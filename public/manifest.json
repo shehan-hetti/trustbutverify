@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "TrustButVerify",
+  "version": "1.0.0",
+  "description": "Track copy activities on LLM/Gen AI websites",
+  "permissions": [
+    "storage",
+    "clipboardRead"
+  ],
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://www.deepseek.com/*",
+    "https://chat.deepseek.com/*",
+    "https://deepseek.com/*",
+    "https://x.ai/*",
+    "https://grok.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://www.deepseek.com/*",
+        "https://chat.deepseek.com/*",
+        "https://deepseek.com/*",
+        "https://x.ai/*",
+        "https://grok.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": ["content/content-script.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

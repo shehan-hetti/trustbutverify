@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrustButVerify</title>
+  <link rel="stylesheet" href="./popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>TrustButVerify</h1>
+      <p class="subtitle">Activity dashboard for your AI chats</p>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab-button active" data-tab="conversations" id="tabConversations">Conversations</button>
+      <button class="tab-button" data-tab="copies" id="tabCopies">Copy Activity</button>
+    </nav>
+
+    <section class="analytics" id="analyticsSection">
+      <div class="analytics-grid">
+        <div class="analytics-card">
+          <span class="analytics-label">Total Conversations</span>
+          <span class="analytics-value" id="statTotalConversations">0</span>
+        </div>
+        <div class="analytics-card">
+          <span class="analytics-label">Total Copies</span>
+          <span class="analytics-value" id="statTotalCopies">0</span>
+        </div>
+        <div class="analytics-card">
+          <span class="analytics-label">Avg Response Time</span>
+          <span class="analytics-value" id="statAverageResponse">0s</span>
+        </div>
+        <div class="analytics-card">
+          <span class="analytics-label">Total Prompt → Response</span>
+          <span class="analytics-value" id="statTextTotals">0 → 0</span>
+        </div>
+      </div>
+
+      <div class="domain-breakdown" id="domainBreakdownContainer">
+        <h3>Domain Breakdown</h3>
+        <ul id="domainBreakdown"></ul>
+      </div>
+    </section>
+
+    <section class="controls" id="conversationControls">
+      <input type="search" id="searchInput" placeholder="Search prompts or responses" aria-label="Search conversations">
+      <select id="domainFilter" aria-label="Filter by domain">
+        <option value="">All domains</option>
+      </select>
+      <div class="export-group">
+        <button class="btn-secondary" id="exportJsonBtn">Export JSON</button>
+        <button class="btn-secondary" id="exportCsvBtn">Export CSV</button>
+      </div>
+    </section>
+
+    <section class="list-section" id="conversationsSection">
+      <div id="conversationsList" class="list">
+        <p class="empty-state">No conversations logged yet</p>
+      </div>
+    </section>
+
+    <section class="list-section" id="copiesSection" hidden>
+      <div class="section-header">
+        <h2>Recent Copy Activity</h2>
+        <button id="clearBtn" class="btn-clear">Clear All</button>
+      </div>
+      <div id="activitiesList" class="list">
+        <p class="empty-state">No copy activities yet</p>
+      </div>
+    </section>
+
+    <footer>
+      <p class="privacy-note">🔒 All data stored locally on your device</p>
+    </footer>
+  </div>
+
+  <script type="module" src="./popup.ts"></script>
+</body>
+</html>
