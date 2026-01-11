@@ -21,6 +21,22 @@
   "background": {
     "service_worker": "background/service-worker.js"
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["content/clipboard-bridge.js"],
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://www.deepseek.com/*",
+        "https://chat.deepseek.com/*",
+        "https://deepseek.com/*",
+        "https://x.ai/*",
+        "https://grok.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ]
+    }
+  ],
   "content_scripts": [
     {
       "matches": [

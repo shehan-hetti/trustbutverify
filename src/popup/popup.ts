@@ -222,34 +222,35 @@ class PopupController {
       this.conversationsList.innerHTML = '<p class="empty-state">No conversations found</p>';
       return;
     }
-
-    this.conversationsList.innerHTML = this.conversations
+    // Display newest first by reversing
+    const reversed = [...this.conversations].reverse();
+    this.conversationsList.innerHTML = reversed
       .map((conversation) => this.createConversationHTML(conversation))
       .join('');
   }
 
   private createConversationHTML(conversation: ConversationLog): string {
-    const date = new Date(conversation.timestamp);
+    const date = new Date(conversation.lastUpdatedAt || conversation.createdAt || Date.now());
     const timeAgo = this.getTimeAgo(date);
-    const responseTime = conversation.responseTime ? this.formatDuration(conversation.responseTime) : '—';
     const id = `conversation-${conversation.id}`;
-    const title = conversation.metadata?.conversationTitle;
-    const messageCount = conversation.metadata?.messageCount;
+    const title = conversation.title;
+    const promptCount = conversation.turns.length;
+    const responseCount = conversation.turns.length;
+    const totalPromptLength = conversation.turns.reduce((s, t) => s + t.prompt.textLength, 0);
+    const totalResponseLength = conversation.turns.reduce((s, t) => s + t.response.textLength, 0);
 
     const metaChips = [
-      `Prompt ${conversation.promptLength} chars`,
-      `Response ${conversation.responseLength} chars`
+      `${promptCount} prompts`,
+      `${responseCount} responses`,
+      `Prompt ${totalPromptLength} chars`,
+      `Response ${totalResponseLength} chars`,
+      date.toLocaleString()
     ];
 
-    if (conversation.responseTime) {
-      metaChips.push(`Response time ${responseTime}`);
-    }
-
-    if (messageCount) {
-      metaChips.push(`${messageCount} messages in session`);
-    }
-
-    metaChips.push(date.toLocaleString());
+    // Show last user + assistant turns if available
+    const last = conversation.turns[conversation.turns.length - 1];
+    const lastUserText = last ? last.prompt.text : '(no user turn)';
+    const lastAssistantText = last ? last.response.text : '(no assistant turn)';
 
     return `
       <div class="conversation-item" data-id="${conversation.id}">
@@ -261,12 +262,12 @@ class PopupController {
           ${metaChips.map((chip) => `<span class="meta-chip">${this.escapeHtml(chip)}</span>`).join('')}
         </div>
         <button class="conversation-toggle" data-toggle="${conversation.id}" aria-controls="${id}" aria-expanded="false">
-          View prompt & response
+          View latest turns
           <span class="chevron">▾</span>
         </button>
         <div class="conversation-details" id="${id}">
-          <div class="conversation-block prompt"><strong>Prompt</strong>\n${this.escapeHtml(conversation.userPrompt)}</div>
-          <div class="conversation-block response"><strong>Response</strong>\n${this.escapeHtml(conversation.llmResponse)}</div>
+          <div class="conversation-block prompt"><strong>Latest Prompt</strong>\n${this.escapeHtml(lastUserText)}</div>
+          <div class="conversation-block response"><strong>Latest Response</strong>\n${this.escapeHtml(lastAssistantText)}</div>
         </div>
       </div>
     `;
@@ -280,7 +281,9 @@ class PopupController {
     }
 
     this.clearBtn.disabled = false;
-    this.activitiesList.innerHTML = this.activities
+    // Show newest first by reversing
+    const reversed = [...this.activities].reverse();
+    this.activitiesList.innerHTML = reversed
       .map((activity) => this.createActivityHTML(activity))
       .join('');
   }
@@ -354,23 +357,28 @@ class PopupController {
   }
 
   private createCsv(conversations: ConversationLog[]): string {
-    const headers = ['timestamp', 'domain', 'userPrompt', 'llmResponse', 'responseTimeMs', 'promptLength', 'responseLength', 'sessionId', 'url'];
-    const rows = conversations.map((conversation) => {
-      const cells: Array<string | number | undefined> = [
-        new Date(conversation.timestamp).toISOString(),
-        conversation.domain,
-        conversation.userPrompt,
-        conversation.llmResponse,
-        conversation.responseTime,
-        conversation.promptLength,
-        conversation.responseLength,
-        conversation.sessionId,
-        conversation.url
-      ];
-
-      return cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(',');
+    // One row per turn for easier analysis
+    const headers = ['conversationId', 'domain', 'createdAt', 'lastUpdatedAt', 'promptTs', 'responseTs', 'responseTimeMs', 'promptLength', 'responseLength', 'promptText', 'responseText', 'url'];
+    const rows: string[] = [];
+    conversations.forEach((c) => {
+      c.turns.forEach((t) => {
+        const cells: Array<string | number | undefined> = [
+          c.id,
+          c.domain,
+          new Date(c.createdAt).toISOString(),
+          new Date(c.lastUpdatedAt).toISOString(),
+          new Date(t.prompt.ts).toISOString(),
+          new Date(t.response.ts).toISOString(),
+          t.responseTimeMs,
+          t.prompt.textLength,
+          t.response.textLength,
+          t.prompt.text,
+          t.response.text,
+          c.url
+        ];
+        rows.push(cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(','));
+      });
     });
-
     return [headers.join(','), ...rows].join('\n');
   }
 

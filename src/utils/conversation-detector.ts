@@ -1,11 +1,10 @@
-import type { ConversationLog } from '../types';
+import type { ConversationLog, ConversationTurn } from '../types';
 
 /**
  * Utility to detect and extract conversations from different LLM platforms
  */
 export class ConversationDetector {
   private readonly domain: string;
-  private readonly sessionId: string;
   private pendingPrompt: { text: string; timestamp: number } | null = null;
   private readonly processedElements = new WeakSet<Element>();
   private readonly processedMessageKeys = new Set<string>();
@@ -14,8 +13,7 @@ export class ConversationDetector {
 
   constructor(domain: string) {
     this.domain = domain;
-    this.sessionId = this.generateSessionId();
-    this.logDebug('Detector constructed', { domain: this.domain, session: this.sessionId });
+    this.logDebug('Detector constructed', { domain: this.domain });
   }
 
   /**
@@ -29,6 +27,43 @@ export class ConversationDetector {
     
     // Listen for form submissions (prompts)
     this.observePromptSubmissions();
+  }
+
+  /**
+   * Derive a stable conversation/thread ID from URL/DOM
+   */
+  getConversationId(): string {
+    try {
+      const url = new URL(window.location.href);
+      const path = url.pathname;
+
+      if (this.domain.includes('chatgpt') || this.domain.includes('openai')) {
+        const m = path.match(/\/c\/([^/?#]+)/);
+        if (m) return `${this.domain}::${m[1]}`;
+      }
+
+      if (this.domain.includes('gemini')) {
+        // Gemini uses /app/<id>
+        const m = path.match(/\/app\/([^/?#]+)/);
+        if (m) return `${this.domain}::${m[1]}`;
+      }
+
+      if (this.domain.includes('grok') || this.domain.includes('x.ai')) {
+        // Grok uses /c/<id> and may include rid query
+        const m = path.match(/\/c\/([^/?#]+)/);
+        if (m) return `${this.domain}::${m[1]}`;
+      }
+
+      // Fallback to deterministic hash of origin+path
+      const key = `${url.origin}${url.pathname}`;
+      let hash = 0;
+      for (let i = 0; i < key.length; i++) {
+        hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+      }
+      return `${this.domain}::h${hash.toString(36)}`;
+    } catch {
+      return `${this.domain}::unknown`;
+    }
   }
 
   /**
@@ -608,28 +643,29 @@ export class ConversationDetector {
     // Check if this is a response to a pending prompt
     if (this.pendingPrompt && Date.now() - this.pendingPrompt.timestamp < 60000) {
       const responseTime = Date.now() - this.pendingPrompt.timestamp;
-
-      const conversation: ConversationLog = {
-        id: this.generateId(),
-        timestamp: Date.now(),
-        url: window.location.href,
-        domain: this.domain,
-        sessionId: this.sessionId,
-        userPrompt: this.pendingPrompt.text,
-        llmResponse: text,
-        promptLength: this.pendingPrompt.text.length,
-        responseLength: text.length,
-        responseTime,
-        metadata: {
-          conversationTitle: this.getConversationTitle(),
-          messageCount: this.getMessageCount()
+      const threadId = this.getConversationId();
+      const promptTs = this.pendingPrompt.timestamp;
+      const responseTs = Date.now();
+      const turn: ConversationTurn = {
+        id: `${responseTs}-turn`,
+        ts: responseTs,
+        responseTimeMs: responseTime,
+        prompt: {
+          text: this.pendingPrompt.text,
+          textLength: this.pendingPrompt.text.length,
+          ts: promptTs
+        },
+        response: {
+          text,
+          textLength: text.length,
+          ts: responseTs
         }
       };
 
-      this.sendConversationToBackground(conversation);
-      this.logDebug('Conversation constructed', {
-        promptPreview: conversation.userPrompt.substring(0, 120),
-        responsePreview: conversation.llmResponse.substring(0, 120),
+      this.upsertTurnsToBackground(threadId, [turn]);
+      this.logDebug('Turn constructed', {
+        promptPreview: turn.prompt.text.substring(0, 120),
+        responsePreview: turn.response.text.substring(0, 120),
         responseTime
       });
       const normalizedPrompt = this.normalizeText(this.pendingPrompt.text);
@@ -712,37 +748,41 @@ export class ConversationDetector {
     return undefined;
   }
 
-  /**
-   * Count messages in current conversation
-   */
-  private getMessageCount(): number {
-    const selectors = this.getMessageSelectors();
-    let count = 0;
+  // /**
+  //  * Count messages in current conversation
+  //  */
+  // private getMessageCount(): number {
+  //   const selectors = this.getMessageSelectors();
+  //   let count = 0;
     
-    for (const selector of selectors) {
-      count += document.querySelectorAll(selector).length;
-    }
+  //   for (const selector of selectors) {
+  //     count += document.querySelectorAll(selector).length;
+  //   }
     
-    return count;
-  }
+  //   return count;
+  // }
 
   /**
    * Send conversation log to background script
    */
-  private async sendConversationToBackground(conversation: ConversationLog): Promise<void> {
+  private async upsertTurnsToBackground(threadId: string, turns: ConversationTurn[]): Promise<void> {
     try {
-      await chrome.runtime.sendMessage({
-        type: 'CONVERSATION_EVENT',
-        data: conversation
-      });
-      this.logDebug('Conversation logged', {
+      const threadInfo: Partial<ConversationLog> = {
+        id: threadId,
+        url: window.location.href,
         domain: this.domain,
-        promptLength: conversation.promptLength,
-        responseLength: conversation.responseLength,
-        responseTime: conversation.responseTime
+        title: this.getConversationTitle(),
+        // metadata: {
+        //   messageCount: this.getMessageCount()
+        // }
+      };
+      await chrome.runtime.sendMessage({
+        type: 'UPSERT_CONVERSATION_TURNS',
+        data: { threadId, threadInfo, turns }
       });
+      this.logDebug('Turns upserted', { threadId, count: turns.length });
     } catch (error) {
-      console.error('[TrustButVerify] Error sending conversation:', error);
+      console.error('[TrustButVerify] Error upserting turns:', error);
     }
   }
 
@@ -756,10 +796,7 @@ export class ConversationDetector {
   /**
    * Generate session ID based on URL and timestamp
    */
-  private generateSessionId(): string {
-    const urlPath = window.location.pathname;
-    return `${this.domain}-${urlPath}-${Date.now()}`;
-  }
+  // sessionId removed: conversation continuity now keyed by deterministic threadId
 
   /**
    * Conditional debug logger to keep console clean in production

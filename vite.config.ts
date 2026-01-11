@@ -23,6 +23,7 @@ export default defineConfig({
       input: {
         'background': resolve(__dirname, 'src/background/service-worker.ts'),
         'content': resolve(__dirname, 'src/content/content-script.ts'),
+        'clipboard-bridge': resolve(__dirname, 'src/content/clipboard-bridge.ts'),
         'popup': resolve(__dirname, 'src/popup/popup.html')
       },
       output: {
@@ -32,6 +33,9 @@ export default defineConfig({
           }
           if (chunkInfo.name === 'content') {
             return 'content/content-script.js';
+          }
+          if (chunkInfo.name === 'clipboard-bridge') {
+            return 'content/clipboard-bridge.js';
           }
           if (chunkInfo.name === 'popup') {
             return 'popup/popup.js';

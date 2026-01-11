@@ -1,4 +1,4 @@
-import type { CopyActivity, ConversationLog, StorageData } from '../types';
+import type { CopyActivity, ConversationLog, ConversationTurn } from '../types';
 
 /**
  * Storage utility for managing copy activities and conversation logs
@@ -15,11 +15,14 @@ export class StorageManager {
   static async saveActivity(activity: CopyActivity): Promise<void> {
     try {
       const data = await this.getAllActivities();
-      data.unshift(activity);
+      // Append new activity at the end to keep chronological order
+      data.push(activity);
       
       // Keep only the most recent activities
       if (data.length > this.MAX_ACTIVITIES) {
-        data.length = this.MAX_ACTIVITIES;
+        // Remove oldest from the start, keep latest MAX_ACTIVITIES at the end
+        const excess = data.length - this.MAX_ACTIVITIES;
+        data.splice(0, excess);
       }
 
       await chrome.storage.local.set({
@@ -49,7 +52,8 @@ export class StorageManager {
    */
   static async getRecentActivities(limit: number = 50): Promise<CopyActivity[]> {
     const activities = await this.getAllActivities();
-    return activities.slice(0, limit);
+    // Return the most recent activities (stored at the end)
+    return activities.slice(-limit);
   }
 
   /**
@@ -75,21 +79,50 @@ export class StorageManager {
   /**
    * Save a conversation log to storage
    */
-  static async saveConversation(conversation: ConversationLog): Promise<void> {
+  static async upsertConversationTurns(
+    threadId: string,
+    threadInfo: Partial<ConversationLog> | undefined,
+    turns: ConversationTurn[]
+  ): Promise<void> {
     try {
       const data = await this.getAllConversations();
-      data.unshift(conversation);
-      
-      // Keep only the most recent conversations
+      let existing = data.find(c => c.id === threadId);
+
+      if (!existing) {
+        existing = {
+          id: threadId,
+          url: threadInfo?.url || '',
+          domain: threadInfo?.domain || (new URL(threadInfo?.url || window.location.href)).hostname,
+          platform: threadInfo?.platform,
+          createdAt: Date.now(),
+          lastUpdatedAt: Date.now(),
+          title: threadInfo?.title,
+          turns: [],
+          copyActivities: [],
+          metadata: threadInfo?.metadata || {}
+        } as ConversationLog;
+        // Append new conversation at end; popup will display reversed
+        data.push(existing);
+      }
+
+      // Append turns at end
+      existing.turns.push(...turns);
+      existing.lastUpdatedAt = Date.now();
+      if (threadInfo?.url) existing.url = threadInfo.url;
+      if (threadInfo?.title) existing.title = threadInfo.title;
+      if (threadInfo?.platform) existing.platform = threadInfo.platform;
+      if (threadInfo?.metadata) existing.metadata = { ...(existing.metadata || {}), ...threadInfo.metadata };
+
+      // Trim stored conversations count (keep newest at end by removing from start if over)
       if (data.length > this.MAX_CONVERSATIONS) {
-        data.length = this.MAX_CONVERSATIONS;
+        data.splice(0, data.length - this.MAX_CONVERSATIONS);
       }
 
       await chrome.storage.local.set({
         [this.CONVERSATION_STORAGE_KEY]: data
       });
     } catch (error) {
-      console.error('Error saving conversation:', error);
+      console.error('Error upserting conversation turns:', error);
       throw error;
     }
   }
@@ -107,6 +140,26 @@ export class StorageManager {
     }
   }
 
+  static async attachCopyToConversation(conversationId: string | undefined, activity: CopyActivity): Promise<void> {
+    if (!conversationId) {
+      return;
+    }
+    try {
+      const data = await this.getAllConversations();
+      const existing = data.find(c => c.id === conversationId);
+      if (!existing) {
+        return;
+      }
+      if (!existing.copyActivities) existing.copyActivities = [];
+      // Append copy activity at end
+      existing.copyActivities.push(activity);
+      existing.lastUpdatedAt = Date.now();
+      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: data });
+    } catch (error) {
+      console.error('Error attaching copy to conversation:', error);
+    }
+  }
+
   /**
    * Get recent conversations with limit
    */
@@ -115,13 +168,7 @@ export class StorageManager {
     return conversations.slice(0, limit);
   }
 
-  /**
-   * Get conversations by session ID
-   */
-  static async getConversationsBySession(sessionId: string): Promise<ConversationLog[]> {
-    const conversations = await this.getAllConversations();
-    return conversations.filter(conv => conv.sessionId === sessionId);
-  }
+  // Deprecated: session-based retrieval removed in per-thread model
 
   /**
    * Clear all conversation logs
@@ -157,12 +204,17 @@ export class StorageManager {
     const conversations = await this.getAllConversations();
     const copies = await this.getAllActivities();
 
-    const totalPromptLength = conversations.reduce((sum, c) => sum + c.promptLength, 0);
-    const totalResponseLength = conversations.reduce((sum, c) => sum + c.responseLength, 0);
-    const responseTimes = conversations.filter(c => c.responseTime).map(c => c.responseTime!);
-    const averageResponseTime = responseTimes.length > 0 
-      ? responseTimes.reduce((sum, t) => sum + t, 0) / responseTimes.length 
-      : 0;
+    let totalPromptLength = 0;
+    let totalResponseLength = 0;
+    conversations.forEach((c) => {
+      c.turns.forEach((t) => {
+        totalPromptLength += t.prompt.textLength;
+        totalResponseLength += t.response.textLength;
+      });
+    });
+
+    // Response time is not directly tracked per turn; set to 0 for now
+    const averageResponseTime = 0;
 
     const domainBreakdown: Record<string, number> = {};
     conversations.forEach(c => {

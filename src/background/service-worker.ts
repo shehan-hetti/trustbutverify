@@ -4,6 +4,7 @@ import type {
   MessageResponse,
   CopyActivity,
   ConversationLog,
+  ConversationTurn,
   GetConversationsParams
 } from '../types';
 
@@ -48,7 +49,13 @@ async function handleMessage(
       return handleClearActivities();
     
     case 'CONVERSATION_EVENT':
-      return handleConversationEvent(message.data as ConversationLog);
+      return handleConversationEvent(message.data as any);
+    case 'UPSERT_CONVERSATION_TURNS':
+      return handleUpsertConversationTurns(message.data as {
+        threadId: string;
+        threadInfo?: Partial<ConversationLog>;
+        turns: ConversationTurn[];
+      });
     
     case 'GET_CONVERSATIONS':
       return handleGetConversations(message.data as GetConversationsParams | undefined);
@@ -73,9 +80,12 @@ async function handleMessage(
 async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse> {
   try {
     await StorageManager.saveActivity(activity);
+    // Also attach to conversation if provided
+    await StorageManager.attachCopyToConversation(activity.conversationId, activity);
     console.log('[TrustButVerify] Copy activity saved:', {
       domain: activity.domain,
       length: activity.textLength,
+      trigger: activity.trigger?.method || activity.trigger?.type,
       timestamp: new Date(activity.timestamp).toISOString()
     });
     
@@ -123,20 +133,69 @@ async function handleClearActivities(): Promise<MessageResponse> {
 /**
  * Handle conversation event from content script
  */
-async function handleConversationEvent(conversation: ConversationLog): Promise<MessageResponse> {
+async function handleConversationEvent(conversation: any): Promise<MessageResponse> {
   try {
-    await StorageManager.saveConversation(conversation);
-    console.log('[TrustButVerify] Conversation saved:', {
-      domain: conversation.domain,
-      promptLength: conversation.promptLength,
-      responseLength: conversation.responseLength,
-      responseTime: conversation.responseTime,
-      timestamp: new Date(conversation.timestamp).toISOString()
-    });
-    
+    // Backward compatibility: if an old-style conversation arrives, convert to turns
+    if (conversation && conversation.userPrompt && conversation.llmResponse) {
+      const threadId = deriveThreadIdFromUrl(conversation.url, conversation.domain);
+      const promptTs = conversation.timestamp - (conversation.responseTime || 0);
+      const responseTs = conversation.timestamp;
+      const turns: ConversationTurn[] = [
+        {
+          id: `${responseTs}-turn`,
+          ts: responseTs,
+          responseTimeMs: conversation.responseTime || undefined,
+          prompt: {
+            text: conversation.userPrompt,
+            textLength: conversation.userPrompt.length,
+            ts: promptTs
+          },
+          response: {
+            text: conversation.llmResponse,
+            textLength: conversation.llmResponse.length,
+            ts: responseTs
+          }
+        }
+      ];
+
+      await StorageManager.upsertConversationTurns(threadId, {
+        id: threadId,
+        url: conversation.url,
+        domain: conversation.domain,
+        title: conversation.metadata?.conversationTitle,
+        metadata: { messageCount: conversation.metadata?.messageCount }
+      }, turns);
+
+      console.log('[TrustButVerify] Conversation upserted (legacy payload):', {
+        domain: conversation.domain,
+        turns: turns.length
+      });
+      return { success: true };
+    }
+
+    // If new format accidentally sent here, try to upsert
+    if (conversation && conversation.id && Array.isArray(conversation.turns)) {
+      await StorageManager.upsertConversationTurns(conversation.id, conversation, conversation.turns);
+      return { success: true };
+    }
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error saving conversation:', error);
+    throw error;
+  }
+}
+
+async function handleUpsertConversationTurns(payload: {
+  threadId: string;
+  threadInfo?: Partial<ConversationLog>;
+  turns: ConversationTurn[];
+}): Promise<MessageResponse> {
+  try {
+    await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, payload.turns);
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error upserting turns:', error);
     throw error;
   }
 }
@@ -161,7 +220,9 @@ async function handleGetConversations(params?: GetConversationsParams): Promise<
         return matchesDomain;
       }
 
-      const haystack = `${conversation.userPrompt}\n${conversation.llmResponse}`.toLowerCase();
+      const haystack = conversation.turns
+        .map(t => `${t.prompt.text}\n${t.response.text}`.toLowerCase())
+        .join('\n');
       return matchesDomain && haystack.includes(searchTerm);
     });
     
@@ -210,3 +271,32 @@ async function handleClearConversations(): Promise<MessageResponse> {
 chrome.runtime.onInstalled.addListener((details) => {
   console.log('[TrustButVerify] Extension installed/updated:', details.reason);
 });
+
+function deriveThreadIdFromUrl(url: string, domain: string): string {
+  try {
+    const u = new URL(url);
+    const path = u.pathname;
+
+    // ChatGPT
+    const chatgpt = path.match(/\/c\/([^/?#]+)/);
+    if (chatgpt) return `${domain}::${chatgpt[1]}`;
+
+    // Gemini
+    const gemApp = path.match(/\/app\/([^/?#]+)/);
+    if (gemApp) return `${domain}::${gemApp[1]}`;
+
+    // Grok
+    const grokC = path.match(/\/c\/([^/?#]+)/);
+    if (grokC) return `${domain}::${grokC[1]}`;
+
+    // Fallback: hash origin+path
+    const key = `${u.origin}${u.pathname}`;
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+    }
+    return `${domain}::h${hash.toString(36)}`;
+  } catch {
+    return `${domain}::unknown`;
+  }
+}
