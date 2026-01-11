@@ -23,7 +23,12 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["content/clipboard-bridge.js"],
+      "resources": [
+        "content/clipboard-bridge.js",
+        "popup/popup.html",
+        "popup/popup.js",
+        "popup/popup.css"
+      ],
       "matches": [
         "https://chat.openai.com/*",
         "https://chatgpt.com/*",

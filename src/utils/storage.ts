@@ -206,15 +206,23 @@ export class StorageManager {
 
     let totalPromptLength = 0;
     let totalResponseLength = 0;
+    let totalResponseTime = 0;
+    let responseCount = 0;
+
     conversations.forEach((c) => {
       c.turns.forEach((t) => {
         totalPromptLength += t.prompt.textLength;
         totalResponseLength += t.response.textLength;
+        if (t.responseTimeMs !== undefined && t.responseTimeMs > 0) {
+          totalResponseTime += t.responseTimeMs;
+          responseCount++;
+        }
       });
     });
 
-    // Response time is not directly tracked per turn; set to 0 for now
-    const averageResponseTime = 0;
+    const averageResponseTime = responseCount > 0 
+      ? Math.round(totalResponseTime / responseCount) 
+      : 0;
 
     const domainBreakdown: Record<string, number> = {};
     conversations.forEach(c => {

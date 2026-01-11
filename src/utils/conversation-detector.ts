@@ -54,6 +54,18 @@ export class ConversationDetector {
         if (m) return `${this.domain}::${m[1]}`;
       }
 
+      if (this.domain.includes('claude')) {
+        // Claude uses /chat/<id>
+        const m = path.match(/\/chat\/([^\/?#]+)/);
+        if (m) return `${this.domain}::${m[1]}`;
+      }
+
+      if (this.domain.includes('deepseek')) {
+        // DeepSeek uses /a/chat/s/<id>
+        const m = path.match(/\/a\/chat\/s\/([^\/?#]+)/);
+        if (m) return `${this.domain}::${m[1]}`;
+      }
+
       // Fallback to deterministic hash of origin+path
       const key = `${url.origin}${url.pathname}`;
       let hash = 0;
@@ -200,6 +212,8 @@ export class ConversationDetector {
         'textarea[data-testid*="chat-input"]',
         'textarea[placeholder*="Ask"]',
         'div[contenteditable="true"][data-placeholder*="message"]',
+        'div[contenteditable="true"][aria-label*="Ask"]',
+        'div[contenteditable="true"][data-testid*="composer"]',
         ...baseSelectors
       ];
     }
@@ -547,6 +561,7 @@ export class ConversationDetector {
         '[data-is-streaming="false"]',
         '[class*="AssistantMessage"]',
         '[class*="HumanMessage"]',
+        '.font-claude-response-body',
         ...this.getGenericAssistantSelectors()
       ];
     }
@@ -581,7 +596,13 @@ export class ConversationDetector {
         '[data-role="assistant"]',
         '.message-content[data-role="assistant"]',
         '.message-content.ai',
-        '[class*="assistant-message"]',
+        '[data-testid="assistant-message"]',
+        '[data-testid*="assistant"]',
+        '[data-testid*="response"]',
+        '.markdown, .markdown-body, .ds-markdown',
+        '.message-content:not([data-role="user"])',
+        '[class*="assistant"]:not([class*="user"])',
+        '[class*="ai-"]:not([class*="user"])',
         ...this.getGenericAssistantSelectors()
       ];
     }
@@ -771,6 +792,7 @@ export class ConversationDetector {
         id: threadId,
         url: window.location.href,
         domain: this.domain,
+        platform: this.getPlatformName(),
         title: this.getConversationTitle(),
         // metadata: {
         //   messageCount: this.getMessageCount()
@@ -784,6 +806,16 @@ export class ConversationDetector {
     } catch (error) {
       console.error('[TrustButVerify] Error upserting turns:', error);
     }
+  }
+
+  private getPlatformName(): string | undefined {
+    const d = this.domain;
+    if (d.includes('chatgpt') || d.includes('openai')) return 'ChatGPT';
+    if (d.includes('gemini')) return 'Gemini';
+    if (d.includes('grok') || d.includes('x.ai')) return 'Grok';
+    if (d.includes('claude')) return 'Claude';
+    if (d.includes('deepseek')) return 'DeepSeek';
+    return undefined;
   }
 
   /**
@@ -875,9 +907,12 @@ export class ConversationDetector {
 
     if (domain.includes('deepseek')) {
       return [
-        '[data-role="user"]',
-        '[class*="message-user"]',
-        '[class*="user-message"]'
+        '[data-role="user"]', 
+        '[class*="message-user"]', 
+        '[class*="user-message"]', 
+        '[data-testid*="user-message"]', 
+        '.message-content[data-role="user"]', 
+        '[class*="user"]:not([class*="assistant"])'
       ];
     }
 

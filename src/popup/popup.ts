@@ -63,6 +63,24 @@ class PopupController {
     this.renderAnalytics();
     this.renderConversations();
     this.renderActivities();
+    
+    // Listen for storage changes to auto-refresh data
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === 'local') {
+        if (changes.conversationLogs || changes.copyActivities) {
+          this.handleStorageChange();
+        }
+      }
+    });
+  }
+
+  private async handleStorageChange(): Promise<void> {
+    await this.loadAnalytics();
+    await Promise.all([this.loadConversations(), this.loadActivities()]);
+    this.populateDomainFilter();
+    this.renderAnalytics();
+    this.renderConversations();
+    this.renderActivities();
   }
 
   private bindEvents(): void {

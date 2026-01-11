@@ -4,12 +4,51 @@
   box-sizing: border-box;
 }
 
+:root {
+  --tbv-scale: 1;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  font-size: calc(14px * var(--tbv-scale));
   width: 420px;
+  min-width: 320px;
   min-height: 560px;
   background: #f5f5f5;
   color: #333;
+}
+
+/* When embedded in overlay iframe, enable container queries and scale with container */
+body[data-tbv-embedded] {
+  width: 100%;
+  height: 100%;
+  min-height: 260px;
+  container-type: inline-size;
+}
+
+/* Responsive scaling based on container width */
+@container (max-width: 350px) {
+  :root {
+    --tbv-scale: 0.85;
+  }
+}
+
+@container (min-width: 351px) and (max-width: 449px) {
+  :root {
+    --tbv-scale: 0.95;
+  }
+}
+
+@container (min-width: 450px) and (max-width: 549px) {
+  :root {
+    --tbv-scale: 1;
+  }
+}
+
+@container (min-width: 550px) {
+  :root {
+    --tbv-scale: 1.1;
+  }
 }
 
 .container {
@@ -19,20 +58,20 @@ body {
 }
 
 header {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #0286f7 0%, #002387 100%);
   color: white;
   padding: 20px;
   text-align: center;
 }
 
 header h1 {
-  font-size: 20px;
+  font-size: 1.25em;
   font-weight: 600;
   margin-bottom: 4px;
 }
 
 .subtitle {
-  font-size: 12px;
+  font-size: 0.86em;
   opacity: 0.9;
 }
 
@@ -47,7 +86,7 @@ header h1 {
   padding: 12px 16px;
   border: none;
   background: transparent;
-  font-size: 14px;
+  font-size: 1em;
   font-weight: 600;
   color: #666;
   cursor: pointer;
@@ -87,14 +126,14 @@ header h1 {
 }
 
 .analytics-label {
-  font-size: 12px;
+  font-size: 0.86em;
   color: #666;
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
 
 .analytics-value {
-  font-size: 18px;
+  font-size: 1.29em;
   font-weight: 600;
   color: #3f51b5;
 }
@@ -104,7 +143,7 @@ header h1 {
 }
 
 .domain-breakdown h3 {
-  font-size: 13px;
+  font-size: 0.93em;
   font-weight: 600;
   color: #444;
   margin-bottom: 8px;
@@ -121,7 +160,7 @@ header h1 {
   background: #f0f0f5;
   border-radius: 999px;
   padding: 6px 10px;
-  font-size: 12px;
+  font-size: 0.86em;
   color: #555;
 }
 
@@ -142,7 +181,7 @@ header h1 {
   padding: 8px 10px;
   border: 1px solid #d0d0d0;
   border-radius: 6px;
-  font-size: 13px;
+  font-size: 0.93em;
   background: white;
 }
 
@@ -157,7 +196,7 @@ header h1 {
   color: #667eea;
   padding: 8px 12px;
   border-radius: 6px;
-  font-size: 12px;
+  font-size: 0.86em;
   cursor: pointer;
   transition: background 0.2s, color 0.2s;
 }
@@ -181,7 +220,7 @@ header h1 {
 }
 
 .section-header h2 {
-  font-size: 16px;
+  font-size: 1.14em;
   font-weight: 600;
   color: #333;
 }
@@ -192,7 +231,7 @@ header h1 {
   border: none;
   padding: 6px 12px;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: 0.86em;
   cursor: pointer;
   transition: background 0.2s;
 }
@@ -216,7 +255,7 @@ header h1 {
   text-align: center;
   color: #999;
   padding: 40px 20px;
-  font-size: 14px;
+  font-size: 1em;
 }
 
 .conversation-item,
@@ -246,12 +285,12 @@ header h1 {
 .activity-domain {
   font-weight: 600;
   color: #667eea;
-  font-size: 13px;
+  font-size: 0.93em;
 }
 
 .conversation-time,
 .activity-time {
-  font-size: 11px;
+  font-size: 0.79em;
   color: #999;
 }
 
@@ -259,7 +298,7 @@ header h1 {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  font-size: 12px;
+  font-size: 0.86em;
   color: #666;
   margin-bottom: 8px;
 }
@@ -277,7 +316,7 @@ header h1 {
   border: none;
   border-radius: 6px;
   padding: 10px 12px;
-  font-size: 13px;
+  font-size: 0.93em;
   cursor: pointer;
   display: flex;
   justify-content: space-between;
@@ -305,7 +344,7 @@ header h1 {
   border: 1px dashed #dcdcdc;
   border-radius: 6px;
   padding: 10px;
-  font-size: 13px;
+  font-size: 0.93em;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -320,7 +359,7 @@ header h1 {
 }
 
 .activity-text {
-  font-size: 13px;
+  font-size: 0.93em;
   color: #555;
   line-height: 1.4;
   max-height: 60px;
@@ -337,7 +376,7 @@ header h1 {
   margin-top: 8px;
   padding-top: 8px;
   border-top: 1px solid #f0f0f0;
-  font-size: 11px;
+  font-size: 0.79em;
   color: #999;
 }
 
@@ -349,7 +388,7 @@ footer {
 }
 
 .privacy-note {
-  font-size: 11px;
+  font-size: 0.79em;
   color: #666;
 }
 
