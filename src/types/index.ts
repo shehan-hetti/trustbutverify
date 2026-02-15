@@ -5,6 +5,8 @@
 export interface CopyActivityTrigger {
   type: 'selection' | 'programmatic';
   method?: string;
+  expanded?: boolean;
+  extractionStrategy?: string;
   elementTag?: string;
   elementClasses?: string;
   elementRole?: string;
@@ -21,6 +23,36 @@ export interface CopyActivity {
   conversationId?: string;
   copiedText: string;
   textLength: number;
+  /**
+   * Resolved side of the conversation turn that the copy belongs to.
+   * Omitted when not confidently determinable (no 'unknown' persisted).
+   */
+  turnSide?: 'prompt' | 'response';
+  /**
+   * Full extracted container text (typically the full message wrapper).
+   * May be capped for storage; see containerTextLength for original length.
+   */
+  containerText?: string;
+  /**
+   * Original (uncapped) length of containerText.
+   */
+  containerTextLength?: number;
+  /**
+   * When turnSide is 'response', the paired prompt text captured at copy time.
+   */
+  pairedPromptText?: string;
+  /**
+   * Links this copy event to a stored ConversationTurn id.
+   */
+  turnId?: string;
+  /**
+   * Categorization label for this copy event.
+   */
+  copyCategory?: string;
+  /**
+   * Where copyCategory came from.
+   */
+  copyCategorySource?: 'turn' | 'llm';
   selectionContext?: string;
   trigger?: CopyActivityTrigger;
 }
@@ -29,6 +61,20 @@ export interface ConversationTurn {
   id: string;
   ts: number; // timestamp of assistant finish
   responseTimeMs?: number; // delta from prompt submit to assistant finish
+  /**
+   * Turn-level category produced by LLM-2.
+   * Stored as the full pipe-separated label string returned by the model.
+   */
+  category?: string;
+  /**
+   * Turn-level summary produced by LLM-2.
+   * Stored as the full summary line value returned by the model.
+   */
+  summary?: string;
+  /**
+   * Link to the previous turn id in this conversation.
+   */
+  previousTurnId?: string;
   prompt: {
     text: string;
     textLength: number;

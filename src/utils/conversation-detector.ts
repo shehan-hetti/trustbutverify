@@ -6,10 +6,53 @@ import type { ConversationLog, ConversationTurn } from '../types';
 export class ConversationDetector {
   private readonly domain: string;
   private pendingPrompt: { text: string; timestamp: number } | null = null;
+  private lastPromptCapturedAt = 0;
+  private lastPromptIntentAt = 0;
+  private lastUserInteractionAt = 0;
   private readonly processedElements = new WeakSet<Element>();
   private readonly processedMessageKeys = new Set<string>();
   private readonly processedMessageKeyQueue: string[] = [];
   private readonly recentPrompts: Array<{ text: string; timestamp: number }> = [];
+  private extensionContextInvalidated = false;
+
+  private async sendMessageToBackground(payload: unknown): Promise<void> {
+    // If extension was actually reloaded/updated while this page is alive,
+    // runtime id is unavailable and further attempts are futile.
+    if (this.extensionContextInvalidated || !chrome?.runtime?.id) {
+      this.extensionContextInvalidated = true;
+      throw new Error('Extension context invalidated');
+    }
+
+    const send = async () => {
+      await chrome.runtime.sendMessage(payload);
+    };
+
+    try {
+      await send();
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const lower = message.toLowerCase();
+
+      // Transient worker/message channel issues should not permanently disable capture.
+      const isTransientPortIssue =
+        lower.includes('message port closed') ||
+        lower.includes('receiving end does not exist') ||
+        lower.includes('could not establish connection');
+
+      if (isTransientPortIssue && chrome?.runtime?.id) {
+        await new Promise((resolve) => window.setTimeout(resolve, 200));
+        await send();
+        return;
+      }
+
+      if (lower.includes('extension context invalidated')) {
+        this.extensionContextInvalidated = true;
+      }
+
+      throw error;
+    }
+  }
 
   constructor(domain: string) {
     this.domain = domain;
@@ -21,12 +64,63 @@ export class ConversationDetector {
    */
   init(): void {
     this.logDebug('Conversation monitoring initialized');
+
+    // Important: on refresh, many platforms re-render historical messages as added nodes.
+    // Seed already-rendered assistant messages as processed so we only track genuinely new turns.
+    this.seedExistingAssistantMessages();
     
     // Use MutationObserver to detect new messages
     this.observeConversations();
     
     // Listen for form submissions (prompts)
     this.observePromptSubmissions();
+  }
+
+  /**
+   * Seed currently-rendered assistant messages as processed on startup.
+   * This prevents historical backfill on refresh/opening old conversations.
+   */
+  private seedExistingAssistantMessages(): void {
+    const selectors = this.getMessageSelectors();
+    const seenKeys = new Set<string>();
+    let seededCount = 0;
+
+    for (const selector of selectors) {
+      let nodes: NodeListOf<Element>;
+      try {
+        nodes = document.querySelectorAll(selector);
+      } catch {
+        continue;
+      }
+
+      nodes.forEach((candidate) => {
+        if (this.isUserAuthoredElement(candidate)) {
+          return;
+        }
+
+        const messageKey = this.getMessageKey(candidate);
+        if (!messageKey) {
+          return;
+        }
+
+        if (seenKeys.has(messageKey)) {
+          return;
+        }
+
+        seenKeys.add(messageKey);
+        // Seed only by key. Do not mark the DOM element as permanently processed,
+        // because some sites may reuse existing nodes for new responses.
+        this.registerProcessedKey(messageKey);
+        seededCount += 1;
+      });
+    }
+
+    if (seededCount > 0) {
+      this.logDebug('Seeded existing assistant messages on init', {
+        seededCount,
+        domain: this.domain
+      });
+    }
   }
 
   /**
@@ -107,6 +201,23 @@ export class ConversationDetector {
     let cachedPrompt = '';
     let cacheTimestamp = 0;
 
+    const markUserInteraction = () => {
+      this.lastUserInteractionAt = Date.now();
+    };
+
+    // Track explicit, trusted user interactions only.
+    document.addEventListener('pointerdown', (event) => {
+      if (event.isTrusted) {
+        markUserInteraction();
+      }
+    }, true);
+
+    document.addEventListener('keydown', (event) => {
+      if (event.isTrusted) {
+        markUserInteraction();
+      }
+    }, true);
+
     const updateCachedPrompt = () => {
       const text = this.getComposerText();
       if (text && text !== cachedPrompt) {
@@ -145,6 +256,10 @@ export class ConversationDetector {
       if (event.key === 'Enter' && !event.shiftKey) {
         const target = event.target as HTMLElement;
         if (this.isComposerElement(target)) {
+          if (!event.isTrusted) {
+            return;
+          }
+          this.lastPromptIntentAt = Date.now();
           updateCachedPrompt();
           if (cachedPrompt) {
             this.logDebug('Enter captured prompt', cachedPrompt.substring(0, 120));
@@ -155,16 +270,76 @@ export class ConversationDetector {
       }
     }, true);
 
-    // Capture on button click (mouse down phase)
+    // Capture on form submit (covers UIs that submit via form)
+    document.addEventListener('submit', (event) => {
+      if (!event.isTrusted) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      updateCachedPrompt();
+      const immediatePrompt = this.getComposerText();
+      if (immediatePrompt && immediatePrompt !== cachedPrompt) {
+        cachedPrompt = immediatePrompt;
+        cacheTimestamp = Date.now();
+      }
+
+      const hasFreshPrompt = Boolean(cachedPrompt) && (Date.now() - cacheTimestamp < 45000);
+      if (!hasFreshPrompt) {
+        return;
+      }
+
+      this.lastPromptIntentAt = Date.now();
+      if (cachedPrompt && Date.now() - cacheTimestamp < 45000) {
+        this.logDebug('Submit captured prompt', {
+          targetTag: target?.tagName,
+          targetClass: target ? (target as HTMLElement).className : undefined,
+          promptPreview: cachedPrompt.substring(0, 120)
+        });
+        this.handlePrompt(cachedPrompt);
+        cachedPrompt = '';
+      }
+    }, true);
+
+    // Capture on send-like click (covers non-button send controls too)
     document.addEventListener('mousedown', (event) => {
+      if (!event.isTrusted) {
+        return;
+      }
       const target = event.target as HTMLElement;
-      if (target.tagName === 'BUTTON' || target.closest('button')) {
-        updateCachedPrompt();
-        if (cachedPrompt && Date.now() - cacheTimestamp < 5000) {
-          this.logDebug('Button captured prompt', cachedPrompt.substring(0, 120));
-          this.handlePrompt(cachedPrompt);
-          cachedPrompt = '';
-        }
+      const clickable = target.closest('button,[role="button"],[aria-label*="Send" i],[data-testid*="send" i],[data-test-id*="send" i]') as HTMLElement | null;
+      if (!clickable) {
+        return;
+      }
+
+      // Avoid obvious non-send controls
+      const aria = (clickable.getAttribute('aria-label') || '').toLowerCase();
+      const txt = (clickable.textContent || '').toLowerCase();
+      if (aria.includes('copy') || txt.includes('copy')) {
+        return;
+      }
+
+      updateCachedPrompt();
+      const immediatePrompt = this.getComposerText();
+      if (immediatePrompt && immediatePrompt !== cachedPrompt) {
+        cachedPrompt = immediatePrompt;
+        cacheTimestamp = Date.now();
+      }
+
+      const hasFreshPrompt = Boolean(cachedPrompt) && (Date.now() - cacheTimestamp < 45000);
+      if (!hasFreshPrompt) {
+        return;
+      }
+
+      this.lastPromptIntentAt = Date.now();
+      if (cachedPrompt && Date.now() - cacheTimestamp < 45000) {
+        this.logDebug('Click captured prompt', {
+          clickableTag: clickable.tagName,
+          clickableAria: clickable.getAttribute('aria-label') || undefined,
+          clickableTestId: clickable.getAttribute('data-testid') || clickable.getAttribute('data-test-id') || undefined,
+          promptPreview: cachedPrompt.substring(0, 120)
+        });
+        this.handlePrompt(cachedPrompt);
+        cachedPrompt = '';
       }
     }, true);
   }
@@ -247,7 +422,17 @@ export class ConversationDetector {
     if (element === this.getComposerElement()) {
       return true;
     }
-    return Boolean(element.closest('div[contenteditable="true"]') || element.closest('.ProseMirror'));
+
+    // Many platforms use textarea for the composer.
+    if (element.matches('textarea') || Boolean(element.closest('textarea'))) {
+      return true;
+    }
+
+    return Boolean(
+      element.closest('div[contenteditable="true"]') ||
+      element.closest('[role="textbox"]') ||
+      element.closest('.ProseMirror')
+    );
   }
 
   /**
@@ -291,6 +476,7 @@ export class ConversationDetector {
       }
 
       candidates.forEach((candidate) => {
+        const previousKey = candidate instanceof HTMLElement ? candidate.dataset.tbvKey : undefined;
         const messageKey = this.getMessageKey(candidate);
 
         if (candidate instanceof HTMLElement && messageKey) {
@@ -311,7 +497,21 @@ export class ConversationDetector {
         }
 
         if (this.processedElements.has(candidate)) {
-          return;
+          // Allow re-processing if the same DOM element now represents a different message.
+          // This behavior is primarily needed for Gemini where DOM nodes are often reused.
+          // On Claude it can cause multiple partial captures while a single response is still rendering.
+          const allowKeyChangeReprocess = this.isGeminiDomain();
+          if (!allowKeyChangeReprocess || !previousKey || !messageKey || previousKey === messageKey) {
+            return;
+          }
+
+          this.logDebug('Re-processing previously seen element due to key change', {
+            previousKey,
+            messageKey,
+            tag: candidate.tagName,
+            class: (candidate as HTMLElement).className,
+            id: (candidate as HTMLElement).id
+          });
         }
 
         if (this.isUserAuthoredElement(candidate)) {
@@ -559,9 +759,7 @@ export class ConversationDetector {
     if (domain.includes('claude')) {
       return [
         '[data-is-streaming="false"]',
-        '[class*="AssistantMessage"]',
-        '[class*="HumanMessage"]',
-        '.font-claude-response-body',
+        '.font-claude-response',
         ...this.getGenericAssistantSelectors()
       ];
     }
@@ -698,6 +896,63 @@ export class ConversationDetector {
       }
       this.pendingPrompt = null;
     } else {
+      // Cold-load safety: if no prompt interaction was captured recently,
+      // do not infer prompt/response pairs from historical DOM.
+      const RECENT_PROMPT_WINDOW_MS = 90_000;
+      const RECENT_INTERACTION_WINDOW_MS = 90_000;
+      const latestPromptSignalAt = Math.max(this.lastPromptCapturedAt, this.lastPromptIntentAt);
+      const hasRecentPromptIntent = latestPromptSignalAt > 0
+        && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
+      const hasRecentUserInteraction = this.lastUserInteractionAt > 0
+        && (Date.now() - this.lastUserInteractionAt) <= RECENT_INTERACTION_WINDOW_MS;
+
+      if (!hasRecentPromptIntent || !hasRecentUserInteraction) {
+        this.logDebug('Skipping inferred turn on cold load (no recent prompt intent)', {
+          elementTag: element.tagName,
+          textPreview: (text || '').substring(0, 120),
+          hasRecentPromptIntent,
+          hasRecentUserInteraction
+        });
+        return;
+      }
+
+      // Fallback: derive prompt text from DOM when prompt submission capture fails.
+      const inferredPromptElement = this.findNearestUserMessageElement(element);
+      const inferredPromptText = inferredPromptElement ? this.extractText(inferredPromptElement) : '';
+      const normalizedInferredPrompt = this.normalizeText(inferredPromptText);
+
+      if (normalizedInferredPrompt && normalizedInferredPrompt.length >= 2) {
+        const threadId = this.getConversationId();
+        const responseTs = Date.now();
+        const promptTs = responseTs;
+
+        // Avoid creating degenerate turns where prompt equals response.
+        if (this.normalizeText(text) !== normalizedInferredPrompt) {
+          const turn: ConversationTurn = {
+            id: `${responseTs}-turn`,
+            ts: responseTs,
+            prompt: {
+              text: inferredPromptText,
+              textLength: inferredPromptText.length,
+              ts: promptTs,
+              meta: { inferred: true }
+            },
+            response: {
+              text,
+              textLength: text.length,
+              ts: responseTs
+            }
+          };
+
+          this.upsertTurnsToBackground(threadId, [turn]);
+          this.logDebug('Turn constructed (inferred prompt)', {
+            promptPreview: turn.prompt.text.substring(0, 120),
+            responsePreview: turn.response.text.substring(0, 120)
+          });
+          return;
+        }
+      }
+
       this.logDebug('No pending prompt to pair with response');
     }
   }
@@ -708,6 +963,7 @@ export class ConversationDetector {
   private handlePrompt(promptText: string): void {
     this.logDebug('Prompt stored', promptText.substring(0, 120));
     const timestamp = Date.now();
+    this.lastPromptCapturedAt = timestamp;
     this.pendingPrompt = {
       text: promptText,
       timestamp
@@ -798,12 +1054,30 @@ export class ConversationDetector {
         //   messageCount: this.getMessageCount()
         // }
       };
-      await chrome.runtime.sendMessage({
+      await this.sendMessageToBackground({
         type: 'UPSERT_CONVERSATION_TURNS',
         data: { threadId, threadInfo, turns }
       });
+
+      // Notify content script that a chat turn was actually recorded.
+      // This is used to lazily reveal popup UI after first real activity.
+      try {
+        window.dispatchEvent(new CustomEvent('tbv:chat-activity'));
+      } catch {
+        // non-fatal
+      }
+
       this.logDebug('Turns upserted', { threadId, count: turns.length });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message.toLowerCase().includes('extension context invalidated')
+      ) {
+        this.extensionContextInvalidated = true;
+        console.debug('[TrustButVerify] Extension context invalidated; disabling further turn upserts');
+        return;
+      }
+
       console.error('[TrustButVerify] Error upserting turns:', error);
     }
   }
@@ -916,6 +1190,26 @@ export class ConversationDetector {
       ];
     }
 
+    if (domain.includes('gemini')) {
+      return [
+        '[data-test-id*="user" i]',
+        '[data-testid*="user" i]',
+        '[class*="user" i]',
+        '[class*="query" i]',
+        '[role="article"] [role="heading"]'
+      ];
+    }
+
+    if (domain.includes('claude')) {
+      return [
+        '[class*="HumanMessage"]',
+        '[data-testid*="human" i]',
+        '[class*="human" i]',
+        '[data-role="user"]',
+        '[data-testid="user-message"]'
+      ];
+    }
+
     return [
       '[data-role="user"]',
       '[data-author="user"]',
@@ -966,18 +1260,87 @@ export class ConversationDetector {
       return `${this.domain}::${dataMessageUuid}`;
     }
 
+    // data-testid is frequently the same for many messages (e.g. "assistant-message").
+    // Only use it when it's unique in the DOM.
     const testId = element.getAttribute('data-testid')?.trim();
     if (testId) {
-      return `${this.domain}::${testId}`;
+      try {
+        const escaped = (globalThis as unknown as { CSS?: { escape?: (value: string) => string } }).CSS?.escape
+          ? (globalThis as unknown as { CSS: { escape: (value: string) => string } }).CSS.escape(testId)
+          : testId.replace(/[^a-zA-Z0-9_-]/g, '');
+        const matches = escaped ? document.querySelectorAll(`[data-testid="${escaped}"]`).length : 0;
+        if (matches === 1) {
+          return `${this.domain}::${testId}`;
+        }
+      } catch {
+        // ignore
+      }
     }
 
     const text = this.normalizeText(element.textContent || '');
     if (text.length >= 4) {
-      const prefix = text.substring(0, 60);
-      return `${this.domain}::text::${prefix}::${text.length}`;
+      const sample = text.substring(0, 500);
+      const hash = this.hashText(sample);
+      return `${this.domain}::t${hash.toString(36)}::${text.length}`;
     }
 
     return undefined;
+  }
+
+  private hashText(text: string): number {
+    // FNV-1a 32-bit
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = (hash * 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+  }
+
+  private safeMatches(element: Element, selector: string): boolean {
+    try {
+      return element.matches(selector);
+    } catch {
+      return false;
+    }
+  }
+
+  private findNearestUserMessageElement(from: Element): Element | null {
+    const selectors = this.getUserMessageSelectors().filter(Boolean);
+    if (!selectors.length) {
+      return null;
+    }
+
+    const isUser = (el: Element): boolean => selectors.some((sel) => this.safeMatches(el, sel));
+
+    // Walk up a few levels, scanning previous siblings for a user message.
+    let cursor: Element | null = from;
+    for (let depth = 0; depth < 8 && cursor; depth += 1) {
+      let sib: Element | null = cursor.previousElementSibling;
+      while (sib) {
+        if (isUser(sib)) {
+          return sib;
+        }
+
+        // Also check inside sibling subtree (common when message wrapper differs).
+        for (const sel of selectors) {
+          try {
+            const found = sib.querySelector(sel);
+            if (found) {
+              return found;
+            }
+          } catch {
+            // ignore invalid selector
+          }
+        }
+
+        sib = sib.previousElementSibling;
+      }
+
+      cursor = cursor.parentElement;
+    }
+
+    return null;
   }
 
   private markProcessed(element: Element, messageKey?: string): void {
@@ -1039,7 +1402,9 @@ export class ConversationDetector {
       'one sec',
       'just a moment',
       'give me a moment',
-      'show thinking'
+      'show thinking',
+      'gemini said',
+      'you said'
     ]);
 
     if (placeholderPhrases.has(normalized)) {
@@ -1048,6 +1413,8 @@ export class ConversationDetector {
 
     const stripped = normalized
       .replace(/^show thinking/, '')
+      .replace(/^gemini said/, '')
+      .replace(/^you said/, '')
       .replace(/^just a second/, '')
       .replace(/^thinking/, '')
       .replace(/^loading/, '')
@@ -1070,6 +1437,8 @@ export class ConversationDetector {
 
   private cleanGeminiText(text: string): string {
     let cleaned = text
+      .replace(/^\s*gemini said\s*/i, ' ')
+      .replace(/^\s*you said\s*/i, ' ')
       .replace(/Show thinking/gi, ' ')
       .replace(/Just a second(?:\u2026|\.\.\.)?/gi, ' ')
       .replace(/\s{2,}/g, ' ');
