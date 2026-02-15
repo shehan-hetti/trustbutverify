@@ -5,9 +5,10 @@ import type { ConversationLog, ConversationTurn } from '../types';
  */
 export class ConversationDetector {
   private readonly domain: string;
-  private pendingPrompt: { text: string; timestamp: number } | null = null;
+  private pendingPrompt: { text: string; timestamp: number; threadId: string } | null = null;
   private lastPromptCapturedAt = 0;
   private lastPromptIntentAt = 0;
+  private lastPromptThreadId: string | null = null;
   private lastUserInteractionAt = 0;
   private readonly processedElements = new WeakSet<Element>();
   private readonly processedMessageKeys = new Set<string>();
@@ -824,6 +825,7 @@ export class ConversationDetector {
    */
   private extractAndSaveMessage(element: Element): void {
     const text = this.extractText(element);
+    const currentThreadId = this.getConversationId();
     
     if (!text || text.length < 2) {
       this.logDebug('Extracted text too short', text);
@@ -860,9 +862,19 @@ export class ConversationDetector {
     }
 
     // Check if this is a response to a pending prompt
-    if (this.pendingPrompt && Date.now() - this.pendingPrompt.timestamp < 60000) {
+    const pendingPromptMatchesThread = Boolean(this.pendingPrompt)
+      && (
+        this.pendingPrompt!.threadId === currentThreadId
+        || this.canMapFallbackPromptThreadToCurrentThread(this.pendingPrompt!.threadId, currentThreadId)
+      );
+
+    if (
+      this.pendingPrompt
+      && pendingPromptMatchesThread
+      && Date.now() - this.pendingPrompt.timestamp < 60000
+    ) {
       const responseTime = Date.now() - this.pendingPrompt.timestamp;
-      const threadId = this.getConversationId();
+      const threadId = currentThreadId;
       const promptTs = this.pendingPrompt.timestamp;
       const responseTs = Date.now();
       const turn: ConversationTurn = {
@@ -905,13 +917,18 @@ export class ConversationDetector {
         && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
       const hasRecentUserInteraction = this.lastUserInteractionAt > 0
         && (Date.now() - this.lastUserInteractionAt) <= RECENT_INTERACTION_WINDOW_MS;
+      const isSameThreadAsLatestPrompt = Boolean(this.lastPromptThreadId)
+        && this.lastPromptThreadId === currentThreadId;
 
-      if (!hasRecentPromptIntent || !hasRecentUserInteraction) {
+      if (!hasRecentPromptIntent || !hasRecentUserInteraction || !isSameThreadAsLatestPrompt) {
         this.logDebug('Skipping inferred turn on cold load (no recent prompt intent)', {
           elementTag: element.tagName,
           textPreview: (text || '').substring(0, 120),
           hasRecentPromptIntent,
-          hasRecentUserInteraction
+          hasRecentUserInteraction,
+          isSameThreadAsLatestPrompt,
+          currentThreadId,
+          lastPromptThreadId: this.lastPromptThreadId
         });
         return;
       }
@@ -922,7 +939,7 @@ export class ConversationDetector {
       const normalizedInferredPrompt = this.normalizeText(inferredPromptText);
 
       if (normalizedInferredPrompt && normalizedInferredPrompt.length >= 2) {
-        const threadId = this.getConversationId();
+        const threadId = currentThreadId;
         const responseTs = Date.now();
         const promptTs = responseTs;
 
@@ -963,10 +980,13 @@ export class ConversationDetector {
   private handlePrompt(promptText: string): void {
     this.logDebug('Prompt stored', promptText.substring(0, 120));
     const timestamp = Date.now();
+    const threadId = this.getConversationId();
     this.lastPromptCapturedAt = timestamp;
+    this.lastPromptThreadId = threadId;
     this.pendingPrompt = {
       text: promptText,
-      timestamp
+      timestamp,
+      threadId
     };
 
     const normalized = this.normalizeText(promptText);
@@ -1373,6 +1393,32 @@ export class ConversationDetector {
 
   private isGeminiDomain(): boolean {
     return this.domain.includes('gemini');
+  }
+
+  private isGrokDomain(): boolean {
+    return this.domain.includes('grok') || this.domain.includes('x.ai');
+  }
+
+  /**
+   * When starting a brand-new Grok chat, prompt capture can happen before URL
+   * changes to /c/<id>. In that case prompt threadId is the fallback hash and
+   * response threadId is the concrete /c/<id> id. Treat them as compatible once.
+   */
+  private canMapFallbackPromptThreadToCurrentThread(
+    promptThreadId: string,
+    currentThreadId: string
+  ): boolean {
+    if (!this.isGrokDomain()) {
+      return false;
+    }
+
+    const promptPart = (promptThreadId.split('::')[1] || '').trim();
+    const currentPart = (currentThreadId.split('::')[1] || '').trim();
+
+    const isPromptFallback = promptPart === 'unknown' || /^h[0-9a-z]+$/i.test(promptPart);
+    const isCurrentConcrete = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currentPart);
+
+    return isPromptFallback && isCurrentConcrete;
   }
 
   private isGeminiPlaceholder(text: string): boolean {

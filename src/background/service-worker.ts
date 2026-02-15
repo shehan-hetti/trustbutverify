@@ -1,4 +1,5 @@
 import { StorageManager } from '../utils/storage';
+import { computeReadability } from '../utils/readability-metrics';
 import type {
   MessagePayload,
   MessageResponse,
@@ -108,6 +109,15 @@ async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse>
       enriched = await enrichCopyActivity(enriched);
     }
 
+    // Compute readability metrics for response-side copies.
+    if (enriched.turnSide === 'response' && !enriched.readability) {
+      const textForMetrics = enriched.copiedText || enriched.containerText || '';
+      const result = computeReadability(textForMetrics);
+      if (result) {
+        enriched = { ...enriched, readability: result.metrics, complexity: result.complexity };
+      }
+    }
+
     await StorageManager.saveActivity(enriched);
     // Also attach to conversation if provided
     await StorageManager.attachCopyToConversation(enriched.conversationId, enriched);
@@ -152,18 +162,20 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
   }
 
   const convo = await StorageManager.getConversationById(activity.conversationId);
-  if (!convo || !Array.isArray(convo.turns)) {
+  if (convo && !Array.isArray(convo.turns)) {
     return;
   }
+
+  const existingTurns = convo?.turns || [];
 
   // Only recover when this conversation was active recently.
   // Prevent creating historical phantom turns from old copied content.
   const now = activity.timestamp || Date.now();
-  if (convo.lastUpdatedAt && (now - convo.lastUpdatedAt) > 10 * 60 * 1000) {
+  if (convo?.lastUpdatedAt && (now - convo.lastUpdatedAt) > 10 * 60 * 1000) {
     return;
   }
 
-  const alreadyExists = convo.turns.some((t) => {
+  const alreadyExists = existingTurns.some((t) => {
     const p = t?.prompt?.text || '';
     const r = t?.response?.text || '';
     return containmentScore(prompt, p) >= 0.9 && containmentScore(response, r) >= 0.8;
@@ -196,8 +208,8 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
       id: activity.conversationId,
       url: activity.url,
       domain: activity.domain,
-      platform: convo.platform,
-      title: convo.title
+      platform: convo?.platform,
+      title: convo?.title
     },
     [inferredTurn]
   );
@@ -749,7 +761,25 @@ async function handleUpsertConversationTurns(payload: {
   turns: ConversationTurn[];
 }): Promise<MessageResponse> {
   try {
-    await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, payload.turns);
+    // Attach readability metrics to each turn's response before persisting.
+    const enrichedTurns = payload.turns.map(turn => {
+      if (turn.response?.text && !turn.response.readability) {
+        const result = computeReadability(turn.response.text);
+        if (result) {
+          return {
+            ...turn,
+            response: {
+              ...turn.response,
+              readability: result.metrics,
+              complexity: result.complexity,
+            },
+          };
+        }
+      }
+      return turn;
+    });
+
+    await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, enrichedTurns);
 
     // IMPORTANT (MV3): If we fire-and-forget, Chrome may suspend the service worker
     // before the fetch+storage write completes, leaving categories stuck at 'pending'.

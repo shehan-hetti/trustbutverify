@@ -2,6 +2,75 @@
  * Type definitions for TrustButVerify extension
  */
 
+/* ------------------------------------------------------------------ */
+/*  Text readability / complexity metrics                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Raw readability scores produced by text-readability-ts.
+ * Every value is the direct output of the library function –
+ * no rounding or clamping is applied at storage time.
+ */
+export interface TextReadabilityMetrics {
+  /** Schema version – bump when adding / removing fields. */
+  version: 1;
+  /** Length (chars) of the text sample fed to the library. */
+  sampleTextLength: number;
+  /** Number of sentences detected. */
+  sentenceCount: number;
+  /** Number of words detected. */
+  wordCount: number;
+
+  /* — Grade-level / index scores — */
+  fleschReadingEase: number;       // 0-100+  (higher = easier)
+  fleschKincaidGrade: number;      // US grade level
+  smogIndex: number;               // US grade level
+  colemanLiauIndex: number;        // US grade level
+  automatedReadabilityIndex: number; // US grade level
+  gunningFog: number;              // US grade level
+  daleChallReadabilityScore: number; // raw Dale-Chall score
+  lix: number;                     // Läsbarhetsindex
+  rix: number;                     // Anderson's Rix
+
+  /* — Consensus helpers — */
+  /** text_standard() string, e.g. "9th and 10th grade". */
+  textStandard?: string;
+  /** text_median() single grade number. */
+  textMedian?: number;
+}
+
+/**
+ * Derived complexity band computed from the raw metrics.
+ *
+ * Grade consensus = textMedian (most reliable single number).
+ * Bands:
+ *   very-easy   ≤ 4
+ *   easy         5 – 7
+ *   moderate     8 – 10
+ *   hard        11 – 13
+ *   very-hard   ≥ 14
+ */
+export type ComplexityBand =
+  | 'very-easy'
+  | 'easy'
+  | 'moderate'
+  | 'hard'
+  | 'very-hard';
+
+export interface TextComplexitySummary {
+  /** Consensus grade level (from textMedian). */
+  gradeConsensus: number;
+  /** Human-friendly complexity band. */
+  complexityBand: ComplexityBand;
+  /**
+   * Optional reason codes explaining band assignment, e.g.
+   * ['high-fog', 'low-flesch-ease'].
+   */
+  reasonCodes?: string[];
+}
+
+/* ------------------------------------------------------------------ */
+
 export interface CopyActivityTrigger {
   type: 'selection' | 'programmatic';
   method?: string;
@@ -53,6 +122,14 @@ export interface CopyActivity {
    * Where copyCategory came from.
    */
   copyCategorySource?: 'turn' | 'llm';
+  /**
+   * Readability metrics computed on the copied text (response-side only).
+   */
+  readability?: TextReadabilityMetrics;
+  /**
+   * Derived complexity summary for the copied text.
+   */
+  complexity?: TextComplexitySummary;
   selectionContext?: string;
   trigger?: CopyActivityTrigger;
 }
@@ -88,6 +165,14 @@ export interface ConversationTurn {
     ts: number; // assistant message time
     messageId?: string;
     meta?: Record<string, unknown>;
+    /**
+     * Readability metrics for the full assistant response text.
+     */
+    readability?: TextReadabilityMetrics;
+    /**
+     * Derived complexity summary for the assistant response.
+     */
+    complexity?: TextComplexitySummary;
   };
 }
 

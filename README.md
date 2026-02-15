@@ -66,6 +66,7 @@ trustbutverify/
 │   ├── background/         # Background service worker
 │   │   └── service-worker.ts
 │   ├── content/            # Content scripts
+│   │   ├── clipboard-bridge.ts
 │   │   └── content-script.ts
 │   ├── popup/              # Extension popup UI
 │   │   ├── popup.html
@@ -74,7 +75,8 @@ trustbutverify/
 │   ├── types/              # TypeScript type definitions
 │   │   └── index.ts
 │   └── utils/              # Utility functions
-|       ├── conversation-detector.ts 
+│       ├── conversation-detector.ts
+│       ├── readability-metrics.ts
 │       └── storage.ts
 ├── public/
 │   ├── manifest.json       # Extension manifest
@@ -92,6 +94,7 @@ trustbutverify/
 - **Manifest V3**: Latest browser extension standard
 - **Vite**: Fast build tooling
 - **Chrome Storage API**: Local data persistence
+- **text-readability-ts**: Text readability / complexity analysis
 - **Vanilla TypeScript**: No framework dependencies for optimal performance
 
 ## Architecture
@@ -104,7 +107,10 @@ Runs on target websites and listens for copy events. Captures:
 - Selection context
 
 ### Background Service Worker
-Processes and stores copy activities using Chrome Storage API.
+Processes and stores copy activities using Chrome Storage API. Also:
+- Enriches copy activities with turn matching and category assignment
+- Computes text readability metrics on LLM responses and response-side copies
+- Categorizes turns and unmatched copies via LLM-2
 
 ### Popup UI
 Displays tracked activities with:
@@ -112,6 +118,46 @@ Displays tracked activities with:
 - Recent activities list
 - Clear all option
 - Privacy information
+
+## Text Readability Metrics
+
+When an LLM response is captured (turn or response-side copy), the extension computes readability metrics using the `text-readability-ts` library. Metrics are stored on `ConversationTurn.response.readability` and `CopyActivity.readability`.
+
+### Raw Metrics (TextReadabilityMetrics)
+
+| Metric | What it measures | Range / units |
+|--------|-----------------|---------------|
+| `fleschReadingEase` | Overall readability (higher = easier) | 0–100+ |
+| `fleschKincaidGrade` | US school grade level | Grade number |
+| `smogIndex` | Grade level needed to understand (based on polysyllables) | Grade number |
+| `colemanLiauIndex` | Grade level based on characters per word / sentences | Grade number |
+| `automatedReadabilityIndex` | Grade level from character counts | Grade number |
+| `gunningFog` | Complexity based on sentence length and hard words | Grade number |
+| `daleChallReadabilityScore` | Score using a list of familiar words | Raw score |
+| `lix` | Swedish readability index (Läsbarhetsindex) | Index value |
+| `rix` | Anderson's Rix readability | Index value |
+| `textStandard` | Consensus grade string, e.g. "9th and 10th grade" | String |
+| `textMedian` | Median grade across all formulas | Grade number |
+
+### Derived Complexity (TextComplexitySummary)
+
+The `gradeConsensus` value (from `textMedian`) is mapped to a human-friendly band:
+
+| Band | Grade range | Meaning |
+|------|-------------|---------|
+| `very-easy` | ≤ 4 | Elementary school level |
+| `easy` | 5 – 7 | Middle school level |
+| `moderate` | 8 – 10 | High school level |
+| `hard` | 11 – 13 | College level |
+| `very-hard` | ≥ 14 | Graduate / professional level |
+
+Optional `reasonCodes` explain the band, e.g. `low-flesch-ease`, `high-fog`, `high-smog`.
+
+### Limits
+
+- Text shorter than 20 words is skipped (too short for reliable scoring).
+- Text longer than 50,000 characters is truncated to the first 50k before scoring.
+- All library calls are wrapped with safe defaults (0 on error) to prevent crashes.
 
 ## Scripts
 

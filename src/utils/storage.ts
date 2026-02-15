@@ -291,14 +291,34 @@ export class StorageManager {
     }
     try {
       const data = await this.getAllConversations();
-      const existing = data.find(c => c.id === conversationId);
+      let existing = data.find(c => c.id === conversationId);
       if (!existing) {
-        return;
+        const now = Date.now();
+        existing = {
+          id: conversationId,
+          url: activity.url,
+          domain: activity.domain,
+          createdAt: now,
+          lastUpdatedAt: now,
+          turns: [],
+          copyActivities: [],
+          metadata: {}
+        };
+        data.push(existing);
       }
       if (!existing.copyActivities) existing.copyActivities = [];
+      if (existing.copyActivities.some((a) => a.id === activity.id)) {
+        return;
+      }
       // Append copy activity at end
       existing.copyActivities.push(activity);
       existing.lastUpdatedAt = Date.now();
+
+      // Trim stored conversations count (keep newest at end by removing from start if over)
+      if (data.length > this.MAX_CONVERSATIONS) {
+        data.splice(0, data.length - this.MAX_CONVERSATIONS);
+      }
+
       await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: data });
     } catch (error) {
       console.error('Error attaching copy to conversation:', error);

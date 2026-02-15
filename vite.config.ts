@@ -3,6 +3,14 @@ import { resolve } from 'path';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // Force the CJS build of text-readability-ts.  The .mjs build has a
+      // broken `import pluralize from "pluralize"` that Rollup cannot resolve
+      // because pluralize is CJS-only.
+      'text-readability-ts': resolve(__dirname, 'node_modules/text-readability-ts/dist/index.js'),
+    },
+  },
   plugins: [
     viteStaticCopy({
       targets: [
@@ -19,6 +27,11 @@ export default defineConfig({
   ],
   build: {
     outDir: 'dist',
+    commonjsOptions: {
+      include: [/node_modules/],
+      transformMixedEsModules: true,
+      requireReturnsDefault: 'auto',
+    },
     rollupOptions: {
       input: {
         'background': resolve(__dirname, 'src/background/service-worker.ts'),
