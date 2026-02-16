@@ -4,10 +4,12 @@ import type { CopyActivity, ConversationLog, ConversationTurn } from '../types';
  * Storage utility for managing copy activities and conversation logs
  */
 export class StorageManager {
-  private static readonly COPY_STORAGE_KEY = 'copyActivities';
+  private static readonly LEGACY_COPY_STORAGE_KEY = 'copyActivities';
   private static readonly CONVERSATION_STORAGE_KEY = 'conversationLogs';
+  private static readonly COPY_MIGRATION_FLAG_KEY = 'copyActivitiesMigratedToConversationsV1';
   private static readonly MAX_ACTIVITIES = 1000;
   private static readonly MAX_CONVERSATIONS = 500;
+  private static migrationPromise: Promise<void> | null = null;
 
   private static normalizeTurnText(text: string): string {
     return (text || '').replace(/\s+/g, ' ').trim();
@@ -23,25 +25,157 @@ export class StorageManager {
     return 0;
   }
 
+  private static async ensureCopyActivitiesMigration(): Promise<void> {
+    if (this.migrationPromise) {
+      await this.migrationPromise;
+      return;
+    }
+
+    this.migrationPromise = (async () => {
+      try {
+        const result = await chrome.storage.local.get([
+          this.COPY_MIGRATION_FLAG_KEY,
+          this.LEGACY_COPY_STORAGE_KEY,
+          this.CONVERSATION_STORAGE_KEY
+        ]);
+
+        const alreadyMigrated = Boolean(result[this.COPY_MIGRATION_FLAG_KEY]);
+        const legacyActivities = (result[this.LEGACY_COPY_STORAGE_KEY] as CopyActivity[] | undefined) || [];
+        const conversations = (result[this.CONVERSATION_STORAGE_KEY] as ConversationLog[] | undefined) || [];
+
+        if (legacyActivities.length === 0) {
+          if (!alreadyMigrated) {
+            await chrome.storage.local.set({ [this.COPY_MIGRATION_FLAG_KEY]: true });
+          }
+          await chrome.storage.local.remove(this.LEGACY_COPY_STORAGE_KEY);
+          return;
+        }
+
+        const now = Date.now();
+        for (const activity of legacyActivities) {
+          const conversationId = this.resolveConversationIdForActivity(activity);
+          let convo = conversations.find((c) => c.id === conversationId);
+          if (!convo) {
+            convo = {
+              id: conversationId,
+              url: activity.url,
+              domain: activity.domain,
+              createdAt: activity.timestamp || now,
+              lastUpdatedAt: activity.timestamp || now,
+              turns: [],
+              copyActivities: [],
+              metadata: {}
+            };
+            conversations.push(convo);
+          }
+
+          if (!convo.copyActivities) {
+            convo.copyActivities = [];
+          }
+
+          if (!convo.copyActivities.some((a) => a.id === activity.id)) {
+            convo.copyActivities.push({ ...activity, conversationId });
+          }
+
+          convo.lastUpdatedAt = Math.max(convo.lastUpdatedAt || 0, activity.timestamp || now);
+        }
+
+        this.pruneGlobalActivities(conversations);
+        this.trimConversations(conversations);
+
+        await chrome.storage.local.set({
+          [this.CONVERSATION_STORAGE_KEY]: conversations,
+          [this.COPY_MIGRATION_FLAG_KEY]: true
+        });
+        await chrome.storage.local.remove(this.LEGACY_COPY_STORAGE_KEY);
+      } catch (error) {
+        console.error('Error migrating legacy copy activities:', error);
+      }
+    })();
+
+    await this.migrationPromise;
+  }
+
+  private static resolveConversationIdForActivity(activity: CopyActivity): string {
+    if (activity.conversationId && activity.conversationId.trim().length > 0) {
+      return activity.conversationId;
+    }
+    return this.deriveThreadIdFromUrl(activity.url, activity.domain);
+  }
+
+  private static deriveThreadIdFromUrl(url: string, domain: string): string {
+    try {
+      const u = new URL(url);
+      const path = u.pathname;
+
+      const threadMatch = path.match(/\/(?:c|app)\/([^/?#]+)/);
+      if (threadMatch) {
+        return `${domain}::${threadMatch[1]}`;
+      }
+
+      const key = `${u.origin}${u.pathname}`;
+      let hash = 0;
+      for (let i = 0; i < key.length; i++) {
+        hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+      }
+      return `${domain}::h${hash.toString(36)}`;
+    } catch {
+      return `${domain}::unknown`;
+    }
+  }
+
+  private static flattenActivities(conversations: ConversationLog[]): CopyActivity[] {
+    return conversations
+      .flatMap((c) => c.copyActivities || [])
+      .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  }
+
+  private static trimConversations(data: ConversationLog[]): void {
+    if (data.length > this.MAX_CONVERSATIONS) {
+      data.splice(0, data.length - this.MAX_CONVERSATIONS);
+    }
+  }
+
+  private static pruneGlobalActivities(conversations: ConversationLog[]): void {
+    const all = conversations
+      .flatMap((convo) =>
+        (convo.copyActivities || []).map((activity, idx) => ({
+          conversationId: convo.id,
+          idx,
+          timestamp: activity.timestamp || 0
+        }))
+      )
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const excess = all.length - this.MAX_ACTIVITIES;
+    if (excess <= 0) {
+      return;
+    }
+
+    const toDrop = all.slice(0, excess);
+    const dropByConversation = new Map<string, Set<number>>();
+    for (const item of toDrop) {
+      if (!dropByConversation.has(item.conversationId)) {
+        dropByConversation.set(item.conversationId, new Set<number>());
+      }
+      dropByConversation.get(item.conversationId)!.add(item.idx);
+    }
+
+    for (const convo of conversations) {
+      const indexes = dropByConversation.get(convo.id);
+      if (!indexes || !convo.copyActivities || convo.copyActivities.length === 0) {
+        continue;
+      }
+      convo.copyActivities = convo.copyActivities.filter((_, idx) => !indexes.has(idx));
+    }
+  }
+
   /**
    * Save a copy activity to storage
    */
   static async saveActivity(activity: CopyActivity): Promise<void> {
     try {
-      const data = await this.getAllActivities();
-      // Append new activity at the end to keep chronological order
-      data.push(activity);
-      
-      // Keep only the most recent activities
-      if (data.length > this.MAX_ACTIVITIES) {
-        // Remove oldest from the start, keep latest MAX_ACTIVITIES at the end
-        const excess = data.length - this.MAX_ACTIVITIES;
-        data.splice(0, excess);
-      }
-
-      await chrome.storage.local.set({
-        [this.COPY_STORAGE_KEY]: data
-      });
+      await this.attachCopyToConversation(activity.conversationId, activity);
     } catch (error) {
       console.error('Error saving activity:', error);
       throw error;
@@ -53,8 +187,8 @@ export class StorageManager {
    */
   static async getAllActivities(): Promise<CopyActivity[]> {
     try {
-      const result = await chrome.storage.local.get(this.COPY_STORAGE_KEY);
-      return result[this.COPY_STORAGE_KEY] || [];
+      const conversations = await this.getAllConversations();
+      return this.flattenActivities(conversations);
     } catch (error) {
       console.error('Error getting activities:', error);
       return [];
@@ -83,7 +217,15 @@ export class StorageManager {
    */
   static async clearAllActivities(): Promise<void> {
     try {
-      await chrome.storage.local.remove(this.COPY_STORAGE_KEY);
+      const conversations = await this.getAllConversations();
+      for (const convo of conversations) {
+        if (convo.copyActivities?.length) {
+          convo.copyActivities = [];
+        }
+      }
+      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
+      await chrome.storage.local.remove(this.LEGACY_COPY_STORAGE_KEY);
+      await chrome.storage.local.set({ [this.COPY_MIGRATION_FLAG_KEY]: true });
     } catch (error) {
       console.error('Error clearing activities:', error);
       throw error;
@@ -277,6 +419,7 @@ export class StorageManager {
    */
   static async getAllConversations(): Promise<ConversationLog[]> {
     try {
+      await this.ensureCopyActivitiesMigration();
       const result = await chrome.storage.local.get(this.CONVERSATION_STORAGE_KEY);
       return result[this.CONVERSATION_STORAGE_KEY] || [];
     } catch (error) {
@@ -286,16 +429,15 @@ export class StorageManager {
   }
 
   static async attachCopyToConversation(conversationId: string | undefined, activity: CopyActivity): Promise<void> {
-    if (!conversationId) {
-      return;
-    }
     try {
+      await this.ensureCopyActivitiesMigration();
       const data = await this.getAllConversations();
-      let existing = data.find(c => c.id === conversationId);
+      const resolvedConversationId = conversationId || this.resolveConversationIdForActivity(activity);
+      let existing = data.find(c => c.id === resolvedConversationId);
       if (!existing) {
         const now = Date.now();
         existing = {
-          id: conversationId,
+          id: resolvedConversationId,
           url: activity.url,
           domain: activity.domain,
           createdAt: now,
@@ -311,13 +453,14 @@ export class StorageManager {
         return;
       }
       // Append copy activity at end
-      existing.copyActivities.push(activity);
+      existing.copyActivities.push({
+        ...activity,
+        conversationId: resolvedConversationId
+      });
       existing.lastUpdatedAt = Date.now();
 
-      // Trim stored conversations count (keep newest at end by removing from start if over)
-      if (data.length > this.MAX_CONVERSATIONS) {
-        data.splice(0, data.length - this.MAX_CONVERSATIONS);
-      }
+      this.pruneGlobalActivities(data);
+      this.trimConversations(data);
 
       await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: data });
     } catch (error) {
@@ -333,13 +476,6 @@ export class StorageManager {
   static async patchCopyActivityById(activityId: string, patch: Partial<CopyActivity>): Promise<void> {
     if (!activityId) {
       return;
-    }
-
-    const activities = await this.getAllActivities();
-    const idx = activities.findIndex(a => a.id === activityId);
-    if (idx !== -1) {
-      activities[idx] = { ...activities[idx], ...patch };
-      await chrome.storage.local.set({ [this.COPY_STORAGE_KEY]: activities });
     }
 
     const conversations = await this.getAllConversations();
@@ -370,19 +506,6 @@ export class StorageManager {
       copyCategory,
       copyCategorySource: 'turn'
     };
-
-    const activities = await this.getAllActivities();
-    let activityUpdated = false;
-    for (let i = 0; i < activities.length; i++) {
-      const a = activities[i];
-      if (a.turnId === turnId && a.copyCategorySource === 'turn') {
-        activities[i] = { ...a, ...patch };
-        activityUpdated = true;
-      }
-    }
-    if (activityUpdated) {
-      await chrome.storage.local.set({ [this.COPY_STORAGE_KEY]: activities });
-    }
 
     const conversations = await this.getAllConversations();
     let convoUpdated = false;

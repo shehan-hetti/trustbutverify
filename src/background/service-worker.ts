@@ -13,6 +13,18 @@ import type {
  * Background service worker for TrustButVerify extension
  */
 console.log('[TrustButVerify] Service worker started');
+const FLOW_TRACE_ENABLED = true;
+
+function flowTrace(event: string, detail?: Record<string, unknown>): void {
+  if (!FLOW_TRACE_ENABLED) {
+    return;
+  }
+  if (detail) {
+    console.log('[TBV FLOW][Worker]', event, detail);
+    return;
+  }
+  console.log('[TBV FLOW][Worker]', event);
+}
 
 // LLM-2 (CSC cloud) categorization settings (hardcoded per requirement)
 const LLM2_URL = 'http://86.50.252.163/completion';
@@ -59,6 +71,10 @@ async function handleMessage(
   message: MessagePayload,
   sender: chrome.runtime.MessageSender
 ): Promise<MessageResponse> {
+  flowTrace('handleMessage', {
+    type: message.type,
+    url: sender.url || sender.tab?.url || undefined
+  });
   switch (message.type) {
     case 'COPY_EVENT':
       return handleCopyEvent(message.data as CopyActivity);
@@ -100,6 +116,14 @@ async function handleMessage(
  */
 async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse> {
   try {
+    flowTrace('handleCopyEvent:start', {
+      id: activity.id,
+      conversationId: activity.conversationId,
+      domain: activity.domain,
+      turnSide: activity.turnSide,
+      textLength: activity.textLength,
+      extractionStrategy: activity.trigger?.extractionStrategy || undefined
+    });
     let enriched = await enrichCopyActivity(activity);
 
     // Recovery path: if turn capture missed but copy contains a paired prompt + full response,
@@ -119,14 +143,21 @@ async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse>
     }
 
     await StorageManager.saveActivity(enriched);
-    // Also attach to conversation if provided
-    await StorageManager.attachCopyToConversation(enriched.conversationId, enriched);
 
     // If we couldn't match to a stored turn, queue LLM-2 fallback (debounced).
     // This avoids firing network calls immediately on every copy.
     if (!enriched.turnId && (!enriched.copyCategory || enriched.copyCategory === 'pending')) {
       void enqueueCopyCategorizationIfNeeded(enriched);
     }
+    flowTrace('handleCopyEvent:done', {
+      id: enriched.id,
+      conversationId: enriched.conversationId,
+      domain: enriched.domain,
+      turnId: enriched.turnId || null,
+      turnSide: enriched.turnSide || null,
+      copyCategory: enriched.copyCategory || null,
+      textLength: enriched.textLength
+    });
     console.log('[TrustButVerify] Copy activity saved:', {
       domain: enriched.domain,
       length: enriched.textLength,
@@ -145,19 +176,69 @@ async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse>
 }
 
 async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
+  flowTrace('tryBackfillTurnFromCopy:start', {
+    id: activity.id,
+    conversationId: activity.conversationId,
+    domain: activity.domain,
+    turnId: activity.turnId || null,
+    turnSide: activity.turnSide || null,
+    extractionStrategy: activity.trigger?.extractionStrategy || undefined
+  });
   if (!activity.conversationId) {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'no-conversation-id', id: activity.id });
     return;
   }
   if (activity.turnId) {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'already-linked', id: activity.id, turnId: activity.turnId });
     return;
   }
   if (activity.turnSide !== 'response') {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'not-response-side', id: activity.id, turnSide: activity.turnSide || null });
+    return;
+  }
+
+  // Backfill is intentionally limited to ChatGPT-family domains where
+  // first-turn misses are most common and copy extraction is stable.
+  // For other platforms, copy-only actions must NOT create inferred turns.
+  const domain = (activity.domain || '').toLowerCase();
+  const strategy = (activity.trigger?.extractionStrategy || '').toLowerCase();
+  const isChatGptDomain = domain.includes('chatgpt.com') || domain.includes('openai.com');
+  const isChatGptStrategy = strategy.startsWith('chatgpt:');
+  if (!isChatGptDomain && !isChatGptStrategy) {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'domain-gated', id: activity.id, domain });
     return;
   }
 
   const prompt = normalizeText(activity.pairedPromptText || '');
-  const response = normalizeText(activity.containerText || activity.copiedText || '');
+  const copiedResponse = normalizeText(activity.copiedText || '');
+  const containerResponse = normalizeText(activity.containerText || '');
+  const extractionStrategy = activity.trigger?.extractionStrategy || '';
+  const isExplicitSelection = extractionStrategy.includes(':explicit');
+
+  // Guard: explicit partial highlights should not create inferred full turns.
+  // This avoids logging full conversation responses when user only copied a snippet.
+  if (isExplicitSelection && copiedResponse && containerResponse) {
+    const copiedLooksLikeFullContainer =
+      containmentScore(copiedResponse, containerResponse) >= 0.9
+      && copiedResponse.length >= Math.floor(containerResponse.length * 0.85);
+    if (!copiedLooksLikeFullContainer) {
+      flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'explicit-partial-selection', id: activity.id });
+      return;
+    }
+  }
+
+  const response = normalizeText(
+    isExplicitSelection
+      ? (copiedResponse || containerResponse)
+      : (containerResponse || copiedResponse)
+  );
   if (prompt.length < 2 || response.length < 8) {
+    flowTrace('tryBackfillTurnFromCopy:skip', {
+      reason: 'prompt-response-too-short',
+      id: activity.id,
+      promptLength: prompt.length,
+      responseLength: response.length
+    });
     return;
   }
 
@@ -172,6 +253,7 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
   // Prevent creating historical phantom turns from old copied content.
   const now = activity.timestamp || Date.now();
   if (convo?.lastUpdatedAt && (now - convo.lastUpdatedAt) > 10 * 60 * 1000) {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'conversation-stale', id: activity.id, conversationId: activity.conversationId });
     return;
   }
 
@@ -182,6 +264,7 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
   });
 
   if (alreadyExists) {
+    flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'already-exists', id: activity.id, conversationId: activity.conversationId });
     return;
   }
 
@@ -216,6 +299,13 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
 
   // Keep categories aligned with the rest of the pipeline.
   await categorizeLatestPendingTurn(activity.conversationId);
+  flowTrace('tryBackfillTurnFromCopy:created', {
+    id: activity.id,
+    conversationId: activity.conversationId,
+    inferredTurnId: inferredTurn.id,
+    promptLength: inferredTurn.prompt.textLength,
+    responseLength: inferredTurn.response.textLength
+  });
 }
 
 async function enqueueCopyCategorizationIfNeeded(activity: CopyActivity): Promise<void> {
@@ -442,12 +532,23 @@ function containmentScore(a: string, b: string): number {
 }
 
 async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity> {
+  flowTrace('enrichCopyActivity:start', {
+    id: activity.id,
+    conversationId: activity.conversationId,
+    domain: activity.domain,
+    turnSide: activity.turnSide || null,
+    hasPairedPrompt: Boolean(activity.pairedPromptText)
+  });
   if (!activity.conversationId) {
     return activity;
   }
 
   const convo = await StorageManager.getConversationById(activity.conversationId);
   if (!convo || !Array.isArray(convo.turns) || convo.turns.length === 0) {
+    flowTrace('enrichCopyActivity:no-turns', {
+      id: activity.id,
+      conversationId: activity.conversationId
+    });
     return activity;
   }
 
@@ -522,6 +623,12 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     if (!activity.copyCategory) {
       return { ...activity, copyCategory: 'pending' };
     }
+    flowTrace('enrichCopyActivity:unmatched', {
+      id: activity.id,
+      conversationId: activity.conversationId,
+      bestScore,
+      acceptThreshold
+    });
     return activity;
   }
 
@@ -538,6 +645,15 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     }
   }
 
+  flowTrace('enrichCopyActivity:matched', {
+    id: activity.id,
+    conversationId: activity.conversationId,
+    turnId: bestTurn.id,
+    turnSide: activity.turnSide || bestSide,
+    bestScore,
+    bestPrimaryScore,
+    bestPromptScore
+  });
   return {
     ...activity,
     turnId: bestTurn.id,
@@ -761,6 +877,12 @@ async function handleUpsertConversationTurns(payload: {
   turns: ConversationTurn[];
 }): Promise<MessageResponse> {
   try {
+    flowTrace('handleUpsertConversationTurns:start', {
+      threadId: payload.threadId,
+      turnCount: payload.turns.length,
+      firstPromptLength: payload.turns[0]?.prompt?.textLength ?? 0,
+      firstResponseLength: payload.turns[0]?.response?.textLength ?? 0
+    });
     // Attach readability metrics to each turn's response before persisting.
     const enrichedTurns = payload.turns.map(turn => {
       if (turn.response?.text && !turn.response.readability) {
@@ -793,6 +915,11 @@ async function handleUpsertConversationTurns(payload: {
         ms: dt
       });
     }
+
+    flowTrace('handleUpsertConversationTurns:done', {
+      threadId: payload.threadId,
+      turnCount: payload.turns.length
+    });
 
     return { success: true };
   } catch (error) {

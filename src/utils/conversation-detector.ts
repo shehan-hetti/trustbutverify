@@ -5,6 +5,8 @@ import type { ConversationLog, ConversationTurn } from '../types';
  */
 export class ConversationDetector {
   private readonly domain: string;
+  // TEMP DEBUG: keep true while validating capture flow; disable/remove after testing.
+  private readonly flowTraceEnabled = true;
   private pendingPrompt: { text: string; timestamp: number; threadId: string } | null = null;
   private lastPromptCapturedAt = 0;
   private lastPromptIntentAt = 0;
@@ -58,6 +60,18 @@ export class ConversationDetector {
   constructor(domain: string) {
     this.domain = domain;
     this.logDebug('Detector constructed', { domain: this.domain });
+    this.traceFlow('constructor', { domain: this.domain });
+  }
+
+  private traceFlow(event: string, detail?: Record<string, unknown>): void {
+    if (!this.flowTraceEnabled) {
+      return;
+    }
+    if (detail) {
+      console.log('[TBV FLOW][Detector]', event, detail);
+      return;
+    }
+    console.log('[TBV FLOW][Detector]', event);
   }
 
   /**
@@ -65,6 +79,10 @@ export class ConversationDetector {
    */
   init(): void {
     this.logDebug('Conversation monitoring initialized');
+    this.traceFlow('init', {
+      domain: this.domain,
+      threadId: this.getConversationId()
+    });
 
     // Important: on refresh, many platforms re-render historical messages as added nodes.
     // Seed already-rendered assistant messages as processed so we only track genuinely new turns.
@@ -199,6 +217,10 @@ export class ConversationDetector {
    */
   private observePromptSubmissions(): void {
     this.logDebug('observePromptSubmissions start');
+    this.traceFlow('observePromptSubmissions:start', {
+      threadId: this.getConversationId(),
+      domain: this.domain
+    });
     let cachedPrompt = '';
     let cacheTimestamp = 0;
 
@@ -210,12 +232,33 @@ export class ConversationDetector {
     document.addEventListener('pointerdown', (event) => {
       if (event.isTrusted) {
         markUserInteraction();
+        this.traceFlow('observePromptSubmissions:pointerdown', {
+          threadId: this.getConversationId(),
+          tag: (event.target as HTMLElement | null)?.tagName || null
+        });
       }
     }, true);
 
     document.addEventListener('keydown', (event) => {
       if (event.isTrusted) {
         markUserInteraction();
+        const target = event.target as HTMLElement | null;
+        const hasComposerContext = Boolean(
+          target
+          && (
+            this.isComposerElement(target)
+            || target.closest('textarea, [role="textbox"], div[contenteditable="true"], .ProseMirror')
+          )
+        );
+        if (hasComposerContext) {
+          this.lastPromptIntentAt = Date.now();
+          this.lastPromptThreadId = this.getConversationId();
+          this.traceFlow('observePromptSubmissions:keydownIntent', {
+            threadId: this.lastPromptThreadId,
+            key: event.key,
+            isTrusted: event.isTrusted
+          });
+        }
       }
     }, true);
 
@@ -256,15 +299,32 @@ export class ConversationDetector {
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {
         const target = event.target as HTMLElement;
-        if (this.isComposerElement(target)) {
+        const hasComposerContext = Boolean(
+          target
+          && (
+            this.isComposerElement(target)
+            || target.closest('textarea, [role="textbox"], div[contenteditable="true"], .ProseMirror')
+          )
+        );
+        if (hasComposerContext) {
           if (!event.isTrusted) {
             return;
           }
           this.lastPromptIntentAt = Date.now();
           updateCachedPrompt();
+          this.traceFlow('observePromptSubmissions:enterDetected', {
+            threadId: this.getConversationId(),
+            hasCachedPrompt: Boolean(cachedPrompt),
+            cachedPromptLength: cachedPrompt.length
+          });
           if (cachedPrompt) {
             this.logDebug('Enter captured prompt', cachedPrompt.substring(0, 120));
             this.handlePrompt(cachedPrompt);
+            this.traceFlow('observePromptSubmissions:enterCapturedPrompt', {
+              threadId: this.getConversationId(),
+              promptLength: cachedPrompt.length,
+              promptPreview: cachedPrompt.substring(0, 80)
+            });
             cachedPrompt = '';
           }
         }
@@ -276,6 +336,8 @@ export class ConversationDetector {
       if (!event.isTrusted) {
         return;
       }
+      this.lastPromptIntentAt = Date.now();
+      this.lastPromptThreadId = this.getConversationId();
       const target = event.target as HTMLElement | null;
       updateCachedPrompt();
       const immediatePrompt = this.getComposerText();
@@ -286,10 +348,13 @@ export class ConversationDetector {
 
       const hasFreshPrompt = Boolean(cachedPrompt) && (Date.now() - cacheTimestamp < 45000);
       if (!hasFreshPrompt) {
+        this.traceFlow('observePromptSubmissions:submitNoFreshPrompt', {
+          threadId: this.getConversationId(),
+          cacheAgeMs: cacheTimestamp ? (Date.now() - cacheTimestamp) : null
+        });
         return;
       }
 
-      this.lastPromptIntentAt = Date.now();
       if (cachedPrompt && Date.now() - cacheTimestamp < 45000) {
         this.logDebug('Submit captured prompt', {
           targetTag: target?.tagName,
@@ -297,6 +362,11 @@ export class ConversationDetector {
           promptPreview: cachedPrompt.substring(0, 120)
         });
         this.handlePrompt(cachedPrompt);
+        this.traceFlow('observePromptSubmissions:submitCapturedPrompt', {
+          threadId: this.getConversationId(),
+          promptLength: cachedPrompt.length,
+          promptPreview: cachedPrompt.substring(0, 80)
+        });
         cachedPrompt = '';
       }
     }, true);
@@ -307,7 +377,9 @@ export class ConversationDetector {
         return;
       }
       const target = event.target as HTMLElement;
-      const clickable = target.closest('button,[role="button"],[aria-label*="Send" i],[data-testid*="send" i],[data-test-id*="send" i]') as HTMLElement | null;
+      const clickable = target.closest(
+        'button,[role="button"],[aria-label*="Send" i],[aria-label*="Submit" i],[data-testid*="send" i],[data-test-id*="send" i],[data-testid*="submit" i],[data-test-id*="submit" i]'
+      ) as HTMLElement | null;
       if (!clickable) {
         return;
       }
@@ -316,8 +388,18 @@ export class ConversationDetector {
       const aria = (clickable.getAttribute('aria-label') || '').toLowerCase();
       const txt = (clickable.textContent || '').toLowerCase();
       if (aria.includes('copy') || txt.includes('copy')) {
+        this.traceFlow('observePromptSubmissions:clickIgnoredNonSend', {
+          threadId: this.getConversationId(),
+          clickableAria: aria || null,
+          clickableTextPreview: txt.substring(0, 60) || null
+        });
         return;
       }
+
+      // Record prompt-send intent even if composer text extraction fails.
+      // This allows fallback inferred turn pairing for first-turn/new-thread cases.
+      this.lastPromptIntentAt = Date.now();
+      this.lastPromptThreadId = this.getConversationId();
 
       updateCachedPrompt();
       const immediatePrompt = this.getComposerText();
@@ -328,10 +410,14 @@ export class ConversationDetector {
 
       const hasFreshPrompt = Boolean(cachedPrompt) && (Date.now() - cacheTimestamp < 45000);
       if (!hasFreshPrompt) {
+        this.traceFlow('observePromptSubmissions:clickNoFreshPrompt', {
+          threadId: this.getConversationId(),
+          clickableAria: clickable.getAttribute('aria-label') || null,
+          cacheAgeMs: cacheTimestamp ? (Date.now() - cacheTimestamp) : null
+        });
         return;
       }
 
-      this.lastPromptIntentAt = Date.now();
       if (cachedPrompt && Date.now() - cacheTimestamp < 45000) {
         this.logDebug('Click captured prompt', {
           clickableTag: clickable.tagName,
@@ -340,6 +426,11 @@ export class ConversationDetector {
           promptPreview: cachedPrompt.substring(0, 120)
         });
         this.handlePrompt(cachedPrompt);
+        this.traceFlow('observePromptSubmissions:clickCapturedPrompt', {
+          threadId: this.getConversationId(),
+          promptLength: cachedPrompt.length,
+          promptPreview: cachedPrompt.substring(0, 80)
+        });
         cachedPrompt = '';
       }
     }, true);
@@ -456,11 +547,27 @@ export class ConversationDetector {
    * Detect if a new element is a conversation message
    */
   private detectMessage(element: Element): void {
+    this.traceFlow('detectMessage:start', {
+      tag: element.tagName,
+      className: (element as HTMLElement).className || '',
+      id: (element as HTMLElement).id || ''
+    });
     // Platform-specific selectors
     const selectors = this.getMessageSelectors();
     
     for (const selector of selectors) {
       const candidates: Element[] = [];
+
+      // Handle streaming UIs where mutations happen inside an existing
+      // assistant wrapper (no new wrapper node added).
+      try {
+        const ancestor = element.closest(selector);
+        if (ancestor) {
+          candidates.push(ancestor);
+        }
+      } catch {
+        // ignore invalid selector errors
+      }
 
       if (element.matches(selector)) {
         candidates.push(element);
@@ -516,6 +623,12 @@ export class ConversationDetector {
         }
 
         if (this.isUserAuthoredElement(candidate)) {
+          this.capturePromptFromUserElement(candidate);
+          this.traceFlow('detectMessage:userElement', {
+            threadId: this.getConversationId(),
+            messageKey,
+            textLength: (candidate.textContent || '').trim().length
+          });
           this.markProcessed(candidate, messageKey);
           this.logDebug('Skipping user-authored element', {
             selector,
@@ -538,6 +651,11 @@ export class ConversationDetector {
         });
 
         // Wait for content to load (streaming responses)
+        this.traceFlow('detectMessage:assistantCandidate', {
+          threadId: this.getConversationId(),
+          messageKey,
+          selector
+        });
         this.waitForContent(candidate);
       });
     }
@@ -547,6 +665,11 @@ export class ConversationDetector {
    * Wait for element to have content, then extract it
    */
   private waitForContent(element: Element): void {
+    this.traceFlow('waitForContent:start', {
+      threadId: this.getConversationId(),
+      key: this.getElementKey(element),
+      tag: element.tagName
+    });
     if (this.processedElements.has(element)) {
       return;
     }
@@ -663,6 +786,12 @@ export class ConversationDetector {
           messageKey
         });
         this.markProcessed(element, messageKey);
+        this.traceFlow('waitForContent:ready', {
+          threadId: this.getConversationId(),
+          key: messageKey,
+          textLength: text.length,
+          retryCount
+        });
         this.extractAndSaveMessage(element);
         placeholderCount = 0;
       }
@@ -826,6 +955,12 @@ export class ConversationDetector {
   private extractAndSaveMessage(element: Element): void {
     const text = this.extractText(element);
     const currentThreadId = this.getConversationId();
+    this.traceFlow('extractAndSaveMessage:start', {
+      threadId: currentThreadId,
+      textLength: text?.length || 0,
+      hasPendingPrompt: Boolean(this.pendingPrompt),
+      pendingPromptThreadId: this.pendingPrompt?.threadId || null
+    });
     
     if (!text || text.length < 2) {
       this.logDebug('Extracted text too short', text);
@@ -894,6 +1029,12 @@ export class ConversationDetector {
       };
 
       this.upsertTurnsToBackground(threadId, [turn]);
+      this.traceFlow('extractAndSaveMessage:pairedTurn', {
+        threadId,
+        promptLength: turn.prompt.textLength,
+        responseLength: turn.response.textLength,
+        responseTimeMs: responseTime
+      });
       this.logDebug('Turn constructed', {
         promptPreview: turn.prompt.text.substring(0, 120),
         responsePreview: turn.response.text.substring(0, 120),
@@ -917,16 +1058,20 @@ export class ConversationDetector {
         && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
       const hasRecentUserInteraction = this.lastUserInteractionAt > 0
         && (Date.now() - this.lastUserInteractionAt) <= RECENT_INTERACTION_WINDOW_MS;
-      const isSameThreadAsLatestPrompt = Boolean(this.lastPromptThreadId)
-        && this.lastPromptThreadId === currentThreadId;
+      const lastPromptThreadId = this.lastPromptThreadId;
+      const isPromptThreadCompatible = Boolean(lastPromptThreadId)
+        && (
+          lastPromptThreadId === currentThreadId
+          || this.canMapFallbackPromptThreadToCurrentThread(lastPromptThreadId!, currentThreadId)
+        );
 
-      if (!hasRecentPromptIntent || !hasRecentUserInteraction || !isSameThreadAsLatestPrompt) {
+      if (!hasRecentPromptIntent || !hasRecentUserInteraction || !isPromptThreadCompatible) {
         this.logDebug('Skipping inferred turn on cold load (no recent prompt intent)', {
           elementTag: element.tagName,
           textPreview: (text || '').substring(0, 120),
           hasRecentPromptIntent,
           hasRecentUserInteraction,
-          isSameThreadAsLatestPrompt,
+          isPromptThreadCompatible,
           currentThreadId,
           lastPromptThreadId: this.lastPromptThreadId
         });
@@ -962,6 +1107,11 @@ export class ConversationDetector {
           };
 
           this.upsertTurnsToBackground(threadId, [turn]);
+          this.traceFlow('extractAndSaveMessage:inferredTurn', {
+            threadId,
+            promptLength: turn.prompt.textLength,
+            responseLength: turn.response.textLength
+          });
           this.logDebug('Turn constructed (inferred prompt)', {
             promptPreview: turn.prompt.text.substring(0, 120),
             responsePreview: turn.response.text.substring(0, 120)
@@ -988,6 +1138,11 @@ export class ConversationDetector {
       timestamp,
       threadId
     };
+    this.traceFlow('handlePrompt:stored', {
+      threadId,
+      promptLength: promptText.length,
+      promptPreview: promptText.substring(0, 80)
+    });
 
     const normalized = this.normalizeText(promptText);
     if (normalized) {
@@ -998,6 +1153,65 @@ export class ConversationDetector {
     }
 
     this.pruneRecentPrompts(timestamp);
+  }
+
+  private capturePromptFromUserElement(element: Element): void {
+    const text = this.extractText(element);
+    const normalized = this.normalizeText(text);
+    if (!normalized || normalized.length < 2) {
+      return;
+    }
+
+    const now = Date.now();
+    const RECENT_WINDOW_MS = 90_000;
+    const hasRecentIntent = this.lastPromptIntentAt > 0 && (now - this.lastPromptIntentAt) <= RECENT_WINDOW_MS;
+    const threadId = this.getConversationId();
+    const lastPromptThreadId = this.lastPromptThreadId;
+    const intentMatchesThread = Boolean(lastPromptThreadId)
+      && (
+        lastPromptThreadId === threadId
+        || this.canMapFallbackPromptThreadToCurrentThread(lastPromptThreadId!, threadId)
+      );
+
+    // Only capture user DOM prompts when we have recent prompt intent tied to this thread.
+    // This prevents passive navigation/opening old chats from creating inferred turns.
+    if (!hasRecentIntent || !intentMatchesThread) {
+      return;
+    }
+
+    if (this.pendingPrompt) {
+      const sameText = this.normalizeText(this.pendingPrompt.text) === normalized;
+      const sameThread = this.pendingPrompt.threadId === threadId
+        || this.canMapFallbackPromptThreadToCurrentThread(this.pendingPrompt.threadId, threadId);
+      const freshPending = (now - this.pendingPrompt.timestamp) <= RECENT_WINDOW_MS;
+      if (sameText && sameThread && freshPending) {
+        return;
+      }
+    }
+
+    this.lastPromptCapturedAt = now;
+    this.lastPromptThreadId = threadId;
+    this.pendingPrompt = {
+      text,
+      timestamp: now,
+      threadId
+    };
+    this.traceFlow('capturePromptFromUserElement:stored', {
+      threadId,
+      promptLength: text.length,
+      promptPreview: normalized.substring(0, 80)
+    });
+
+    this.recentPrompts.push({ text: normalized, timestamp: now });
+    if (this.recentPrompts.length > 50) {
+      this.recentPrompts.splice(0, this.recentPrompts.length - 50);
+    }
+    this.pruneRecentPrompts(now);
+
+    this.logDebug('Prompt captured from user DOM message', {
+      threadId,
+      promptPreview: normalized.substring(0, 120)
+    });
   }
 
   /**
@@ -1064,6 +1278,12 @@ export class ConversationDetector {
    */
   private async upsertTurnsToBackground(threadId: string, turns: ConversationTurn[]): Promise<void> {
     try {
+      this.traceFlow('upsertTurnsToBackground:start', {
+        threadId,
+        turnCount: turns.length,
+        firstPromptLength: turns[0]?.prompt?.textLength ?? 0,
+        firstResponseLength: turns[0]?.response?.textLength ?? 0
+      });
       const threadInfo: Partial<ConversationLog> = {
         id: threadId,
         url: window.location.href,
@@ -1088,6 +1308,10 @@ export class ConversationDetector {
       }
 
       this.logDebug('Turns upserted', { threadId, count: turns.length });
+      this.traceFlow('upsertTurnsToBackground:success', {
+        threadId,
+        count: turns.length
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
@@ -1099,6 +1323,10 @@ export class ConversationDetector {
       }
 
       console.error('[TrustButVerify] Error upserting turns:', error);
+      this.traceFlow('upsertTurnsToBackground:error', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 
@@ -1265,19 +1493,21 @@ export class ConversationDetector {
       return undefined;
     }
 
+    const threadScope = this.getConversationId();
+
     const id = element.id?.trim();
     if (id) {
-      return `${this.domain}::${id}`;
+      return `${threadScope}::${id}`;
     }
 
     const dataMessageId = element.getAttribute('data-message-id')?.trim();
     if (dataMessageId) {
-      return `${this.domain}::${dataMessageId}`;
+      return `${threadScope}::${dataMessageId}`;
     }
 
     const dataMessageUuid = element.getAttribute('data-message-uuid')?.trim();
     if (dataMessageUuid) {
-      return `${this.domain}::${dataMessageUuid}`;
+      return `${threadScope}::${dataMessageUuid}`;
     }
 
     // data-testid is frequently the same for many messages (e.g. "assistant-message").
@@ -1290,7 +1520,7 @@ export class ConversationDetector {
           : testId.replace(/[^a-zA-Z0-9_-]/g, '');
         const matches = escaped ? document.querySelectorAll(`[data-testid="${escaped}"]`).length : 0;
         if (matches === 1) {
-          return `${this.domain}::${testId}`;
+          return `${threadScope}::${testId}`;
         }
       } catch {
         // ignore
@@ -1301,7 +1531,7 @@ export class ConversationDetector {
     if (text.length >= 4) {
       const sample = text.substring(0, 500);
       const hash = this.hashText(sample);
-      return `${this.domain}::t${hash.toString(36)}::${text.length}`;
+      return `${threadScope}::t${hash.toString(36)}::${text.length}`;
     }
 
     return undefined;
@@ -1399,6 +1629,10 @@ export class ConversationDetector {
     return this.domain.includes('grok') || this.domain.includes('x.ai');
   }
 
+  private isChatGptDomain(): boolean {
+    return this.domain.includes('chatgpt') || this.domain.includes('openai');
+  }
+
   /**
    * When starting a brand-new Grok chat, prompt capture can happen before URL
    * changes to /c/<id>. In that case prompt threadId is the fallback hash and
@@ -1408,7 +1642,9 @@ export class ConversationDetector {
     promptThreadId: string,
     currentThreadId: string
   ): boolean {
-    if (!this.isGrokDomain()) {
+    const promptDomain = (promptThreadId.split('::')[0] || '').trim();
+    const currentDomain = (currentThreadId.split('::')[0] || '').trim();
+    if (!promptDomain || !currentDomain || promptDomain !== currentDomain) {
       return false;
     }
 
@@ -1416,7 +1652,9 @@ export class ConversationDetector {
     const currentPart = (currentThreadId.split('::')[1] || '').trim();
 
     const isPromptFallback = promptPart === 'unknown' || /^h[0-9a-z]+$/i.test(promptPart);
-    const isCurrentConcrete = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currentPart);
+    const isCurrentConcrete = Boolean(currentPart)
+      && currentPart !== 'unknown'
+      && !/^h[0-9a-z]+$/i.test(currentPart);
 
     return isPromptFallback && isCurrentConcrete;
   }

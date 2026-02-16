@@ -448,9 +448,29 @@ class ActivityTracker {
       }
 
       const expanded = this.expandCopySelection(selection);
-      const finalText = expanded?.text?.trim() || copiedText;
-      const didExpand = Boolean(expanded && expanded.text && expanded.text.trim() !== copiedText);
-      const extractionStrategy = expanded?.strategy || 'selection:fallback';
+      const hasExplicitSelection = Boolean(
+        selection
+        && selection.rangeCount > 0
+        && !selection.isCollapsed
+        && copiedText.length > 0
+      );
+
+      // IMPORTANT: when user explicitly highlights text, keep that exact text
+      // as copiedText. Only expand to full message/container when there is no
+      // explicit selection (e.g., copy buttons, programmatic wrappers).
+      const finalText = hasExplicitSelection
+        ? copiedText
+        : (expanded?.text?.trim() || copiedText);
+
+      const didExpand = Boolean(
+        !hasExplicitSelection
+        && expanded
+        && expanded.text
+        && expanded.text.trim() !== copiedText
+      );
+      const extractionStrategy = hasExplicitSelection
+        ? `${expanded?.strategy || 'selection'}:explicit`
+        : (expanded?.strategy || 'selection:fallback');
 
       const { context, element } = this.extractSelectionContext(selection);
       const fallbackElement = (element as HTMLElement | null)
@@ -460,7 +480,9 @@ class ActivityTracker {
         || null;
 
       const recordElement = expanded?.element || fallbackElement;
-      const recordContext = expanded?.context || context || this.buildContextFromElement(recordElement, finalText);
+      const recordContext = hasExplicitSelection
+        ? (context || this.buildContextFromElement(recordElement, finalText))
+        : (expanded?.context || context || this.buildContextFromElement(recordElement, finalText));
 
       const containerText = expanded?.containerText || finalText;
       const containerTextLength = expanded?.containerTextLength ?? containerText.length;

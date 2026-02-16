@@ -67,7 +67,7 @@ class PopupController {
     // Listen for storage changes to auto-refresh data
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName === 'local') {
-        if (changes.conversationLogs || changes.copyActivities) {
+        if (changes.conversationLogs) {
           this.handleStorageChange();
         }
       }

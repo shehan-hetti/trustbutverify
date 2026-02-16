@@ -45,7 +45,7 @@ function readability(): any {
 }
 
 /** Don't bother computing metrics for texts shorter than this. */
-const MIN_WORD_COUNT = 20;
+const MIN_WORD_COUNT = 10;
 
 /**
  * Hard cap on the text length fed to the library.
