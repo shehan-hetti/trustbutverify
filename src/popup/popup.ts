@@ -2,7 +2,8 @@ import type {
   CopyActivity,
   ConversationLog,
   MessageResponse,
-  AnalyticsSummary
+  AnalyticsSummary,
+  NudgeAggregateStats
 } from '../types';
 
 class PopupController {
@@ -23,10 +24,17 @@ class PopupController {
   private statTextTotals: HTMLElement;
   private domainBreakdownList: HTMLElement;
   private analyticsSection: HTMLElement;
+  private nudgeShown: HTMLElement;
+  private nudgeAnswered: HTMLElement;
+  private nudgeSkipped: HTMLElement;
+  private nudgeDismissRate: HTMLElement;
+  private nudgeCopyRate: HTMLElement;
+  private nudgeResponseRate: HTMLElement;
 
   private conversations: ConversationLog[] = [];
   private activities: CopyActivity[] = [];
   private stats: AnalyticsSummary | null = null;
+  private nudgeStats: NudgeAggregateStats | null = null;
   private currentTab: 'conversations' | 'copies' = 'conversations';
   private currentSearchTerm = '';
   private currentDomain = '';
@@ -51,16 +59,24 @@ class PopupController {
     this.statTextTotals = document.getElementById('statTextTotals')!;
     this.domainBreakdownList = document.getElementById('domainBreakdown')!;
     this.analyticsSection = document.getElementById('analyticsSection')!;
+    this.nudgeShown = document.getElementById('nudgeShown')!;
+    this.nudgeAnswered = document.getElementById('nudgeAnswered')!;
+    this.nudgeSkipped = document.getElementById('nudgeSkipped')!;
+    this.nudgeDismissRate = document.getElementById('nudgeDismissRate')!;
+    this.nudgeCopyRate = document.getElementById('nudgeCopyRate')!;
+    this.nudgeResponseRate = document.getElementById('nudgeResponseRate')!;
 
     this.init();
   }
 
   private async init(): Promise<void> {
     await this.loadAnalytics();
+    await this.loadNudgeStats();
     this.populateDomainFilter();
     await Promise.all([this.loadConversations(), this.loadActivities()]);
     this.bindEvents();
     this.renderAnalytics();
+    this.renderNudgeStats();
     this.renderConversations();
     this.renderActivities();
     
@@ -69,6 +85,9 @@ class PopupController {
       if (areaName === 'local') {
         if (changes.conversationLogs) {
           this.handleStorageChange();
+        }
+        if (changes.nudgeEvents) {
+          this.loadNudgeStats().then(() => this.renderNudgeStats());
         }
       }
     });
@@ -209,6 +228,41 @@ class PopupController {
         .map(([domain, count]) => `<li class="domain-chip">${this.escapeHtml(this.formatDomain(domain))} • ${count}</li>`)
         .join('');
     }
+  }
+
+  private async loadNudgeStats(): Promise<void> {
+    try {
+      const response: MessageResponse = await chrome.runtime.sendMessage({
+        type: 'GET_NUDGE_STATS'
+      });
+      if (response.success && response.data) {
+        this.nudgeStats = response.data as NudgeAggregateStats;
+      }
+    } catch (error) {
+      console.error('[TrustButVerify] Error loading nudge stats:', error);
+    }
+  }
+
+  private renderNudgeStats(): void {
+    if (!this.nudgeStats || this.nudgeStats.totalShown === 0) {
+      this.nudgeShown.textContent = '0';
+      this.nudgeAnswered.textContent = '0';
+      this.nudgeSkipped.textContent = '0';
+      this.nudgeDismissRate.textContent = '0%';
+      this.nudgeCopyRate.textContent = 'Copy: 0%';
+      this.nudgeResponseRate.textContent = 'Response: 0%';
+      return;
+    }
+
+    const { totalShown, answered, skipped, dismissRateByQuestionType } = this.nudgeStats;
+    const overallDismissRate = totalShown > 0 ? Math.round((skipped / totalShown) * 100) : 0;
+
+    this.nudgeShown.textContent = totalShown.toString();
+    this.nudgeAnswered.textContent = answered.toString();
+    this.nudgeSkipped.textContent = skipped.toString();
+    this.nudgeDismissRate.textContent = `${overallDismissRate}%`;
+    this.nudgeCopyRate.textContent = `Copy: ${Math.round((dismissRateByQuestionType.copy || 0) * 100)}%`;
+    this.nudgeResponseRate.textContent = `Response: ${Math.round((dismissRateByQuestionType.response || 0) * 100)}%`;
   }
 
   private populateDomainFilter(): void {

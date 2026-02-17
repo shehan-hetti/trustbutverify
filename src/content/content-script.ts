@@ -1,5 +1,16 @@
-import type { CopyActivity, CopyActivityTrigger } from '../types';
+import type {
+  CopyActivity,
+  CopyActivityTrigger,
+  NudgeAnswerMode,
+  NudgeTriggerType
+} from '../types';
 import { ConversationDetector } from '../utils/conversation-detector';
+import {
+  NudgeOverlay,
+  type NudgeOverlayPayload,
+  type NudgeOverlayResolution,
+  type NudgeOverlayPosition
+} from './nudge-overlay';
 
 /**
  * Content script that tracks copy events and conversations on LLM/Gen AI websites
@@ -7,6 +18,7 @@ import { ConversationDetector } from '../utils/conversation-detector';
 class ActivityTracker {
   private readonly domain: string;
   private conversationDetector: ConversationDetector;
+  private nudgeOverlay: NudgeOverlay | null = null;
   private lastInteractedElement: HTMLElement | null = null;
   private overlayToggle?: (show?: boolean) => void;
   private overlayAutoShown = false;
@@ -17,6 +29,69 @@ class ActivityTracker {
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
   private static readonly MAX_PAIRED_PROMPT_CHARS = 20000;
   private static readonly CHAT_ACTIVITY_EVENT = 'tbv:chat-activity';
+  private static readonly NUDGE_TIMEOUT_MS = 25_000;
+
+  private readonly handleRuntimeMessage = (
+    message: unknown,
+    _sender: chrome.runtime.MessageSender,
+    sendResponse: (response?: unknown) => void
+  ): boolean | void => {
+    const payload = (message || {}) as {
+      type?: string;
+      data?: {
+        questionId?: string;
+        questionText?: string;
+        answerMode?: NudgeAnswerMode;
+        triggerType?: NudgeTriggerType;
+        conversationId?: string;
+        turnId?: string;
+        copyActivityId?: string;
+        timeoutMs?: number;
+        position?: NudgeOverlayPosition;
+      };
+    };
+
+    if (!payload?.type) {
+      return;
+    }
+
+    if (payload.type === 'SHOW_NUDGE' || payload.type === 'TBV_SHOW_NUDGE') {
+      // Only handle nudge messages in the top frame to avoid invisible iframe overlays
+      if (window.top !== window.self) {
+        return;
+      }
+
+      const data = payload.data;
+      if (!data || !data.questionId || !data.questionText || !data.answerMode || !data.triggerType) {
+        console.warn('[TrustButVerify] Invalid nudge payload:', data);
+        sendResponse({ success: false, error: 'Invalid nudge payload' });
+        return;
+      }
+
+      this.showNudgeOverlay({
+        questionId: data.questionId,
+        questionText: data.questionText,
+        answerMode: data.answerMode,
+        triggerType: data.triggerType,
+        conversationId: data.conversationId,
+        turnId: data.turnId,
+        copyActivityId: data.copyActivityId,
+        timeoutMs: data.timeoutMs,
+        position: data.position
+      });
+      sendResponse({ success: true });
+      return;
+    }
+
+    if (payload.type === 'HIDE_NUDGE' || payload.type === 'TBV_HIDE_NUDGE') {
+      if (window.top !== window.self) {
+        return;
+      }
+      this.nudgeOverlay?.hide();
+      sendResponse({ success: true });
+      return;
+    }
+  };
 
   private readonly handleBridgeMessage = (event: MessageEvent) => {
     if (event.source !== window || !event.data || typeof event.data !== 'object') {
@@ -91,6 +166,10 @@ class ActivityTracker {
     // Initialize conversation tracking
     this.conversationDetector.init();
 
+    // Initialize nudge UI layer (hidden until explicitly requested).
+    this.initNudgeOverlay();
+    chrome.runtime.onMessage.addListener(this.handleRuntimeMessage);
+
     // Show overlay lazily only after first meaningful user activity.
     window.addEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
 
@@ -100,7 +179,80 @@ class ActivityTracker {
     window.addEventListener('beforeunload', () => {
       window.removeEventListener('message', this.handleBridgeMessage);
       window.removeEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
+      chrome.runtime.onMessage.removeListener(this.handleRuntimeMessage);
+      this.nudgeOverlay?.dispose();
+      this.nudgeOverlay = null;
     });
+  }
+
+  private initNudgeOverlay(): void {
+    if (this.nudgeOverlay) {
+      return;
+    }
+
+    try {
+      this.nudgeOverlay = new NudgeOverlay();
+      this.nudgeOverlay.setOnResolve((result) => this.handleNudgeResolution(result));
+    } catch (error) {
+      console.debug('[TrustButVerify] Nudge overlay init failed:', error);
+      this.nudgeOverlay = null;
+    }
+  }
+
+  private showNudgeOverlay(data: NudgeOverlayPayload): void {
+    this.initNudgeOverlay();
+    if (!this.nudgeOverlay) {
+      console.warn('[TrustButVerify] Nudge overlay not available, cannot show nudge');
+      return;
+    }
+
+    console.log('[TrustButVerify] Showing nudge overlay:', data.questionId, data.questionText);
+    this.nudgeOverlay.show({
+      ...data,
+      timeoutMs: data.timeoutMs ?? ActivityTracker.NUDGE_TIMEOUT_MS
+    });
+  }
+
+  private handleNudgeResolution(result: NudgeOverlayResolution): void {
+    console.debug('[TrustButVerify] Nudge resolved:', {
+      questionId: result.questionId,
+      response: result.response,
+      responseTimeMs: result.responseTimeMs,
+      dismissedBy: result.dismissedBy,
+      triggerType: result.triggerType,
+      conversationId: result.conversationId,
+      turnId: result.turnId,
+      copyActivityId: result.copyActivityId
+    });
+
+    // Persist the nudge event via service worker
+    const nudgeEvent = {
+      id: `nudge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: Date.now(),
+      conversationId: result.conversationId || '',
+      turnId: result.turnId,
+      copyActivityId: result.copyActivityId,
+      domain: this.domain,
+      triggerType: result.triggerType,
+      nudgeQuestionId: result.questionId,
+      nudgeQuestionText: result.questionText,
+      response: result.response,
+      responseTimeMs: result.responseTimeMs,
+      dismissedBy: result.dismissedBy
+    };
+
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'SAVE_NUDGE_EVENT', data: nudgeEvent },
+        () => {
+          if (chrome.runtime.lastError) {
+            console.debug('[TrustButVerify] Nudge event save failed:', chrome.runtime.lastError.message);
+          }
+        }
+      );
+    } catch {
+      // Extension context may be invalidated — safe to ignore
+    }
   }
 
   /**

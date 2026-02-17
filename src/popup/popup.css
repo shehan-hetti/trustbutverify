@@ -164,6 +164,62 @@ header h1 {
   color: #555;
 }
 
+/* ── Nudge stats ─────────────────────────────────────────────────── */
+.nudge-stats {
+  margin-top: 16px;
+}
+
+.nudge-stats h3 {
+  font-size: 0.93em;
+  font-weight: 600;
+  color: #444;
+  margin-bottom: 8px;
+}
+
+.nudge-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.nudge-stat {
+  background: #f0f4ff;
+  border: 1px solid #dce3ff;
+  border-radius: 8px;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.nudge-stat-value {
+  font-size: 1.15em;
+  font-weight: 600;
+  color: #3f51b5;
+}
+
+.nudge-stat-label {
+  font-size: 0.75em;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.nudge-dismiss-breakdown {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.nudge-dismiss-chip {
+  background: #f0f0f5;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.8em;
+  color: #666;
+}
+
 .controls {
   display: flex;
   flex-wrap: wrap;

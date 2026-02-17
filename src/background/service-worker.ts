@@ -1,5 +1,6 @@
 import { StorageManager } from '../utils/storage';
 import { computeReadability } from '../utils/readability-metrics';
+import { getNextNudgeQuestion } from '../nudges/nudge-selector';
 import type {
   MessagePayload,
   MessageResponse,
@@ -77,7 +78,7 @@ async function handleMessage(
   });
   switch (message.type) {
     case 'COPY_EVENT':
-      return handleCopyEvent(message.data as CopyActivity);
+      return handleCopyEvent(message.data as CopyActivity, sender);
     
     case 'GET_ACTIVITIES':
       return handleGetActivities((message.data as { limit?: number })?.limit);
@@ -92,7 +93,7 @@ async function handleMessage(
         threadId: string;
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
-      });
+      }, sender);
     
     case 'GET_CONVERSATIONS':
       return handleGetConversations(message.data as GetConversationsParams | undefined);
@@ -102,6 +103,12 @@ async function handleMessage(
 
     case 'GET_ANALYTICS':
       return handleGetAnalytics();
+
+    case 'SAVE_NUDGE_EVENT':
+      return handleSaveNudgeEvent(message.data as import('../types').NudgeEvent);
+
+    case 'GET_NUDGE_STATS':
+      return handleGetNudgeStats();
     
     default:
       return {
@@ -114,7 +121,7 @@ async function handleMessage(
 /**
  * Handle copy event from content script
  */
-async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse> {
+async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.MessageSender): Promise<MessageResponse> {
   try {
     flowTrace('handleCopyEvent:start', {
       id: activity.id,
@@ -167,6 +174,14 @@ async function handleCopyEvent(activity: CopyActivity): Promise<MessageResponse>
       copyCategory: enriched.copyCategory,
       timestamp: new Date(enriched.timestamp).toISOString()
     });
+
+    // ── Nudge trigger: response-side copy ≥ 80 chars ──
+    if (
+      enriched.turnSide === 'response' &&
+      enriched.textLength >= NUDGE_COPY_MIN_CHARS
+    ) {
+      void trySendCopyNudge(sender.tab?.id, enriched);
+    }
     
     return { success: true };
   } catch (error) {
@@ -875,7 +890,7 @@ async function handleUpsertConversationTurns(payload: {
   threadId: string;
   threadInfo?: Partial<ConversationLog>;
   turns: ConversationTurn[];
-}): Promise<MessageResponse> {
+}, sender: chrome.runtime.MessageSender): Promise<MessageResponse> {
   try {
     flowTrace('handleUpsertConversationTurns:start', {
       threadId: payload.threadId,
@@ -920,6 +935,9 @@ async function handleUpsertConversationTurns(payload: {
       threadId: payload.threadId,
       turnCount: payload.turns.length
     });
+
+    // ── Nudge trigger: every Nth qualifying response ──
+    void tryResponseNudge(sender.tab?.id, payload.threadId, enrichedTurns);
 
     return { success: true };
   } catch (error) {
@@ -1206,6 +1224,208 @@ async function handleClearConversations(): Promise<MessageResponse> {
   } catch (error) {
     console.error('[TrustButVerify] Error clearing conversations:', error);
     throw error;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Nudge event persistence                                            */
+/* ------------------------------------------------------------------ */
+
+async function handleSaveNudgeEvent(event: import('../types').NudgeEvent): Promise<MessageResponse> {
+  try {
+    await StorageManager.saveNudgeEvent(event);
+    flowTrace('nudge:event-saved', {
+      id: event.id,
+      questionId: event.nudgeQuestionId,
+      response: event.response,
+      dismissedBy: event.dismissedBy,
+      triggerType: event.triggerType
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error saving nudge event:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+async function handleGetNudgeStats(): Promise<MessageResponse> {
+  try {
+    const stats = await StorageManager.getNudgeAggregateStats();
+    return { success: true, data: stats };
+  } catch (error) {
+    console.error('[TrustButVerify] Error getting nudge stats:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Nudge trigger helpers                                              */
+/* ------------------------------------------------------------------ */
+
+/** Minimum copied-text length to trigger a copy nudge. */
+const NUDGE_COPY_MIN_CHARS = 80;
+/** Minimum response text length to count as "meaningful" for response nudge. */
+const NUDGE_RESPONSE_MIN_CHARS = 250;
+/** Fire a response nudge every N qualifying responses. */
+const NUDGE_RESPONSE_EVERY_N = 3;
+/** chrome.storage.local key for the per-session qualifying-response counter. */
+const NUDGE_RESPONSE_COUNTER_KEY = 'nudgeResponseCounter';
+/** Dedup window (ms) — skip duplicate response nudge for same thread within this period. */
+const NUDGE_RESPONSE_DEDUP_WINDOW_MS = 30_000;
+/**
+ * In-memory guard to prevent duplicate response nudges caused by concurrent
+ * UPSERT_CONVERSATION_TURNS calls for the same thread during streaming.
+ * Maps threadId → timestamp of last response nudge fired.
+ */
+const lastResponseNudgeFired = new Map<string, number>();
+
+/**
+ * Send a SHOW_NUDGE message to the content script on the given tab.
+ * Fire-and-forget — errors are logged but never propagated.
+ */
+function sendNudgeToTab(
+  tabId: number,
+  data: {
+    questionId: string;
+    questionText: string;
+    answerMode: string;
+    triggerType: string;
+    conversationId?: string;
+    turnId?: string;
+    copyActivityId?: string;
+    timeoutMs?: number;
+    position?: string;
+  }
+): void {
+  chrome.tabs.sendMessage(
+    tabId,
+    { type: 'SHOW_NUDGE', data },
+    { frameId: 0 },
+    () => {
+      // Swallow "receiving end does not exist" errors gracefully.
+      if (chrome.runtime.lastError) {
+        console.debug('[TrustButVerify] Nudge send skipped:', chrome.runtime.lastError.message);
+      }
+    }
+  );
+}
+
+/**
+ * Try to fire a copy-triggered nudge after a qualifying copy event.
+ */
+async function trySendCopyNudge(
+  tabId: number | undefined,
+  activity: CopyActivity
+): Promise<void> {
+  if (!tabId) {
+    return;
+  }
+  try {
+    const question = await getNextNudgeQuestion('copy');
+    if (!question) {
+      return;
+    }
+    flowTrace('nudge:copy-trigger', {
+      tabId,
+      questionId: question.id,
+      copyActivityId: activity.id,
+      textLength: activity.textLength
+    });
+    sendNudgeToTab(tabId, {
+      questionId: question.id,
+      questionText: question.text,
+      answerMode: question.answerMode,
+      triggerType: 'copy',
+      conversationId: activity.conversationId,
+      turnId: activity.turnId,
+      copyActivityId: activity.id,
+      timeoutMs: 25_000,
+      position: 'top-right'
+    });
+  } catch (error) {
+    console.debug('[TrustButVerify] Copy nudge failed:', error);
+  }
+}
+
+/**
+ * Try to fire a response-triggered nudge.
+ * Increments a global counter for every qualifying response and fires
+ * a nudge on every NUDGE_RESPONSE_EVERY_N-th qualifying response.
+ *
+ * A response qualifies when:
+ *   - textLength ≥ NUDGE_RESPONSE_MIN_CHARS, OR
+ *   - complexity is 'hard' or 'very-hard'
+ */
+async function tryResponseNudge(
+  tabId: number | undefined,
+  threadId: string,
+  turns: ConversationTurn[]
+): Promise<void> {
+  if (!tabId) {
+    return;
+  }
+
+  // ── Dedup guard: skip if a response nudge was already fired for this
+  //    thread within the dedup window (prevents race from concurrent upserts).
+  const lastFired = lastResponseNudgeFired.get(threadId);
+  if (lastFired && (Date.now() - lastFired) < NUDGE_RESPONSE_DEDUP_WINDOW_MS) {
+    return;
+  }
+
+  try {
+    // Count qualifying turns in this batch
+    const qualifying = turns.filter(t => {
+      const len = t.response?.textLength ?? 0;
+      const band = t.response?.complexity?.complexityBand;
+      return len >= NUDGE_RESPONSE_MIN_CHARS || band === 'hard' || band === 'very-hard';
+    });
+
+    if (qualifying.length === 0) {
+      return;
+    }
+
+    // Load and increment the global counter
+    const result = await chrome.storage.local.get(NUDGE_RESPONSE_COUNTER_KEY);
+    let counter: number = (typeof result[NUDGE_RESPONSE_COUNTER_KEY] === 'number')
+      ? result[NUDGE_RESPONSE_COUNTER_KEY]
+      : 0;
+
+    for (const turn of qualifying) {
+      counter += 1;
+
+      if (counter % NUDGE_RESPONSE_EVERY_N === 0) {
+        const question = await getNextNudgeQuestion('response');
+        if (!question) {
+          continue;
+        }
+        flowTrace('nudge:response-trigger', {
+          tabId,
+          questionId: question.id,
+          threadId,
+          turnId: turn.id,
+          counter,
+          responseLength: turn.response?.textLength
+        });
+        sendNudgeToTab(tabId, {
+          questionId: question.id,
+          questionText: question.text,
+          answerMode: question.answerMode,
+          triggerType: 'response',
+          conversationId: threadId,
+          turnId: turn.id,
+          timeoutMs: 25_000,
+          position: 'top-right'
+        });
+        // Record dedup timestamp so concurrent upserts don't fire again
+        lastResponseNudgeFired.set(threadId, Date.now());
+        // Only one nudge per upsert batch to avoid spamming
+        break;
+      }
+    }
+
+    await chrome.storage.local.set({ [NUDGE_RESPONSE_COUNTER_KEY]: counter });
+  } catch (error) {
+    console.debug('[TrustButVerify] Response nudge failed:', error);
   }
 }
 

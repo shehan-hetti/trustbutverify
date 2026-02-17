@@ -192,9 +192,67 @@ export interface ConversationLog {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/*  Nudge system types                                                 */
+/* ------------------------------------------------------------------ */
+
+export type NudgeTriggerType = 'copy' | 'response';
+
+export type NudgeAnswerMode =
+  | 'yes_no_skip'
+  | 'yes_partly_no_skip'
+  | 'rating_1_10_skip';
+
+export type NudgeNumericRating = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+
+/**
+ * Stored in a single `response` field.
+ * - Binary / ternary nudges use yes/no/partly/skip
+ * - Rating nudges store 1..10 directly here (no separate responseValue)
+ */
+export type NudgeResponseValue =
+  | 'yes'
+  | 'no'
+  | 'partly'
+  | 'skip'
+  | NudgeNumericRating;
+
+export interface NudgeQuestion {
+  id: string;
+  text: string;
+  triggerType: NudgeTriggerType;
+  answerMode: NudgeAnswerMode;
+  active: boolean;
+  tags?: string[];
+}
+
+export interface NudgeEvent {
+  id: string;
+  timestamp: number;
+  conversationId: string;
+  turnId?: string;
+  copyActivityId?: string;
+  domain: string;
+  platform?: string;
+  triggerType: NudgeTriggerType;
+  nudgeQuestionId: string;
+  nudgeQuestionText: string;
+  response: NudgeResponseValue;
+  responseTimeMs: number;
+  dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
+}
+
+export interface NudgeAggregateStats {
+  totalShown: number;
+  answered: number;
+  skipped: number;
+  dismissRateByQuestionType: Record<NudgeTriggerType, number>;
+}
+
 export interface StorageData {
   activities: CopyActivity[];
   conversations: ConversationLog[];
+  nudgeEvents?: NudgeEvent[];
 }
 
 export interface AnalyticsSummary {
@@ -221,12 +279,15 @@ export interface MessagePayload {
     | 'UPSERT_CONVERSATION_TURNS'
     | 'GET_CONVERSATIONS'
     | 'CLEAR_CONVERSATIONS'
-    | 'GET_ANALYTICS';
+    | 'GET_ANALYTICS'
+    | 'SAVE_NUDGE_EVENT'
+    | 'GET_NUDGE_STATS';
   data?:
     | CopyActivity
     | ConversationLog
     | { limit?: number }
     | GetConversationsParams
+    | NudgeEvent
     | {
         threadId: string;
         threadInfo?: Partial<ConversationLog>;
@@ -240,7 +301,8 @@ export interface MessageResponse {
     | CopyActivity[]
     | ConversationLog[]
     | { count: number }
-    | AnalyticsSummary;
+    | AnalyticsSummary
+    | NudgeAggregateStats;
   error?: string;
 }
 

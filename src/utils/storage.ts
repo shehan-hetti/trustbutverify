@@ -1,4 +1,11 @@
-import type { CopyActivity, ConversationLog, ConversationTurn } from '../types';
+import type {
+  CopyActivity,
+  ConversationLog,
+  ConversationTurn,
+  NudgeAggregateStats,
+  NudgeEvent,
+  NudgeTriggerType
+} from '../types';
 
 /**
  * Storage utility for managing copy activities and conversation logs
@@ -6,9 +13,11 @@ import type { CopyActivity, ConversationLog, ConversationTurn } from '../types';
 export class StorageManager {
   private static readonly LEGACY_COPY_STORAGE_KEY = 'copyActivities';
   private static readonly CONVERSATION_STORAGE_KEY = 'conversationLogs';
+  private static readonly NUDGE_EVENTS_STORAGE_KEY = 'nudgeEvents';
   private static readonly COPY_MIGRATION_FLAG_KEY = 'copyActivitiesMigratedToConversationsV1';
   private static readonly MAX_ACTIVITIES = 1000;
   private static readonly MAX_CONVERSATIONS = 500;
+  private static readonly MAX_NUDGE_EVENTS = 5000;
   private static migrationPromise: Promise<void> | null = null;
 
   private static normalizeTurnText(text: string): string {
@@ -133,6 +142,12 @@ export class StorageManager {
   private static trimConversations(data: ConversationLog[]): void {
     if (data.length > this.MAX_CONVERSATIONS) {
       data.splice(0, data.length - this.MAX_CONVERSATIONS);
+    }
+  }
+
+  private static trimNudgeEvents(events: NudgeEvent[]): void {
+    if (events.length > this.MAX_NUDGE_EVENTS) {
+      events.splice(0, events.length - this.MAX_NUDGE_EVENTS);
     }
   }
 
@@ -557,6 +572,89 @@ export class StorageManager {
   static async getConversationsCount(): Promise<number> {
     const conversations = await this.getAllConversations();
     return conversations.length;
+  }
+
+  /**
+   * Save a nudge event.
+   */
+  static async saveNudgeEvent(event: NudgeEvent): Promise<void> {
+    try {
+      const events = await this.getAllNudgeEvents();
+      if (events.some((e) => e.id === event.id)) {
+        return;
+      }
+
+      events.push(event);
+      events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      this.trimNudgeEvents(events);
+
+      await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
+    } catch (error) {
+      console.error('Error saving nudge event:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all stored nudge events.
+   */
+  static async getAllNudgeEvents(): Promise<NudgeEvent[]> {
+    try {
+      const result = await chrome.storage.local.get(this.NUDGE_EVENTS_STORAGE_KEY);
+      const events = (result[this.NUDGE_EVENTS_STORAGE_KEY] as NudgeEvent[] | undefined) || [];
+      return events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    } catch (error) {
+      console.error('Error getting nudge events:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get recent nudge events.
+   */
+  static async getRecentNudgeEvents(limit: number = 100): Promise<NudgeEvent[]> {
+    const events = await this.getAllNudgeEvents();
+    return events.slice(-limit);
+  }
+
+  /**
+   * Clear all nudge events.
+   */
+  static async clearNudgeEvents(): Promise<void> {
+    try {
+      await chrome.storage.local.remove(this.NUDGE_EVENTS_STORAGE_KEY);
+    } catch (error) {
+      console.error('Error clearing nudge events:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Aggregate stats computed directly from nudge events.
+   */
+  static async getNudgeAggregateStats(): Promise<NudgeAggregateStats> {
+    const events = await this.getAllNudgeEvents();
+    const totalShown = events.length;
+    const skipped = events.filter((e) => e.response === 'skip').length;
+    const answered = totalShown - skipped;
+
+    const triggerTypes: NudgeTriggerType[] = ['copy', 'response'];
+    const dismissRateByQuestionType = triggerTypes.reduce<Record<NudgeTriggerType, number>>((acc, type) => {
+      const shownForType = events.filter((e) => e.triggerType === type).length;
+      const skippedForType = events.filter((e) => e.triggerType === type && e.response === 'skip').length;
+      acc[type] = shownForType > 0 ? skippedForType / shownForType : 0;
+      return acc;
+    }, {
+      copy: 0,
+      response: 0
+    });
+
+    return {
+      totalShown,
+      answered,
+      skipped,
+      dismissRateByQuestionType
+    };
   }
 
   /**
