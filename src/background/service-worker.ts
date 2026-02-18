@@ -1,13 +1,15 @@
 import { StorageManager } from '../utils/storage';
 import { computeReadability } from '../utils/readability-metrics';
 import { getNextNudgeQuestion } from '../nudges/nudge-selector';
+import { verifyParticipant as apiVerifyParticipant, syncData as apiSyncData } from '../utils/backend-api';
 import type {
   MessagePayload,
   MessageResponse,
   CopyActivity,
   ConversationLog,
   ConversationTurn,
-  GetConversationsParams
+  GetConversationsParams,
+  SyncResult
 } from '../types';
 
 /**
@@ -109,6 +111,15 @@ async function handleMessage(
 
     case 'GET_NUDGE_STATS':
       return handleGetNudgeStats();
+
+    case 'VERIFY_PARTICIPANT':
+      return handleVerifyParticipant(message.data as { uuid: string });
+
+    case 'TRIGGER_SYNC':
+      return handleTriggerSync();
+
+    case 'GET_SYNC_STATUS':
+      return handleGetSyncStatus();
     
     default:
       return {
@@ -1432,7 +1443,12 @@ async function tryResponseNudge(
 // Extension installed/updated
 chrome.runtime.onInstalled.addListener((details) => {
   console.log('[TrustButVerify] Extension installed/updated:', details.reason);
+  // Route popup based on registration state
+  routePopup();
 });
+
+// Also check on service-worker startup (browser restart)
+routePopup();
 
 function deriveThreadIdFromUrl(url: string, domain: string): string {
   try {
@@ -1461,4 +1477,270 @@ function deriveThreadIdFromUrl(url: string, domain: string): string {
   } catch {
     return `${domain}::unknown`;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Popup routing: registration vs main                                */
+/* ------------------------------------------------------------------ */
+
+async function routePopup(): Promise<void> {
+  try {
+    const uuid = await StorageManager.getParticipantUuid();
+    if (uuid) {
+      chrome.action.setPopup({ popup: 'popup/popup.html' });
+    } else {
+      chrome.action.setPopup({ popup: 'registration/registration.html' });
+    }
+  } catch (err) {
+    console.error('[TrustButVerify] routePopup error:', err);
+    // Fallback to registration if unknown state
+    chrome.action.setPopup({ popup: 'registration/registration.html' });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sync / participant handlers                                        */
+/* ------------------------------------------------------------------ */
+
+async function handleVerifyParticipant(
+  data: { uuid: string }
+): Promise<MessageResponse> {
+  const uuid = (data?.uuid || '').trim();
+  if (!uuid) {
+    return { success: false, error: 'UUID is required' };
+  }
+
+  try {
+    const result = await apiVerifyParticipant(uuid);
+    if (result.valid) {
+      await StorageManager.setParticipantUuid(uuid);
+      // Switch action popup to the main dashboard
+      chrome.action.setPopup({ popup: 'popup/popup.html' });
+      flowTrace('participant verified', { uuid });
+      return { success: true, data: { valid: true } };
+    }
+    return { success: true, data: { valid: false, error: 'UUID not recognized by the server' } };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[TrustButVerify] Verify participant failed:', msg);
+    return { success: false, error: msg };
+  }
+}
+
+async function handleTriggerSync(): Promise<MessageResponse> {
+  const uuid = await StorageManager.getParticipantUuid();
+  if (!uuid) {
+    return { success: false, error: 'No participant UUID registered' };
+  }
+
+  try {
+    await StorageManager.setSyncStatus('syncing');
+
+    // Gather all local data
+    const conversations = await StorageManager.getAllConversations();
+    const nudgeEvents = await StorageManager.getAllNudgeEvents();
+
+    // Build the sync payload — shape it to match backend SyncRequest
+    const payload = buildSyncPayload(conversations, nudgeEvents);
+
+    flowTrace('sync:start', {
+      conversations: payload.conversations.length,
+      nudgeEvents: payload.nudgeEvents.length
+    });
+
+    const result = await apiSyncData(uuid, payload);
+
+    const syncedAt = Date.now();
+    await StorageManager.setLastSyncAt(syncedAt);
+    await StorageManager.setSyncStatus('success');
+
+    const syncResult: SyncResult = {
+      success: true,
+      newConversations: result.newConversations,
+      updatedConversations: result.updatedConversations,
+      newTurns: result.newTurns,
+      newCopyActivities: result.newCopyActivities,
+      newNudgeEvents: result.newNudgeEvents,
+      syncedAt
+    };
+
+    flowTrace('sync:done', syncResult as unknown as Record<string, unknown>);
+    return { success: true, data: syncResult };
+  } catch (err: unknown) {
+    await StorageManager.setSyncStatus('error');
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[TrustButVerify] Sync failed:', msg);
+    return {
+      success: false,
+      data: {
+        success: false,
+        newConversations: 0,
+        updatedConversations: 0,
+        newTurns: 0,
+        newCopyActivities: 0,
+        newNudgeEvents: 0,
+        syncedAt: 0,
+        error: msg
+      } as SyncResult,
+      error: msg
+    };
+  }
+}
+
+async function handleGetSyncStatus(): Promise<MessageResponse> {
+  try {
+    const participantUuid = await StorageManager.getParticipantUuid();
+    const lastSyncAt = await StorageManager.getLastSyncAt();
+    const syncStatus = await StorageManager.getSyncStatus();
+
+    return {
+      success: true,
+      data: { participantUuid, lastSyncAt, syncStatus }
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sync payload builder — maps local types to backend schema          */
+/* ------------------------------------------------------------------ */
+
+interface SyncTurnPayload {
+  id: string;
+  previousTurnId: string | null;
+  prompt: {
+    text?: string;
+    textLength: number;
+    ts: number;
+  };
+  response: {
+    text?: string;
+    textLength: number;
+    ts: number;
+    readability?: Record<string, unknown>;
+    complexity?: Record<string, unknown>;
+  };
+  responseTimeMs: number | null;
+  category: string | null;
+  summary: string | null;
+  ts: number;
+}
+
+interface SyncCopyPayload {
+  id: string;
+  timestamp: number;
+  domain: string;
+  url: string;
+  conversationId: string;
+  turnId: string | null;
+  turnSide: string | null;
+  textLength: number;
+  containerTextLength: number | null;
+  copyCategory: string | null;
+  copyCategorySource: string | null;
+  readability?: Record<string, unknown>;
+  complexity?: Record<string, unknown>;
+}
+
+interface SyncConversationPayload {
+  id: string;
+  platform: string;
+  domain: string;
+  url: string;
+  title: string | null;
+  createdAt: number;
+  lastUpdatedAt: number;
+  turns: SyncTurnPayload[];
+  copyActivities: SyncCopyPayload[];
+}
+
+interface SyncNudgePayload {
+  id: string;
+  timestamp: number;
+  domain: string;
+  conversationId: string;
+  turnId: string | null;
+  copyActivityId: string | null;
+  triggerType: string;
+  nudgeQuestionId: string;
+  nudgeQuestionText: string;
+  response: string | number;
+  responseTimeMs: number;
+  dismissedBy: string;
+}
+
+function buildSyncPayload(
+  conversations: ConversationLog[],
+  nudgeEvents: import('../types').NudgeEvent[]
+): { conversations: SyncConversationPayload[]; nudgeEvents: SyncNudgePayload[] } {
+  const syncConversations: SyncConversationPayload[] = conversations.map((c) => ({
+    id: c.id,
+    platform: c.platform || derivePlatformFromDomain(c.domain),
+    domain: c.domain,
+    url: c.url,
+    title: c.title ?? null,
+    createdAt: c.createdAt,
+    lastUpdatedAt: c.lastUpdatedAt,
+    turns: c.turns.map((t): SyncTurnPayload => ({
+      id: t.id,
+      previousTurnId: t.previousTurnId ?? null,
+      prompt: {
+        textLength: t.prompt.textLength,
+        ts: t.prompt.ts
+      },
+      response: {
+        textLength: t.response.textLength,
+        ts: t.response.ts,
+        ...(t.response.readability ? { readability: t.response.readability as unknown as Record<string, unknown> } : {}),
+        ...(t.response.complexity ? { complexity: t.response.complexity as unknown as Record<string, unknown> } : {})
+      },
+      responseTimeMs: t.responseTimeMs ?? null,
+      category: (t.category && t.category !== 'pending') ? t.category : null,
+      summary: (t.summary && t.summary !== 'pending') ? t.summary : null,
+      ts: t.ts
+    })),
+    copyActivities: (c.copyActivities || []).map((a): SyncCopyPayload => ({
+      id: a.id,
+      timestamp: a.timestamp,
+      domain: a.domain,
+      url: a.url,
+      conversationId: a.conversationId || c.id,
+      turnId: a.turnId ?? null,
+      turnSide: a.turnSide ?? null,
+      textLength: a.textLength,
+      containerTextLength: a.containerTextLength ?? null,
+      copyCategory: a.copyCategory ?? null,
+      copyCategorySource: a.copyCategorySource ?? null,
+      ...(a.readability ? { readability: a.readability as unknown as Record<string, unknown> } : {}),
+      ...(a.complexity ? { complexity: a.complexity as unknown as Record<string, unknown> } : {})
+    }))
+  }));
+
+  const syncNudgeEvents: SyncNudgePayload[] = nudgeEvents.map((e) => ({
+    id: e.id,
+    timestamp: e.timestamp,
+    domain: e.domain,
+    conversationId: e.conversationId,
+    turnId: e.turnId ?? null,
+    copyActivityId: e.copyActivityId ?? null,
+    triggerType: e.triggerType,
+    nudgeQuestionId: e.nudgeQuestionId,
+    nudgeQuestionText: e.nudgeQuestionText,
+    response: e.response,
+    responseTimeMs: e.responseTimeMs,
+    dismissedBy: e.dismissedBy
+  }));
+
+  return { conversations: syncConversations, nudgeEvents: syncNudgeEvents };
+}
+
+function derivePlatformFromDomain(domain: string): string {
+  if (domain.includes('chatgpt') || domain.includes('openai')) return 'ChatGPT';
+  if (domain.includes('deepseek')) return 'DeepSeek';
+  if (domain.includes('claude')) return 'Claude';
+  if (domain.includes('gemini')) return 'Gemini';
+  if (domain.includes('grok') || domain === 'x.ai') return 'Grok';
+  return 'Unknown';
 }

@@ -97,6 +97,25 @@
       </div>
     </section>
 
+    <section class="sync-section" id="syncSection">
+      <div class="sync-header">
+        <h3>Data Sync</h3>
+        <span class="sync-status-badge" id="syncStatusBadge">idle</span>
+      </div>
+      <div class="sync-info">
+        <div class="sync-info-row">
+          <span class="sync-info-label">Participant</span>
+          <span class="sync-info-value" id="syncParticipantId">—</span>
+        </div>
+        <div class="sync-info-row">
+          <span class="sync-info-label">Last synced</span>
+          <span class="sync-info-value" id="syncLastTime">Never</span>
+        </div>
+      </div>
+      <button class="sync-btn" id="syncNowBtn">Sync Now</button>
+      <div id="syncResultMessage" class="sync-result" hidden></div>
+    </section>
+
     <footer>
       <p class="privacy-note">🔒 All data stored locally on your device</p>
     </footer>

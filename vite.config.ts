@@ -3,6 +3,8 @@ import { resolve } from 'path';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
 export default defineConfig({
+  // Chrome extension popups are loaded from chrome-extension:// — relative paths required
+  base: './',
   resolve: {
     alias: {
       // Force the CJS build of text-readability-ts.  The .mjs build has a
@@ -37,7 +39,8 @@ export default defineConfig({
         'background': resolve(__dirname, 'src/background/service-worker.ts'),
         'content': resolve(__dirname, 'src/content/content-script.ts'),
         'clipboard-bridge': resolve(__dirname, 'src/content/clipboard-bridge.ts'),
-        'popup': resolve(__dirname, 'src/popup/popup.html')
+        'popup': resolve(__dirname, 'src/popup/popup.html'),
+        'registration': resolve(__dirname, 'src/registration/registration.html')
       },
       output: {
         entryFileNames: (chunkInfo: any) => {
@@ -53,12 +56,18 @@ export default defineConfig({
           if (chunkInfo.name === 'popup') {
             return 'popup/popup.js';
           }
+          if (chunkInfo.name === 'registration') {
+            return 'registration/registration.js';
+          }
           return '[name].js';
         },
         chunkFileNames: 'chunks/[name]-[hash].js',
         assetFileNames: (assetInfo: any) => {
           if (assetInfo.name === 'popup.css') {
             return 'popup/popup.css';
+          }
+          if (assetInfo.name === 'registration.css') {
+            return 'registration/registration.css';
           }
           if (assetInfo.name === 'popup.html') {
             return 'popup/popup.html';

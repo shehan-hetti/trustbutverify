@@ -3,7 +3,9 @@ import type {
   ConversationLog,
   MessageResponse,
   AnalyticsSummary,
-  NudgeAggregateStats
+  NudgeAggregateStats,
+  SyncResult,
+  SyncStatus
 } from '../types';
 
 class PopupController {
@@ -30,6 +32,11 @@ class PopupController {
   private nudgeDismissRate: HTMLElement;
   private nudgeCopyRate: HTMLElement;
   private nudgeResponseRate: HTMLElement;
+  private syncStatusBadge: HTMLElement;
+  private syncParticipantId: HTMLElement;
+  private syncLastTime: HTMLElement;
+  private syncNowBtn: HTMLButtonElement;
+  private syncResultMessage: HTMLElement;
 
   private conversations: ConversationLog[] = [];
   private activities: CopyActivity[] = [];
@@ -65,6 +72,11 @@ class PopupController {
     this.nudgeDismissRate = document.getElementById('nudgeDismissRate')!;
     this.nudgeCopyRate = document.getElementById('nudgeCopyRate')!;
     this.nudgeResponseRate = document.getElementById('nudgeResponseRate')!;
+    this.syncStatusBadge = document.getElementById('syncStatusBadge')!;
+    this.syncParticipantId = document.getElementById('syncParticipantId')!;
+    this.syncLastTime = document.getElementById('syncLastTime')!;
+    this.syncNowBtn = document.getElementById('syncNowBtn') as HTMLButtonElement;
+    this.syncResultMessage = document.getElementById('syncResultMessage')!;
 
     this.init();
   }
@@ -72,6 +84,7 @@ class PopupController {
   private async init(): Promise<void> {
     await this.loadAnalytics();
     await this.loadNudgeStats();
+    await this.loadSyncStatus();
     this.populateDomainFilter();
     await Promise.all([this.loadConversations(), this.loadActivities()]);
     this.bindEvents();
@@ -137,6 +150,7 @@ class PopupController {
 
     this.exportJsonBtn.addEventListener('click', () => this.handleExport('json'));
     this.exportCsvBtn.addEventListener('click', () => this.handleExport('csv'));
+    this.syncNowBtn.addEventListener('click', () => this.handleSync());
   }
 
   private async loadAnalytics(): Promise<void> {
@@ -497,6 +511,113 @@ class PopupController {
 
   private showConversationError(message: string): void {
     this.conversationsList.innerHTML = `<p class="empty-state" style="color: #ff4757;">${this.escapeHtml(message)}</p>`;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /*  Sync UI                                                          */
+  /* ---------------------------------------------------------------- */
+
+  private async loadSyncStatus(): Promise<void> {
+    try {
+      const response: MessageResponse = await chrome.runtime.sendMessage({
+        type: 'GET_SYNC_STATUS'
+      });
+      if (response.success && response.data) {
+        const data = response.data as {
+          participantUuid?: string;
+          lastSyncAt?: number;
+          syncStatus: SyncStatus;
+        };
+        this.renderSyncStatus(data.syncStatus, data.participantUuid, data.lastSyncAt);
+      }
+    } catch (err) {
+      console.error('[TrustButVerify] Error loading sync status:', err);
+    }
+  }
+
+  private renderSyncStatus(
+    status: SyncStatus,
+    participantUuid?: string,
+    lastSyncAt?: number
+  ): void {
+    // Badge
+    this.syncStatusBadge.textContent = status;
+    this.syncStatusBadge.className = 'sync-status-badge';
+    if (status !== 'idle') {
+      this.syncStatusBadge.classList.add(`status-${status}`);
+    }
+
+    // Participant UUID (truncated)
+    if (participantUuid) {
+      this.syncParticipantId.textContent = participantUuid.substring(0, 8) + '…';
+      this.syncParticipantId.title = participantUuid;
+    } else {
+      this.syncParticipantId.textContent = '—';
+    }
+
+    // Last sync time
+    if (lastSyncAt) {
+      this.syncLastTime.textContent = this.getTimeAgo(new Date(lastSyncAt));
+      this.syncLastTime.title = new Date(lastSyncAt).toLocaleString();
+    } else {
+      this.syncLastTime.textContent = 'Never';
+    }
+
+    // Button state
+    this.syncNowBtn.disabled = status === 'syncing';
+    this.syncNowBtn.textContent = status === 'syncing' ? 'Syncing…' : 'Sync Now';
+  }
+
+  private async handleSync(): Promise<void> {
+    this.syncNowBtn.disabled = true;
+    this.syncNowBtn.textContent = 'Syncing…';
+    this.syncStatusBadge.textContent = 'syncing';
+    this.syncStatusBadge.className = 'sync-status-badge status-syncing';
+    this.syncResultMessage.hidden = true;
+
+    try {
+      const response: MessageResponse = await chrome.runtime.sendMessage({
+        type: 'TRIGGER_SYNC'
+      });
+
+      if (response.success && response.data) {
+        const result = response.data as SyncResult;
+        this.renderSyncStatus('success', undefined, result.syncedAt);
+        // Keep participant ID visible — re-fetch
+        await this.loadSyncStatus();
+
+        const parts: string[] = [];
+        if (result.newConversations) parts.push(`${result.newConversations} new conv`);
+        if (result.updatedConversations) parts.push(`${result.updatedConversations} updated conv`);
+        if (result.newTurns) parts.push(`${result.newTurns} new turns`);
+        if (result.newCopyActivities) parts.push(`${result.newCopyActivities} new copies`);
+        if (result.newNudgeEvents) parts.push(`${result.newNudgeEvents} new nudges`);
+
+        const summary = parts.length > 0
+          ? `✓ Synced: ${parts.join(', ')}`
+          : '✓ Everything is up to date';
+
+        this.syncResultMessage.textContent = summary;
+        this.syncResultMessage.className = 'sync-result result-success';
+        this.syncResultMessage.hidden = false;
+      } else {
+        this.renderSyncStatus('error');
+        await this.loadSyncStatus();
+        this.syncResultMessage.textContent = response.error || 'Sync failed';
+        this.syncResultMessage.className = 'sync-result result-error';
+        this.syncResultMessage.hidden = false;
+      }
+    } catch (err: unknown) {
+      this.renderSyncStatus('error');
+      await this.loadSyncStatus();
+      const msg = err instanceof Error ? err.message : String(err);
+      this.syncResultMessage.textContent = `Sync error: ${msg}`;
+      this.syncResultMessage.className = 'sync-result result-error';
+      this.syncResultMessage.hidden = false;
+    }
+
+    this.syncNowBtn.disabled = false;
+    this.syncNowBtn.textContent = 'Sync Now';
   }
 
   private showCopyError(message: string): void {

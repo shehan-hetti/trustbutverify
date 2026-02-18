@@ -18,7 +18,8 @@
     "https://grok.com/*",
     "https://claude.ai/*",
     "https://gemini.google.com/*",
-    "http://86.50.252.163/*"
+    "http://86.50.252.163/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js"
@@ -29,7 +30,10 @@
         "content/clipboard-bridge.js",
         "popup/popup.html",
         "popup/popup.js",
-        "popup/popup.css"
+        "popup/popup.css",
+        "registration/registration.html",
+        "registration/registration.js",
+        "registration/registration.css"
       ],
       "matches": [
         "https://chat.openai.com/*",

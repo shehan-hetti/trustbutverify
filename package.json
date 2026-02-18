@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite build --watch --mode development",
     "build": "tsc && vite build && npm run postbuild",
-    "postbuild": "mv dist/src/popup/popup.html dist/popup/ 2>/dev/null || true && rm -rf dist/src && sed -i 's|src=\"/popup/popup.js\"|src=\"./popup.js\"|g' dist/popup/popup.html && sed -i 's|href=\"/popup/popup.css\"|href=\"./popup.css\"|g' dist/popup/popup.html",
+    "postbuild": "node scripts/postbuild.js",
     "preview": "vite preview",
     "type-check": "tsc --noEmit"
   },

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrustButVerify — Registration</title>
+  <link rel="stylesheet" href="./registration.css">
+</head>
+<body>
+  <div class="reg-container">
+    <header class="reg-header">
+      <h1>TrustButVerify</h1>
+      <p class="reg-subtitle">Participant Registration</p>
+    </header>
+
+    <main class="reg-main">
+      <p class="reg-instructions">
+        Enter the Participant ID provided by the researcher to activate the extension.
+      </p>
+
+      <div class="reg-form">
+        <label for="uuidInput" class="reg-label">Participant ID</label>
+        <input
+          type="text"
+          id="uuidInput"
+          class="reg-input"
+          placeholder="e.g. 2d08677a-2575-40a5-b406-245a59a029dc"
+          spellcheck="false"
+          autocomplete="off"
+        >
+        <button id="verifyBtn" class="reg-btn">Verify &amp; Activate</button>
+      </div>
+
+      <div id="statusMessage" class="reg-status" hidden></div>
+    </main>
+
+    <footer class="reg-footer">
+      <p>🔒 Your data is stored locally until you choose to sync.</p>
+    </footer>
+  </div>
+
+  <script type="module" src="./registration.ts"></script>
+</body>
+</html>

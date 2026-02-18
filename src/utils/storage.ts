@@ -4,7 +4,8 @@ import type {
   ConversationTurn,
   NudgeAggregateStats,
   NudgeEvent,
-  NudgeTriggerType
+  NudgeTriggerType,
+  SyncStatus
 } from '../types';
 
 /**
@@ -704,5 +705,44 @@ export class StorageManager {
       averageResponseTime,
       domainBreakdown
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Sync / participant config helpers                                  */
+  /* ------------------------------------------------------------------ */
+
+  private static readonly PARTICIPANT_UUID_KEY = 'participantUuid';
+  private static readonly LAST_SYNC_AT_KEY = 'lastSyncAt';
+  private static readonly SYNC_STATUS_KEY = 'syncStatus';
+
+  static async getParticipantUuid(): Promise<string | undefined> {
+    const result = await chrome.storage.local.get(this.PARTICIPANT_UUID_KEY);
+    return result[this.PARTICIPANT_UUID_KEY] as string | undefined;
+  }
+
+  static async setParticipantUuid(uuid: string): Promise<void> {
+    await chrome.storage.local.set({ [this.PARTICIPANT_UUID_KEY]: uuid });
+  }
+
+  static async clearParticipantUuid(): Promise<void> {
+    await chrome.storage.local.remove(this.PARTICIPANT_UUID_KEY);
+  }
+
+  static async getLastSyncAt(): Promise<number | undefined> {
+    const result = await chrome.storage.local.get(this.LAST_SYNC_AT_KEY);
+    return result[this.LAST_SYNC_AT_KEY] as number | undefined;
+  }
+
+  static async setLastSyncAt(ts: number): Promise<void> {
+    await chrome.storage.local.set({ [this.LAST_SYNC_AT_KEY]: ts });
+  }
+
+  static async getSyncStatus(): Promise<SyncStatus> {
+    const result = await chrome.storage.local.get(this.SYNC_STATUS_KEY);
+    return (result[this.SYNC_STATUS_KEY] as SyncStatus) || 'idle';
+  }
+
+  static async setSyncStatus(status: SyncStatus): Promise<void> {
+    await chrome.storage.local.set({ [this.SYNC_STATUS_KEY]: status });
   }
 }

@@ -249,10 +249,35 @@ export interface NudgeAggregateStats {
   dismissRateByQuestionType: Record<NudgeTriggerType, number>;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Backend sync types                                                 */
+/* ------------------------------------------------------------------ */
+
+export type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
+
+export interface SyncResult {
+  success: boolean;
+  newConversations: number;
+  updatedConversations: number;
+  newTurns: number;
+  newCopyActivities: number;
+  newNudgeEvents: number;
+  syncedAt: number;
+  error?: string;
+}
+
+export interface VerifyParticipantResult {
+  valid: boolean;
+  error?: string;
+}
+
 export interface StorageData {
   activities: CopyActivity[];
   conversations: ConversationLog[];
   nudgeEvents?: NudgeEvent[];
+  participantUuid?: string;
+  lastSyncAt?: number;
+  syncStatus?: SyncStatus;
 }
 
 export interface AnalyticsSummary {
@@ -281,7 +306,10 @@ export interface MessagePayload {
     | 'CLEAR_CONVERSATIONS'
     | 'GET_ANALYTICS'
     | 'SAVE_NUDGE_EVENT'
-    | 'GET_NUDGE_STATS';
+    | 'GET_NUDGE_STATS'
+    | 'VERIFY_PARTICIPANT'
+    | 'TRIGGER_SYNC'
+    | 'GET_SYNC_STATUS';
   data?:
     | CopyActivity
     | ConversationLog
@@ -292,7 +320,8 @@ export interface MessagePayload {
         threadId: string;
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
-      };
+      }
+    | { uuid: string };
 }
 
 export interface MessageResponse {
@@ -302,7 +331,10 @@ export interface MessageResponse {
     | ConversationLog[]
     | { count: number }
     | AnalyticsSummary
-    | NudgeAggregateStats;
+    | NudgeAggregateStats
+    | SyncResult
+    | VerifyParticipantResult
+    | { participantUuid?: string; lastSyncAt?: number; syncStatus: SyncStatus };
   error?: string;
 }
 
