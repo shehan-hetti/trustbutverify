@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
+import type { UserConfig } from 'vitest/config';
 
 export default defineConfig({
   // Chrome extension popups are loaded from chrome-extension:// — relative paths required
@@ -77,5 +78,11 @@ export default defineConfig({
       }
     },
     sourcemap: process.env.NODE_ENV === 'development'
-  }
+  },
+  test: {
+    globals: true,
+    environment: 'node',
+    include: ['tests/**/*.test.ts'],
+    setupFiles: ['tests/setup.ts'],
+  } satisfies UserConfig['test']
 });
