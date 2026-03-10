@@ -6,7 +6,8 @@
   "permissions": [
     "storage",
     "clipboardRead",
-    "alarms"
+    "alarms",
+    "scripting"
   ],
   "host_permissions": [
     "https://chat.openai.com/*",

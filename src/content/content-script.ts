@@ -20,8 +20,8 @@ class ActivityTracker {
   private conversationDetector: ConversationDetector;
   private nudgeOverlay: NudgeOverlay | null = null;
   private lastInteractedElement: HTMLElement | null = null;
-  private overlayToggle?: (show?: boolean) => void;
-  private overlayAutoShown = false;
+  // [POPUP_UI] private overlayToggle?: (show?: boolean) => void;
+  // [POPUP_UI] private overlayAutoShown = false;
   private extensionContextInvalidated = false;
   private readonly copySignatureCache = new Map<string, number>();
   private static readonly COPY_SIGNATURE_TTL = 2500;
@@ -142,7 +142,7 @@ class ActivityTracker {
   };
 
   private readonly handleChatActivityEvent = () => {
-    this.maybeAutoShowOverlay('chat');
+    // [POPUP_UI] this.maybeAutoShowOverlay('chat');
   };
 
   constructor() {
@@ -170,15 +170,15 @@ class ActivityTracker {
     this.initNudgeOverlay();
     chrome.runtime.onMessage.addListener(this.handleRuntimeMessage);
 
-    // Show overlay lazily only after first meaningful user activity.
-    window.addEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
+    // [POPUP_UI] Show overlay lazily only after first meaningful user activity.
+    // window.addEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
 
-    // Initialize floating popup UI overlay
-    this.initFloatingUI();
+    // [POPUP_UI] Initialize floating popup UI overlay
+    // this.initFloatingUI();
 
     window.addEventListener('beforeunload', () => {
       window.removeEventListener('message', this.handleBridgeMessage);
-      window.removeEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
+      // [POPUP_UI] window.removeEventListener(ActivityTracker.CHAT_ACTIVITY_EVENT, this.handleChatActivityEvent as EventListener);
       chrome.runtime.onMessage.removeListener(this.handleRuntimeMessage);
       this.nudgeOverlay?.dispose();
       this.nudgeOverlay = null;
@@ -255,9 +255,11 @@ class ActivityTracker {
     }
   }
 
-  /**
+  /* [POPUP_UI] ── Floating overlay UI (DISABLED) ──────────────────────
+  **
    * Inject a draggable floating overlay that hosts the extension popup via iframe
    */
+  /*
   private initFloatingUI(): void {
     try {
       if (document.getElementById('__tbv_overlay')) {
@@ -549,6 +551,7 @@ class ActivityTracker {
     this.overlayToggle(true);
     console.debug('[TrustButVerify] Overlay auto-shown after first activity:', reason);
   }
+  */ // [POPUP_UI] ── End floating overlay UI ─────────────────────────────
 
   private async safeStorageGet(keys: string[]): Promise<Record<string, unknown>> {
     if (this.extensionContextInvalidated || !chrome?.runtime?.id) {
@@ -1153,9 +1156,19 @@ class ActivityTracker {
         || nestedTurnMessage
         || turn;
       if (root) {
-        const role = root.matches('div[data-message-author-role]')
+        let role = root.matches('div[data-message-author-role]')
           ? (root.getAttribute('data-message-author-role') || 'unknown')
           : 'unknown';
+
+        // Fallback: if role is unknown (e.g. copy button outside the role
+        // wrapper but inside the turn article), infer from nested children.
+        if (role === 'unknown' && turn) {
+          const nestedAssistant = turn.querySelector('div[data-message-author-role="assistant"]');
+          const nestedUser = turn.querySelector('div[data-message-author-role="user"]');
+          if (nestedAssistant) role = 'assistant';
+          else if (nestedUser) role = 'user';
+        }
+
         const side = role === 'user' ? 'prompt' : role === 'assistant' ? 'response' : undefined;
         const strategy = root.matches('div[data-message-author-role]') ? `chatgpt:message:${role}` : 'chatgpt:conversation-turn';
         const text = this.sanitizeCapturedText(getText(root), side, strategy);
@@ -1189,6 +1202,19 @@ class ActivityTracker {
         }
       }
 
+      // Fallback: copy button may be outside message-content but inside
+      // model-response. Walk up to broader container.
+      const modelResponse = anchor.closest('model-response') as HTMLElement | null;
+      if (modelResponse) {
+        const nested = (modelResponse.querySelector('.markdown.markdown-main-panel') as HTMLElement | null)
+          || (modelResponse.querySelector('message-content') as HTMLElement | null);
+        const target = nested || modelResponse;
+        const text = getText(target);
+        if (text) {
+          return this.buildExpandedCopyResult(target as HTMLElement, text, 'gemini:model-response', 'response');
+        }
+      }
+
       const container = anchor.closest('div.conversation-container') as HTMLElement | null;
       if (container) {
         const text = getText(container);
@@ -1199,12 +1225,16 @@ class ActivityTracker {
     }
 
     if (domain.includes('grok') || domain.includes('x.ai')) {
-      const response = anchor.closest('div[id^="response-"]') as HTMLElement | null;
-      if (response) {
-        const content = (response.querySelector('.response-content-markdown') as HTMLElement | null) || response;
+      const responseDiv = anchor.closest('div[id^="response-"]') as HTMLElement | null;
+      if (responseDiv) {
+        // Grok wraps BOTH user and assistant messages in div[id^="response-"].
+        // User messages have .items-end; assistant messages have .items-start.
+        const isUser = responseDiv.classList.contains('items-end');
+        const content = (responseDiv.querySelector('.response-content-markdown') as HTMLElement | null) || responseDiv;
         const text = getText(content);
         if (text) {
-          return this.buildExpandedCopyResult(content, text, 'grok:response', 'response');
+          const side = isUser ? 'prompt' as const : 'response' as const;
+          return this.buildExpandedCopyResult(content, text, isUser ? 'grok:user' : 'grok:response', side);
         }
       }
     }
@@ -1275,6 +1305,16 @@ class ActivityTracker {
       if (message && (role === 'user' || role === 'assistant')) {
         return { wrapper: message, side: role === 'user' ? 'prompt' : 'response' };
       }
+
+      // Fallback: copy buttons sit outside div[data-message-author-role] but
+      // inside the turn article. Check for nested role elements.
+      const turn = element.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      if (turn) {
+        const assistantMsg = turn.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null;
+        const userMsg = turn.querySelector('div[data-message-author-role="user"]') as HTMLElement | null;
+        if (assistantMsg) return { wrapper: assistantMsg, side: 'response' };
+        if (userMsg) return { wrapper: userMsg, side: 'prompt' };
+      }
       return null;
     }
 
@@ -1294,16 +1334,32 @@ class ActivityTracker {
       const assistant = element.closest('message-content') as HTMLElement | null;
       const assistantText = assistant ? (assistant.querySelector('.markdown.markdown-main-panel') as HTMLElement | null) : null;
       if (assistantText) return { wrapper: assistantText, side: 'response' };
+
+      // Fallback: copy buttons on Gemini may sit outside message-content but
+      // inside a broader response container. Walk up to model-response or
+      // similar wrapper and check for nested message-content.
+      const modelResponse = element.closest('model-response') as HTMLElement | null;
+      if (modelResponse) {
+        const nested = modelResponse.querySelector('.markdown.markdown-main-panel') as HTMLElement | null;
+        if (nested) return { wrapper: nested, side: 'response' };
+        const nestedMsg = modelResponse.querySelector('message-content') as HTMLElement | null;
+        if (nestedMsg) return { wrapper: nestedMsg, side: 'response' };
+        return { wrapper: modelResponse, side: 'response' };
+      }
+
       return null;
     }
 
     if (domain.includes('grok') || domain.includes('x.ai')) {
-      const response = (element.closest('div[id^="response-"]') as HTMLElement | null)
+      const responseDiv = (element.closest('div[id^="response-"]') as HTMLElement | null)
         || (element.closest('[data-testid="assistant-message"]') as HTMLElement | null)
         || (element.closest('[data-testid="response-message"]') as HTMLElement | null);
-      if (response) {
-        const content = (response.querySelector('.response-content-markdown') as HTMLElement | null) || response;
-        return { wrapper: content, side: 'response' };
+      if (responseDiv) {
+        // Grok wraps BOTH user and assistant messages in div[id^="response-"].
+        // User messages have .items-end; assistant messages have .items-start.
+        const isUser = responseDiv.classList.contains('items-end');
+        const content = (responseDiv.querySelector('.response-content-markdown') as HTMLElement | null) || responseDiv;
+        return { wrapper: content, side: isUser ? 'prompt' : 'response' };
       }
 
       const user = (element.closest('[data-testid="user-message"]') as HTMLElement | null)
@@ -1413,12 +1469,16 @@ class ActivityTracker {
     if (domain.includes('grok') || domain.includes('x.ai')) {
       const current = (fromElement.closest('div[id^="response-"]') as HTMLElement | null) || fromElement;
       const userEl = lastBefore([
+        'div[id^="response-"].items-end',
         '[data-testid="user-message"]',
         '[class*="userMessage"]',
         '[class*="userBubble"]',
         '[class*="user-bubble"]'
       ], current);
-      const text = getText(userEl);
+      // Extract text from markdown content inside user bubble, not from the
+      // full container (which includes action-button labels like "Edit","Copy").
+      const md = userEl?.querySelector('.response-content-markdown') as HTMLElement | null;
+      const text = getText(md || userEl);
       return text || undefined;
     }
 
@@ -1589,6 +1649,23 @@ class ActivityTracker {
       return;
     }
 
+    // ── Share-link filter ────────────────────────────────────────────────
+    // Platforms like Gemini/Grok auto-copy share URLs to the clipboard
+    // when the user clicks "Share". Skip these — they're not user-selected
+    // content from a conversation.
+    if (this.looksLikeShareLink(trimmed)) {
+      console.log('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
+      return;
+    }
+
+    // ── Prompt-side copy filter ──────────────────────────────────────────
+    // User requested: skip copy activity from the prompt/user side.
+    // We still capture pairedPromptText when the user copies from response side.
+    if (extras?.turnSide === 'prompt') {
+      console.log('[TrustButVerify] Skipping prompt-side copy activity');
+      return;
+    }
+
     const signature = `${conversationId}:${extras?.turnSide || 'unknown'}:${this.normalizeCopySignature(trimmed)}`;
     if (!this.shouldRecordSignature(signature)) {
       return;
@@ -1619,7 +1696,7 @@ class ActivityTracker {
     };
 
     await this.sendToBackground(activity);
-    this.maybeAutoShowOverlay('copy');
+    // [POPUP_UI] this.maybeAutoShowOverlay('copy');
   }
 
   private cleanTriggerMetadata(trigger: CopyActivityTrigger): CopyActivityTrigger {
@@ -1676,6 +1753,22 @@ class ActivityTracker {
       .slice(0, 800);
   }
 
+  /**
+   * Detect if text is a share link (URL-only content).
+   * Platforms like Gemini/Grok auto-copy share URLs to clipboard.
+   */
+  private looksLikeShareLink(text: string): boolean {
+    const stripped = text.trim();
+    // Must be a single line (no newlines) — multi-line content is never a share link.
+    if (stripped.includes('\n')) return false;
+    try {
+      const url = new URL(stripped);
+      return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+
   private sanitizeCapturedText(
     text: string,
     turnSide?: 'prompt' | 'response',
@@ -1704,6 +1797,7 @@ class ActivityTracker {
 
     cleaned = cleaned
       .replace(/\s*is this conversation helpful so far\?\s*$/i, '')
+      .replace(/\s*do you like this personality\?\s*$/i, '')
       .trim();
 
     return cleaned;

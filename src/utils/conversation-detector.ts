@@ -17,6 +17,23 @@ export class ConversationDetector {
   private readonly processedMessageKeyQueue: string[] = [];
   private readonly recentPrompts: Array<{ text: string; timestamp: number }> = [];
   private extensionContextInvalidated = false;
+  /** Currently observed thread ID, updated by monitorThreadChanges. */
+  private currentThreadId = '';
+  /** Whether the DOM is still settling after SPA navigation (captures blocked). */
+  private isDomSettling = false;
+  /** Handle for the thread-change polling interval so we can clear on teardown. */
+  private threadChangeIntervalId: ReturnType<typeof setInterval> | null = null;
+  /** Handles for the DOM-settling machinery. */
+  private settlingObserver: MutationObserver | null = null;
+  private settlingDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private settlingReseedInterval: ReturnType<typeof setInterval> | null = null;
+  private settlingMaxTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Monotonically increasing counter incremented every time DOM settling starts.
+   * waitForContent captures this value at creation time and bails if it no longer
+   * matches — this automatically cancels stale timers that survived a navigation.
+   */
+  private settlingGeneration = 0;
 
   private async sendMessageToBackground(payload: unknown): Promise<void> {
     // If extension was actually reloaded/updated while this page is alive,
@@ -84,15 +101,131 @@ export class ConversationDetector {
       threadId: this.getConversationId()
     });
 
-    // Important: on refresh, many platforms re-render historical messages as added nodes.
-    // Seed already-rendered assistant messages as processed so we only track genuinely new turns.
-    this.seedExistingAssistantMessages();
+    // Record the initial thread ID for SPA navigation detection.
+    this.currentThreadId = this.getConversationId();
+
+    // Block captures synchronously while the async init decides whether to
+    // restore a persisted prompt or start full DOM settling.
+    this.isDomSettling = true;
+    this.asyncInitSettling();
     
     // Use MutationObserver to detect new messages
     this.observeConversations();
     
     // Listen for form submissions (prompts)
     this.observePromptSubmissions();
+
+    // Poll for SPA navigation (URL-based thread changes) every 500ms
+    this.monitorThreadChanges();
+  }
+
+  /**
+   * Async continuation of init(): checks chrome.storage.session for a
+   * persisted pending prompt (surviving full-page navigations on new-chat
+   * redirects). If found and recent, restores prompt state and skips settling
+   * so the first response gets captured. Otherwise falls through to normal
+   * DOM settling.
+   */
+  private async asyncInitSettling(): Promise<void> {
+    try {
+      const result = await chrome.storage.session.get('tbvPendingPrompt');
+      const stored = result?.tbvPendingPrompt as
+        | { text: string; timestamp: number; domain: string }
+        | undefined;
+
+      if (
+        stored &&
+        stored.domain === this.domain &&
+        Date.now() - stored.timestamp < 15_000
+      ) {
+        // Recent prompt exists — this is likely a new-conversation redirect.
+        // Restore prompt state and DON'T settle so the response gets captured.
+        this.pendingPrompt = {
+          text: stored.text,
+          timestamp: stored.timestamp,
+          threadId: this.currentThreadId
+        };
+        this.lastPromptCapturedAt = stored.timestamp;
+        this.lastPromptIntentAt = stored.timestamp;
+        this.lastUserInteractionAt = stored.timestamp;
+        this.lastPromptThreadId = this.currentThreadId;
+
+        // Seed existing messages so history isn't re-captured, but don't block
+        // future captures (no settling).
+        this.seedExistingAssistantMessages();
+        this.isDomSettling = false;
+
+        await chrome.storage.session.remove('tbvPendingPrompt');
+
+        this.traceFlow('init:restoredPrompt', {
+          threadId: this.currentThreadId,
+          promptLength: stored.text.length,
+          promptPreview: stored.text.substring(0, 80),
+          ageMs: Date.now() - stored.timestamp
+        });
+        return;
+      }
+    } catch {
+      // chrome.storage.session may not be available in all contexts — fall through.
+    }
+
+    // Normal load: start full adaptive DOM settling.
+    this.startDomSettling();
+  }
+
+  /**
+   * Called during URL-change navigation: check chrome.storage.session for a
+   * recently-stored prompt. If found and fresh, restore it and skip settling
+   * so the first response on the new thread gets captured. Otherwise fall
+   * through to normal DOM settling.
+   */
+  private async tryRestorePromptThenSettle(newThreadId: string): Promise<void> {
+    try {
+      const result = await chrome.storage.session.get('tbvPendingPrompt');
+      const stored = result?.tbvPendingPrompt as
+        | { text: string; timestamp: number; domain: string }
+        | undefined;
+
+      if (
+        stored &&
+        stored.domain === this.domain &&
+        Date.now() - stored.timestamp < 15_000
+      ) {
+        // Recent prompt — restore state and skip settling.
+        this.pendingPrompt = {
+          text: stored.text,
+          timestamp: stored.timestamp,
+          threadId: newThreadId
+        };
+        this.lastPromptCapturedAt = stored.timestamp;
+        this.lastPromptIntentAt = stored.timestamp;
+        this.lastUserInteractionAt = stored.timestamp;
+        this.lastPromptThreadId = newThreadId;
+
+        this.seedExistingAssistantMessages();
+        this.isDomSettling = false;
+
+        await chrome.storage.session.remove('tbvPendingPrompt');
+
+        this.traceFlow('tryRestorePromptThenSettle:restored', {
+          threadId: newThreadId,
+          promptLength: stored.text.length,
+          promptPreview: stored.text.substring(0, 80),
+          ageMs: Date.now() - stored.timestamp
+        });
+        return;
+      }
+    } catch {
+      // chrome.storage.session may not be available — fall through.
+    }
+
+    // No stored prompt — normal settling.
+    this.startDomSettling();
+
+    this.traceFlow('monitorThreadChanges:stateReset', {
+      newThreadId,
+      isDomSettling: true
+    });
   }
 
   /**
@@ -140,6 +273,177 @@ export class ConversationDetector {
         domain: this.domain
       });
     }
+  }
+
+  /**
+   * Poll for SPA navigation by comparing the current thread ID to the last known one.
+   * On thread change:
+   *  - If a prompt was captured very recently (≤5 s), update its threadId to the new one
+   *    (handles new-chat URL rewrite race).
+   *  - Otherwise, reset capture state and start DOM-settling detection.
+   */
+  private monitorThreadChanges(): void {
+    if (this.threadChangeIntervalId !== null) {
+      clearInterval(this.threadChangeIntervalId);
+    }
+
+    const POLL_MS = 500;
+    const PROMPT_GRACE_MS = 5_000;
+
+    this.threadChangeIntervalId = setInterval(() => {
+      const newThreadId = this.getConversationId();
+      if (newThreadId === this.currentThreadId) {
+        return;
+      }
+
+      const oldThreadId = this.currentThreadId;
+      this.currentThreadId = newThreadId;
+
+      this.traceFlow('monitorThreadChanges:change', {
+        from: oldThreadId,
+        to: newThreadId,
+        hasPendingPrompt: Boolean(this.pendingPrompt),
+        timeSinceLastPromptMs: this.lastPromptCapturedAt ? Date.now() - this.lastPromptCapturedAt : null
+      });
+
+      // If a prompt was captured just before the URL changed (new-chat redirect),
+      // update pendingPrompt's threadId so it pairs with the response on the new thread.
+      if (
+        this.pendingPrompt
+        && this.lastPromptCapturedAt > 0
+        && (Date.now() - this.lastPromptCapturedAt) <= PROMPT_GRACE_MS
+      ) {
+        this.traceFlow('monitorThreadChanges:updatePendingPromptThread', {
+          from: this.pendingPrompt.threadId,
+          to: newThreadId
+        });
+        this.pendingPrompt.threadId = newThreadId;
+        this.lastPromptThreadId = newThreadId;
+        return;
+      }
+
+      // Otherwise this is a genuine navigation – clear stale state to prevent phantom captures.
+      this.pendingPrompt = null;
+      this.lastPromptCapturedAt = 0;
+      this.lastPromptIntentAt = 0;
+      this.lastPromptThreadId = null;
+      this.lastUserInteractionAt = 0;
+      this.recentPrompts.length = 0;
+
+      // Before settling, check chrome.storage.session for a recently-stored
+      // prompt. This handles the case where a new-chat prompt was persisted
+      // just before the URL changed (e.g. Grok / → /c/<id> redirect) but the
+      // grace window above didn't apply because pendingPrompt was already
+      // cleared by an earlier cycle.
+      this.tryRestorePromptThenSettle(newThreadId);
+    }, POLL_MS);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Adaptive DOM-settling detection                                    */
+  /*                                                                     */
+  /*  After SPA navigation, the chat container gets populated with       */
+  /*  historical messages. We block all captures until the DOM has been  */
+  /*  quiet (no childList mutations) for SETTLE_QUIET_MS. During the    */
+  /*  settling window we periodically re-seed so late-arriving messages  */
+  /*  get marked as processed.                                          */
+  /*                                                                     */
+  /*  SETTLE_QUIET_MS  — required quiet time before declaring settled   */
+  /*  SETTLE_MAX_MS    — hard cap to avoid blocking forever             */
+  /*  RESEED_INTERVAL  — how often to re-seed during settling           */
+  /* ------------------------------------------------------------------ */
+
+  private static readonly SETTLE_QUIET_MS = 2_000;
+  private static readonly SETTLE_MAX_MS = 30_000;
+  private static readonly SETTLE_RESEED_MS = 1_000;
+
+  private startDomSettling(): void {
+    // If already settling (rapid navigation), tear down the old session first.
+    this.finishDomSettling(true /* silent — don't seed, we're about to restart */);
+
+    this.isDomSettling = true;
+    this.settlingGeneration++;
+
+    // Immediate seed of whatever is already rendered.
+    this.seedExistingAssistantMessages();
+
+    this.traceFlow('startDomSettling', { threadId: this.currentThreadId });
+
+    // ── Debounced settling observer ────────────────────────────────────
+    const resetDebounce = () => {
+      if (this.settlingDebounceTimer !== null) {
+        clearTimeout(this.settlingDebounceTimer);
+      }
+      this.settlingDebounceTimer = setTimeout(() => {
+        // DOM has been quiet for SETTLE_QUIET_MS → settled.
+        this.traceFlow('domSettled:quiet', {
+          threadId: this.currentThreadId,
+          quietMs: ConversationDetector.SETTLE_QUIET_MS
+        });
+        this.finishDomSettling();
+      }, ConversationDetector.SETTLE_QUIET_MS);
+    };
+
+    // Start the initial debounce timer.
+    resetDebounce();
+
+    // Observe body for any structural mutations (message elements being added).
+    this.settlingObserver = new MutationObserver(() => {
+      resetDebounce();
+    });
+    this.settlingObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    // ── Periodic re-seed ───────────────────────────────────────────────
+    this.settlingReseedInterval = setInterval(() => {
+      if (this.isDomSettling) {
+        this.seedExistingAssistantMessages();
+      }
+    }, ConversationDetector.SETTLE_RESEED_MS);
+
+    // ── Hard safety cap ────────────────────────────────────────────────
+    this.settlingMaxTimer = setTimeout(() => {
+      if (this.isDomSettling) {
+        this.traceFlow('domSettled:maxCap', {
+          threadId: this.currentThreadId,
+          maxMs: ConversationDetector.SETTLE_MAX_MS
+        });
+        this.finishDomSettling();
+      }
+    }, ConversationDetector.SETTLE_MAX_MS);
+  }
+
+  /**
+   * Declare the DOM settled, run a final seed, and re-enable captures.
+   * @param silent If true, skip the final seed (used when restarting settling).
+   */
+  private finishDomSettling(silent = false): void {
+    if (this.settlingObserver) {
+      this.settlingObserver.disconnect();
+      this.settlingObserver = null;
+    }
+    if (this.settlingDebounceTimer !== null) {
+      clearTimeout(this.settlingDebounceTimer);
+      this.settlingDebounceTimer = null;
+    }
+    if (this.settlingReseedInterval !== null) {
+      clearInterval(this.settlingReseedInterval);
+      this.settlingReseedInterval = null;
+    }
+    if (this.settlingMaxTimer !== null) {
+      clearTimeout(this.settlingMaxTimer);
+      this.settlingMaxTimer = null;
+    }
+
+    if (!silent) {
+      // One final seed to catch anything that arrived in the last quiet window.
+      this.seedExistingAssistantMessages();
+      this.traceFlow('finishDomSettling', { threadId: this.currentThreadId });
+    }
+
+    this.isDomSettling = false;
   }
 
   /**
@@ -377,9 +681,32 @@ export class ConversationDetector {
         return;
       }
       const target = event.target as HTMLElement;
-      const clickable = target.closest(
-        'button,[role="button"],[aria-label*="Send" i],[aria-label*="Submit" i],[data-testid*="send" i],[data-test-id*="send" i],[data-testid*="submit" i],[data-test-id*="submit" i]'
-      ) as HTMLElement | null;
+
+      // First, try to match a button with explicit send/submit attributes.
+      const sendSpecificSelector =
+        '[aria-label*="Send" i],[aria-label*="Submit" i],' +
+        '[data-testid*="send" i],[data-test-id*="send" i],' +
+        '[data-testid*="submit" i],[data-test-id*="submit" i]';
+      let clickable = target.closest(sendSpecificSelector) as HTMLElement | null;
+
+      // If no send-specific match, fall back to generic button — but ONLY if
+      // it sits inside the composer area (form or contenteditable container).
+      // This prevents sidebar buttons, "see all", lightbox nav etc. from
+      // being treated as prompt-send controls.
+      if (!clickable) {
+        const genericBtn = target.closest('button,[role="button"]') as HTMLElement | null;
+        if (genericBtn) {
+          const nearComposer = Boolean(
+            genericBtn.closest('form') ||
+            genericBtn.parentElement?.querySelector(
+              'textarea, [role="textbox"], div[contenteditable="true"], .ProseMirror'
+            )
+          );
+          if (nearComposer) {
+            clickable = genericBtn;
+          }
+        }
+      }
       if (!clickable) {
         return;
       }
@@ -396,10 +723,10 @@ export class ConversationDetector {
         return;
       }
 
-      // Record prompt-send intent even if composer text extraction fails.
-      // This allows fallback inferred turn pairing for first-turn/new-thread cases.
-      this.lastPromptIntentAt = Date.now();
-      this.lastPromptThreadId = this.getConversationId();
+      // ── NOTE: prompt-send intent is ONLY set below, inside the block
+      //    where we actually capture prompt text.  Setting it here for every
+      //    matched button (sidebar, "see all", lightbox, etc.) was the #1 cause
+      //    of phantom inferred turns.
 
       updateCachedPrompt();
       const immediatePrompt = this.getComposerText();
@@ -418,7 +745,21 @@ export class ConversationDetector {
         return;
       }
 
+      // Minimum prompt length: single-character composer leftovers are not prompts.
+      if (cachedPrompt.trim().length < 2) {
+        this.traceFlow('observePromptSubmissions:clickPromptTooShort', {
+          threadId: this.getConversationId(),
+          promptLength: cachedPrompt.trim().length
+        });
+        cachedPrompt = '';
+        return;
+      }
+
       if (cachedPrompt && Date.now() - cacheTimestamp < 45000) {
+        // NOW record intent — only when we actually have a substantive prompt.
+        this.lastPromptIntentAt = Date.now();
+        this.lastPromptThreadId = this.getConversationId();
+
         this.logDebug('Click captured prompt', {
           clickableTag: clickable.tagName,
           clickableAria: clickable.getAttribute('aria-label') || undefined,
@@ -656,6 +997,25 @@ export class ConversationDetector {
           messageKey,
           selector
         });
+        // Stamp the thread ID on the element so that waitForContent →
+        // extractAndSaveMessage can verify the thread hasn't changed.
+        if (candidate instanceof HTMLElement) {
+          candidate.dataset.tbvDetectedThread = this.currentThreadId;
+        }
+
+        // During DOM settling, don't start new waitForContent chains — the
+        // periodic re-seed in startDomSettling handles marking elements as
+        // processed.  Starting timers here would only create stale captures
+        // that fire after settling finishes.
+        if (this.isDomSettling) {
+          this.markProcessed(candidate, messageKey);
+          this.traceFlow('detectMessage:blockedDuringSettling', {
+            threadId: this.getConversationId(),
+            messageKey
+          });
+          return;
+        }
+
         this.waitForContent(candidate);
       });
     }
@@ -665,6 +1025,11 @@ export class ConversationDetector {
    * Wait for element to have content, then extract it
    */
   private waitForContent(element: Element): void {
+    // Capture the settling generation at creation time.  If a navigation or
+    // settling restart bumps the generation while this timer is in-flight,
+    // finalizeIfReady will detect the mismatch and bail out.
+    const capturedGeneration = this.settlingGeneration;
+
     this.traceFlow('waitForContent:start', {
       threadId: this.getConversationId(),
       key: this.getElementKey(element),
@@ -695,8 +1060,8 @@ export class ConversationDetector {
     let lastLoggedPlaceholderCount = 0;
     let placeholderWaitActive = false;
 
-    const STABILITY_DELAY = 1200;
-    const FALLBACK_DELAY = 25000;
+    const STABILITY_DELAY = 2000;
+    const FALLBACK_DELAY = 60000;
     const PROMPT_WAIT_RETRY_MS = 150;
     const PROMPT_WAIT_MAX_RETRIES = 10;
     const PLACEHOLDER_MAX_RETRIES = 80;
@@ -750,6 +1115,20 @@ export class ConversationDetector {
 
     const finalizeIfReady = () => {
       if (this.processedElements.has(element)) {
+        return;
+      }
+
+      // If the settling generation has advanced since this waitForContent was
+      // created, a navigation/settling restart happened.  This timer is stale
+      // and must not produce a capture.
+      if (this.settlingGeneration !== capturedGeneration) {
+        this.traceFlow('waitForContent:staleGeneration', {
+          key: this.getElementKey(element),
+          capturedGen: capturedGeneration,
+          currentGen: this.settlingGeneration
+        });
+        cleanup();
+        this.markProcessed(element, this.getElementKey(element));
         return;
       }
 
@@ -878,10 +1257,7 @@ export class ConversationDetector {
     if (domain.includes('chatgpt') || domain.includes('openai')) {
       return [
         '[data-message-author-role="assistant"]',
-        '.agent-turn',
-        '.markdown',
-        '[class*="Message"]',
-        ...this.getGenericAssistantSelectors()
+        '.agent-turn'
       ];
     }
 
@@ -889,49 +1265,32 @@ export class ConversationDetector {
     if (domain.includes('claude')) {
       return [
         '[data-is-streaming="false"]',
-        '.font-claude-response',
-        ...this.getGenericAssistantSelectors()
+        '.font-claude-response'
       ];
     }
 
     // Gemini
     if (domain.includes('gemini')) {
       return [
-        '.model-response',
-        '[class*="response"]',
-        '[data-test-id*="response"]',
-        ...this.getGenericAssistantSelectors()
+        '.model-response-text',
+        'message-content.model-response-text',
+        '.model-response'
       ];
     }
 
     // Grok
     if (domain.includes('grok') || domain.includes('x.ai')) {
       return [
-        '[data-testid="assistant-message"]',
-        '[data-testid="response-message"]',
         'div[id^="response-"] .response-content-markdown',
-        'div[id^="response-"]',
-        '[class*="assistant-message"]',
-        '[class*="assistantBubble"]',
-        '[class*="assistant"]:not([class*="user"])',
-        ...this.getGenericAssistantSelectors()
+        'div[id^="response-"]'
       ];
     }
 
     // DeepSeek
     if (domain.includes('deepseek')) {
       return [
-        '[data-role="assistant"]',
-        '.message-content[data-role="assistant"]',
-        '.message-content.ai',
-        '[data-testid="assistant-message"]',
-        '[data-testid*="assistant"]',
-        '[data-testid*="response"]',
-        '.markdown, .markdown-body, .ds-markdown',
-        '.message-content:not([data-role="user"])',
-        '[class*="assistant"]:not([class*="user"])',
-        '[class*="ai-"]:not([class*="user"])',
-        ...this.getGenericAssistantSelectors()
+        '.ds-markdown',
+        '.ds-message:not([class*="user"])'
       ];
     }
 
@@ -942,10 +1301,7 @@ export class ConversationDetector {
   private getGenericAssistantSelectors(): string[] {
     return [
       '[data-role*="assistant"]',
-      '[data-author*="assistant"]',
-      '[class*="assistant"]',
-      '[class*="ai-response"]',
-      '[role="article"]'
+      '[data-author*="assistant"]'
     ];
   }
 
@@ -955,6 +1311,37 @@ export class ConversationDetector {
   private extractAndSaveMessage(element: Element): void {
     const text = this.extractText(element);
     const currentThreadId = this.getConversationId();
+
+    // ── DOM-settling guard ─────────────────────────────────────────────
+    // After SPA navigation, captures are blocked until the DOM stops
+    // mutating (adaptive settling).  This replaces the old fixed cooldown.
+    if (this.isDomSettling) {
+      this.traceFlow('extractAndSaveMessage:domSettling', {
+        threadId: currentThreadId,
+        textPreview: (text || '').substring(0, 80)
+      });
+      this.logDebug('Skipping capture while DOM is still settling');
+      return;
+    }
+
+    // ── Thread-gate guard ──────────────────────────────────────────────
+    // If this element was detected on a different thread (waitForContent
+    // timer survived a navigation), discard it.
+    if (element instanceof HTMLElement && element.dataset.tbvDetectedThread) {
+      if (element.dataset.tbvDetectedThread !== currentThreadId) {
+        this.traceFlow('extractAndSaveMessage:threadGate', {
+          detectedThread: element.dataset.tbvDetectedThread,
+          currentThread: currentThreadId,
+          textPreview: (text || '').substring(0, 80)
+        });
+        this.logDebug('Discarding stale capture from different thread', {
+          detectedThread: element.dataset.tbvDetectedThread,
+          currentThread: currentThreadId
+        });
+        return;
+      }
+    }
+
     this.traceFlow('extractAndSaveMessage:start', {
       threadId: currentThreadId,
       textLength: text?.length || 0,
@@ -1006,7 +1393,7 @@ export class ConversationDetector {
     if (
       this.pendingPrompt
       && pendingPromptMatchesThread
-      && Date.now() - this.pendingPrompt.timestamp < 60000
+      && Date.now() - this.pendingPrompt.timestamp < 45000
     ) {
       const responseTime = Date.now() - this.pendingPrompt.timestamp;
       const threadId = currentThreadId;
@@ -1048,11 +1435,14 @@ export class ConversationDetector {
         }
       }
       this.pendingPrompt = null;
+
+      // Clear persisted prompt now that it has been successfully consumed.
+      try { chrome.storage.session.remove('tbvPendingPrompt'); } catch { /* non-fatal */ }
     } else {
       // Cold-load safety: if no prompt interaction was captured recently,
       // do not infer prompt/response pairs from historical DOM.
-      const RECENT_PROMPT_WINDOW_MS = 90_000;
-      const RECENT_INTERACTION_WINDOW_MS = 90_000;
+      const RECENT_PROMPT_WINDOW_MS = 30_000;
+      const RECENT_INTERACTION_WINDOW_MS = 30_000;
       const latestPromptSignalAt = Math.max(this.lastPromptCapturedAt, this.lastPromptIntentAt);
       const hasRecentPromptIntent = latestPromptSignalAt > 0
         && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
@@ -1133,6 +1523,14 @@ export class ConversationDetector {
     const threadId = this.getConversationId();
     this.lastPromptCapturedAt = timestamp;
     this.lastPromptThreadId = threadId;
+
+    // If the user is actively sending a prompt the page is loaded enough to
+    // interact with — immediately finish DOM settling so the response gets captured.
+    if (this.isDomSettling) {
+      this.traceFlow('handlePrompt:earlySettle', { threadId });
+      this.finishDomSettling();
+    }
+
     this.pendingPrompt = {
       text: promptText,
       timestamp,
@@ -1143,6 +1541,20 @@ export class ConversationDetector {
       promptLength: promptText.length,
       promptPreview: promptText.substring(0, 80)
     });
+
+    // Persist prompt to chrome.storage.session so it survives full-page
+    // navigations (e.g. ChatGPT/Claude/Grok new-chat redirects).
+    try {
+      chrome.storage.session.set({
+        tbvPendingPrompt: {
+          text: promptText,
+          timestamp,
+          domain: this.domain
+        }
+      });
+    } catch {
+      // non-fatal — storage may not be available in all contexts
+    }
 
     const normalized = this.normalizeText(promptText);
     if (normalized) {
@@ -1163,7 +1575,7 @@ export class ConversationDetector {
     }
 
     const now = Date.now();
-    const RECENT_WINDOW_MS = 90_000;
+    const RECENT_WINDOW_MS = 30_000;
     const hasRecentIntent = this.lastPromptIntentAt > 0 && (now - this.lastPromptIntentAt) <= RECENT_WINDOW_MS;
     const threadId = this.getConversationId();
     const lastPromptThreadId = this.lastPromptThreadId;
@@ -1232,6 +1644,14 @@ export class ConversationDetector {
 
     if (this.isGeminiDomain()) {
       text = this.cleanGeminiText(text);
+    }
+
+    if (this.domain.includes('chatgpt') || this.domain.includes('openai')) {
+      text = text
+        .replace(/^\s*chatgpt\s+said:\s*/i, '')
+        .replace(/\s*is this conversation helpful so far\?\s*$/i, '')
+        .replace(/\s*do you like this personality\?\s*$/i, '')
+        .trim();
     }
     
     return text;
@@ -1642,6 +2062,13 @@ export class ConversationDetector {
     promptThreadId: string,
     currentThreadId: string
   ): boolean {
+    // Only allow fallback→concrete mapping within 10s of the last prompt capture.
+    // This prevents stale home-page fallback hashes from mapping to any thread.
+    const MAX_MAPPING_AGE_MS = 10_000;
+    if (!this.lastPromptCapturedAt || (Date.now() - this.lastPromptCapturedAt) > MAX_MAPPING_AGE_MS) {
+      return false;
+    }
+
     const promptDomain = (promptThreadId.split('::')[0] || '').trim();
     const currentDomain = (currentThreadId.split('::')[0] || '').trim();
     if (!promptDomain || !currentDomain || promptDomain !== currentDomain) {

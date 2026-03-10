@@ -4,7 +4,6 @@ import type {
   MessageResponse,
   AnalyticsSummary,
   NudgeAggregateStats,
-  SyncResult,
   SyncStatus
 } from '../types';
 
@@ -35,7 +34,6 @@ class PopupController {
   private syncStatusBadge: HTMLElement;
   private syncParticipantId: HTMLElement;
   private syncLastTime: HTMLElement;
-  private syncNowBtn: HTMLButtonElement;
   private syncResultMessage: HTMLElement;
 
   private conversations: ConversationLog[] = [];
@@ -75,7 +73,6 @@ class PopupController {
     this.syncStatusBadge = document.getElementById('syncStatusBadge')!;
     this.syncParticipantId = document.getElementById('syncParticipantId')!;
     this.syncLastTime = document.getElementById('syncLastTime')!;
-    this.syncNowBtn = document.getElementById('syncNowBtn') as HTMLButtonElement;
     this.syncResultMessage = document.getElementById('syncResultMessage')!;
 
     this.init();
@@ -150,7 +147,6 @@ class PopupController {
 
     this.exportJsonBtn.addEventListener('click', () => this.handleExport('json'));
     this.exportCsvBtn.addEventListener('click', () => this.handleExport('csv'));
-    this.syncNowBtn.addEventListener('click', () => this.handleSync());
   }
 
   private async loadAnalytics(): Promise<void> {
@@ -562,62 +558,6 @@ class PopupController {
     } else {
       this.syncLastTime.textContent = 'Never';
     }
-
-    // Button state
-    this.syncNowBtn.disabled = status === 'syncing';
-    this.syncNowBtn.textContent = status === 'syncing' ? 'Syncing…' : 'Sync Now';
-  }
-
-  private async handleSync(): Promise<void> {
-    this.syncNowBtn.disabled = true;
-    this.syncNowBtn.textContent = 'Syncing…';
-    this.syncStatusBadge.textContent = 'syncing';
-    this.syncStatusBadge.className = 'sync-status-badge status-syncing';
-    this.syncResultMessage.hidden = true;
-
-    try {
-      const response: MessageResponse = await chrome.runtime.sendMessage({
-        type: 'TRIGGER_SYNC'
-      });
-
-      if (response.success && response.data) {
-        const result = response.data as SyncResult;
-        this.renderSyncStatus('success', undefined, result.syncedAt);
-        // Keep participant ID visible — re-fetch
-        await this.loadSyncStatus();
-
-        const parts: string[] = [];
-        if (result.newConversations) parts.push(`${result.newConversations} new conv`);
-        if (result.updatedConversations) parts.push(`${result.updatedConversations} updated conv`);
-        if (result.newTurns) parts.push(`${result.newTurns} new turns`);
-        if (result.newCopyActivities) parts.push(`${result.newCopyActivities} new copies`);
-        if (result.newNudgeEvents) parts.push(`${result.newNudgeEvents} new nudges`);
-
-        const summary = parts.length > 0
-          ? `✓ Synced: ${parts.join(', ')}`
-          : '✓ Everything is up to date';
-
-        this.syncResultMessage.textContent = summary;
-        this.syncResultMessage.className = 'sync-result result-success';
-        this.syncResultMessage.hidden = false;
-      } else {
-        this.renderSyncStatus('error');
-        await this.loadSyncStatus();
-        this.syncResultMessage.textContent = response.error || 'Sync failed';
-        this.syncResultMessage.className = 'sync-result result-error';
-        this.syncResultMessage.hidden = false;
-      }
-    } catch (err: unknown) {
-      this.renderSyncStatus('error');
-      await this.loadSyncStatus();
-      const msg = err instanceof Error ? err.message : String(err);
-      this.syncResultMessage.textContent = `Sync error: ${msg}`;
-      this.syncResultMessage.className = 'sync-result result-error';
-      this.syncResultMessage.hidden = false;
-    }
-
-    this.syncNowBtn.disabled = false;
-    this.syncNowBtn.textContent = 'Sync Now';
   }
 
   private showCopyError(message: string): void {

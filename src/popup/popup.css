@@ -540,33 +540,6 @@ footer {
   white-space: nowrap;
 }
 
-.sync-btn {
-  width: 100%;
-  padding: 9px 16px;
-  font-size: 0.93em;
-  font-weight: 600;
-  color: white;
-  background: linear-gradient(135deg, #27ae60 0%, #1e8449 100%);
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: opacity 0.2s, transform 0.1s;
-}
-
-.sync-btn:hover {
-  opacity: 0.92;
-}
-
-.sync-btn:active {
-  transform: scale(0.98);
-}
-
-.sync-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  transform: none;
-}
-
 .sync-result {
   margin-top: 10px;
   padding: 8px 12px;

@@ -43,6 +43,9 @@ const COPY_CATEGORIZATION_DELAY_MS = 8_000;
 const COPY_CATEGORIZATION_BATCH_LIMIT = 3;
 const COPY_CATEGORIZATION_MAX_ATTEMPTS = 3;
 
+const AUTO_SYNC_ALARM = 'tbv:auto-sync';
+const AUTO_SYNC_INTERVAL_MINUTES = 5;
+
 type PendingCopyCategorizationItem = {
   id: string;
   attempts: number;
@@ -223,14 +226,17 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
     return;
   }
 
-  // Backfill is intentionally limited to ChatGPT-family domains where
-  // first-turn misses are most common and copy extraction is stable.
-  // For other platforms, copy-only actions must NOT create inferred turns.
+  // Backfill is enabled for all supported LLM platforms.
+  // When copy extraction provides a paired prompt + response and
+  // no matching turn exists, infer the turn from copy metadata.
   const domain = (activity.domain || '').toLowerCase();
-  const strategy = (activity.trigger?.extractionStrategy || '').toLowerCase();
-  const isChatGptDomain = domain.includes('chatgpt.com') || domain.includes('openai.com');
-  const isChatGptStrategy = strategy.startsWith('chatgpt:');
-  if (!isChatGptDomain && !isChatGptStrategy) {
+  const isSupportedLlm =
+    domain.includes('chatgpt.com') || domain.includes('openai.com') ||
+    domain.includes('claude.ai') ||
+    domain.includes('gemini.google.com') ||
+    domain.includes('grok.com') || domain.includes('x.ai') ||
+    domain.includes('deepseek.com');
+  if (!isSupportedLlm) {
     flowTrace('tryBackfillTurnFromCopy:skip', { reason: 'domain-gated', id: activity.id, domain });
     return;
   }
@@ -376,16 +382,25 @@ function scheduleCopyCategorizationRun(): void {
 try {
   if (chrome?.alarms?.onAlarm?.addListener) {
     chrome.alarms.onAlarm.addListener((alarm) => {
-      if (alarm.name !== COPY_CATEGORIZATION_ALARM) {
-        return;
+      if (alarm.name === COPY_CATEGORIZATION_ALARM) {
+        void processCopyCategorizationQueue();
+      } else if (alarm.name === AUTO_SYNC_ALARM) {
+        void runAutoSync();
       }
-      void processCopyCategorizationQueue();
     });
   } else {
     console.warn('[TrustButVerify] chrome.alarms unavailable; copy categorization will use setTimeout fallback');
   }
 } catch (err) {
   console.warn('[TrustButVerify] Failed to register alarms listener (non-fatal):', err);
+}
+
+async function runAutoSync(): Promise<void> {
+  const uuid = await StorageManager.getParticipantUuid();
+  if (!uuid) return;
+  flowTrace('autoSync:start');
+  await handleTriggerSync();
+  flowTrace('autoSync:done');
 }
 
 async function processCopyCategorizationQueue(): Promise<void> {
@@ -1443,9 +1458,53 @@ async function tryResponseNudge(
 // Extension installed/updated
 chrome.runtime.onInstalled.addListener((details) => {
   console.log('[TrustButVerify] Extension installed/updated:', details.reason);
-  // Route popup based on registration state
   routePopup();
+
+  // Schedule periodic auto-sync
+  chrome.alarms.create(AUTO_SYNC_ALARM, {
+    delayInMinutes: 1,
+    periodInMinutes: AUTO_SYNC_INTERVAL_MINUTES
+  });
+
+  // Re-inject content scripts into all matching tabs so existing pages
+  // don't require a hard-reload after extension install/update.
+  if (details.reason === 'install' || details.reason === 'update') {
+    reinjectContentScripts();
+  }
 });
+
+async function reinjectContentScripts(): Promise<void> {
+  const LLM_PATTERNS = [
+    'https://chatgpt.com/*',
+    'https://chat.openai.com/*',
+    'https://claude.ai/*',
+    'https://gemini.google.com/*',
+    'https://grok.com/*',
+    'https://x.ai/*',
+    'https://deepseek.com/*',
+    'https://chat.deepseek.com/*',
+    'https://www.deepseek.com/*'
+  ];
+
+  try {
+    const tabs = await chrome.tabs.query({ url: LLM_PATTERNS });
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ['content/content-script.js']
+        });
+        console.log('[TrustButVerify] Re-injected content script into tab:', tab.id, tab.url);
+      } catch (err) {
+        // Tab may be a special page or discarded — non-fatal.
+        console.debug('[TrustButVerify] Could not re-inject into tab:', tab.id, err);
+      }
+    }
+  } catch (err) {
+    console.debug('[TrustButVerify] reinjectContentScripts failed:', err);
+  }
+}
 
 // Also check on service-worker startup (browser restart)
 routePopup();
