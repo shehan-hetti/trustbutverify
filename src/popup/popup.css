@@ -18,39 +18,6 @@ body {
   color: #333;
 }
 
-/* When embedded in overlay iframe, enable container queries and scale with container */
-body[data-tbv-embedded] {
-  width: 100%;
-  height: 100%;
-  min-height: 260px;
-  container-type: inline-size;
-}
-
-/* Responsive scaling based on container width */
-@container (max-width: 350px) {
-  :root {
-    --tbv-scale: 0.85;
-  }
-}
-
-@container (min-width: 351px) and (max-width: 449px) {
-  :root {
-    --tbv-scale: 0.95;
-  }
-}
-
-@container (min-width: 450px) and (max-width: 549px) {
-  :root {
-    --tbv-scale: 1;
-  }
-}
-
-@container (min-width: 550px) {
-  :root {
-    --tbv-scale: 1.1;
-  }
-}
-
 .container {
   display: flex;
   flex-direction: column;

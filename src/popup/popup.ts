@@ -7,6 +7,11 @@ import type {
   SyncStatus
 } from '../types';
 
+/**
+ * Controller for the extension popup UI.
+ * Manages conversation list, copy activity list, analytics dashboard,
+ * nudge feedback stats, sync status display, and data export.
+ */
 class PopupController {
   private conversationsList: HTMLElement;
   private activitiesList: HTMLElement;
@@ -103,6 +108,7 @@ class PopupController {
     });
   }
 
+  /** Reload all data and re-render when chrome.storage changes externally. */
   private async handleStorageChange(): Promise<void> {
     await this.loadAnalytics();
     await Promise.all([this.loadConversations(), this.loadActivities()]);
@@ -275,6 +281,7 @@ class PopupController {
     this.nudgeResponseRate.textContent = `Response: ${Math.round((dismissRateByQuestionType.response || 0) * 100)}%`;
   }
 
+  /** Populate the domain dropdown from the current analytics breakdown. */
   private populateDomainFilter(): void {
     if (!this.stats) {
       return;
@@ -410,6 +417,7 @@ class PopupController {
     }
   }
 
+  /** Export conversations as JSON or CSV download. */
   private handleExport(format: 'json' | 'csv'): void {
     if (this.conversations.length === 0) {
       alert('No conversations available to export yet.');
@@ -438,6 +446,10 @@ class PopupController {
     URL.revokeObjectURL(url);
   }
 
+  /**
+   * Build a CSV string from conversations — one row per turn for easier
+   * analysis in spreadsheet tools.
+   */
   private createCsv(conversations: ConversationLog[]): string {
     // One row per turn for easier analysis
     const headers = ['conversationId', 'domain', 'createdAt', 'lastUpdatedAt', 'promptTs', 'responseTs', 'responseTimeMs', 'promptLength', 'responseLength', 'promptText', 'responseText', 'url'];
@@ -464,6 +476,7 @@ class PopupController {
     return [headers.join(','), ...rows].join('\n');
   }
 
+  /** Quote and escape a CSV cell value (RFC 4180). */
   private escapeCsv(value: string): string {
     if (value.includes('"') || value.includes(',') || value.includes('\n')) {
       return `"${value.replace(/"/g, '""')}"`;
@@ -598,6 +611,7 @@ class PopupController {
     return `${text.substring(0, maxLength)}...`;
   }
 
+  /** XSS-safe HTML escaping via textContent round-trip. */
   private escapeHtml(text: string): string {
     const div = document.createElement('div');
     div.textContent = text;

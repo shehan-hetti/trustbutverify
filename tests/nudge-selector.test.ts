@@ -4,7 +4,7 @@
  * Uses the chrome.storage.local mock from setup.ts.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { getNextNudgeQuestion, peekNextNudgeQuestion, resetNudgePointer } from '../src/nudges/nudge-selector';
+import { getNextNudgeQuestion, resetNudgePointer } from '../src/nudges/nudge-selector';
 import { getActiveNudgeQuestions } from '../src/nudges/nudge-questions';
 
 describe('nudge-selector: getNextNudgeQuestion', () => {
@@ -65,24 +65,6 @@ describe('nudge-selector: getNextNudgeQuestion', () => {
     // Q2 should differ from Q1 within each type (since pool.length > 1)
     expect(copyQ2!.id).not.toBe(copyQ1!.id);
     expect(respQ2!.id).not.toBe(respQ1!.id);
-  });
-});
-
-describe('nudge-selector: peekNextNudgeQuestion', () => {
-  beforeEach(async () => {
-    await resetNudgePointer();
-  });
-
-  it('returns the same question as the next getNextNudgeQuestion would', async () => {
-    const peeked = await peekNextNudgeQuestion('copy');
-    const next = await getNextNudgeQuestion('copy');
-    expect(peeked!.id).toBe(next!.id);
-  });
-
-  it('does not advance the pointer', async () => {
-    const peek1 = await peekNextNudgeQuestion('copy');
-    const peek2 = await peekNextNudgeQuestion('copy');
-    expect(peek1!.id).toBe(peek2!.id);
   });
 });
 

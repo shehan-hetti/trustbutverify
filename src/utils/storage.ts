@@ -166,14 +166,6 @@ export class StorageManager {
   }
 
   /**
-   * Get activities count
-   */
-  static async getActivitiesCount(): Promise<number> {
-    const activities = await this.getAllActivities();
-    return activities.length;
-  }
-
-  /**
    * Save a conversation log to storage
    */
   static async upsertConversationTurns(
@@ -483,14 +475,6 @@ export class StorageManager {
   }
 
   /**
-   * Get conversation count
-   */
-  static async getConversationsCount(): Promise<number> {
-    const conversations = await this.getAllConversations();
-    return conversations.length;
-  }
-
-  /**
    * Save a nudge event.
    */
   static async saveNudgeEvent(event: NudgeEvent): Promise<void> {
@@ -522,26 +506,6 @@ export class StorageManager {
     } catch (error) {
       console.error('Error getting nudge events:', error);
       return [];
-    }
-  }
-
-  /**
-   * Get recent nudge events.
-   */
-  static async getRecentNudgeEvents(limit: number = 100): Promise<NudgeEvent[]> {
-    const events = await this.getAllNudgeEvents();
-    return events.slice(-limit);
-  }
-
-  /**
-   * Clear all nudge events.
-   */
-  static async clearNudgeEvents(): Promise<void> {
-    try {
-      await chrome.storage.local.remove(this.NUDGE_EVENTS_STORAGE_KEY);
-    } catch (error) {
-      console.error('Error clearing nudge events:', error);
-      throw error;
     }
   }
 
@@ -637,10 +601,6 @@ export class StorageManager {
 
   static async setParticipantUuid(uuid: string): Promise<void> {
     await chrome.storage.local.set({ [this.PARTICIPANT_UUID_KEY]: uuid });
-  }
-
-  static async clearParticipantUuid(): Promise<void> {
-    await chrome.storage.local.remove(this.PARTICIPANT_UUID_KEY);
   }
 
   static async getLastSyncAt(): Promise<number | undefined> {

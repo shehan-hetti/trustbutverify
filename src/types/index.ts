@@ -271,15 +271,6 @@ export interface VerifyParticipantResult {
   error?: string;
 }
 
-export interface StorageData {
-  activities: CopyActivity[];
-  conversations: ConversationLog[];
-  nudgeEvents?: NudgeEvent[];
-  participantUuid?: string;
-  lastSyncAt?: number;
-  syncStatus?: SyncStatus;
-}
-
 export interface AnalyticsSummary {
   totalCopies: number;
   totalConversations: number;
@@ -337,14 +328,3 @@ export interface MessageResponse {
     | { participantUuid?: string; lastSyncAt?: number; syncStatus: SyncStatus };
   error?: string;
 }
-
-export type SupportedDomain = 
-  | 'chat.openai.com'
-  | 'chatgpt.com'
-  | 'deepseek.com'
-  | 'chat.deepseek.com'
-  | 'www.deepseek.com'
-  | 'x.ai'
-  | 'grok.com'
-  | 'claude.ai'
-  | 'gemini.google.com';

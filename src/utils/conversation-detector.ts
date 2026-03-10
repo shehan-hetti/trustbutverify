@@ -2045,14 +2045,6 @@ export class ConversationDetector {
     return this.domain.includes('gemini');
   }
 
-  private isGrokDomain(): boolean {
-    return this.domain.includes('grok') || this.domain.includes('x.ai');
-  }
-
-  private isChatGptDomain(): boolean {
-    return this.domain.includes('chatgpt') || this.domain.includes('openai');
-  }
-
   /**
    * When starting a brand-new Grok chat, prompt capture can happen before URL
    * changes to /c/<id>. In that case prompt threadId is the fallback hash and

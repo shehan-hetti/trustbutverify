@@ -1,3 +1,17 @@
+/**
+ * Clipboard Bridge — injected into the PAGE context (not the content-script
+ * isolated world) so it can monkey-patch the real `navigator.clipboard` and
+ * `document.execCommand('copy')` APIs that the host page calls.
+ *
+ * When a programmatic copy is detected it posts a `window.postMessage` to the
+ * content-script world, which forwards the event to the background service
+ * worker for storage and enrichment.
+ *
+ * Why page-context injection is needed:
+ *  Content scripts run in an isolated JS world and cannot intercept calls the
+ *  page makes to platform APIs. This IIFE is injected via a <script> tag so
+ *  it shares the page's global scope and can wrap the clipboard methods.
+ */
 (() => {
   const globalWindow = window as typeof window & {
     __TBV_CLIPBOARD_BRIDGE__?: boolean;

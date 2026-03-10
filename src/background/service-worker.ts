@@ -488,6 +488,18 @@ async function processCopyCategorizationQueue(): Promise<void> {
   }
 }
 
+/* ── Text normalisation & fuzzy matching ──────────────────────────────
+ * These functions form a three-tier strategy to match a user's clipboard
+ * copy against stored conversation turns:
+ *  1. normalizeText / normalizeForMatch — collapse whitespace, strip
+ *     zero-width chars, and optionally remove common UI artefacts.
+ *  2. containmentScore — check if one normalised string is a substring
+ *     of the other (soft then hard mode), returning a ratio [0‥1].
+ *  3. tokenOverlapScore — fall back to word-level Jaccard-style overlap
+ *     for cases where the copy is a reformatted version (e.g. table CSV
+ *     vs rendered table text).
+ * ──────────────────────────────────────────────────────────────────── */
+
 function normalizeText(text: string): string {
   return (text || '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -515,6 +527,10 @@ function normalizeForMatch(text: string, mode: 'soft' | 'hard'): string {
   return soft.replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
+/**
+ * Tokenise text into words (≥ 3 chars) for overlap scoring.
+ * Short tokens are discarded to reduce noise from articles/prepositions.
+ */
 function tokenizeForOverlap(text: string): string[] {
   const soft = normalizeForMatch(text, 'soft');
   if (!soft) return [];
@@ -525,6 +541,11 @@ function tokenizeForOverlap(text: string): string[] {
     .filter((t) => t.length >= 3);
 }
 
+/**
+ * Compute a Jaccard-like overlap between two texts by comparing their
+ * word-token sets. Returns max(coverageA, coverageB) in [0‥1], where
+ * coverageX = |intersection| / |tokensX|.
+ */
 function tokenOverlapScore(a: string, b: string): number {
   const ta = tokenizeForOverlap(a);
   const tb = tokenizeForOverlap(b);
@@ -540,6 +561,13 @@ function tokenOverlapScore(a: string, b: string): number {
   return Math.max(coverageA, coverageB);
 }
 
+/**
+ * Three-pass containment check between two texts:
+ *  1. Soft-normalised substring check (preserves word boundaries).
+ *  2. Hard-normalised substring check (strips all punctuation/spaces).
+ *  3. Token-overlap fallback (word-level Jaccard, scaled to 0.9 max).
+ * Returns a score in [0‥1] where 1.0 = exact match.
+ */
 function containmentScore(a: string, b: string): number {
   const aSoft = normalizeForMatch(a, 'soft');
   const bSoft = normalizeForMatch(b, 'soft');

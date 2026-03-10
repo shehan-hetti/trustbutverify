@@ -33,6 +33,7 @@ interface ActiveNudgeState {
 }
 
 export class NudgeOverlay {
+  // ── DOM references ──────────────────────────────────────────────────
   private readonly host: HTMLDivElement;
   private readonly card: HTMLDivElement;
   private readonly titleEl: HTMLDivElement;
@@ -44,6 +45,8 @@ export class NudgeOverlay {
   private onResolve?: (result: NudgeOverlayResolution) => void;
 
   constructor() {
+    // ── Build the overlay DOM tree ────────────────────────────────────
+    // All styles are inline to avoid CSS conflicts with the host page.
     this.host = document.createElement('div');
     this.host.id = '__tbv_nudge_overlay';
     this.host.setAttribute('aria-live', 'polite');
@@ -122,6 +125,7 @@ export class NudgeOverlay {
     this.card.appendChild(footer);
     this.host.appendChild(this.card);
 
+    // ── Wire up dismiss / skip handlers ───────────────────────────────
     this.closeButton.addEventListener('click', () => {
       this.resolve('skip', 'close');
     });
@@ -195,6 +199,7 @@ export class NudgeOverlay {
     this.host.remove();
   }
 
+  // ── Answer button rendering per answer mode ─────────────────────────
   private renderAnswerButtons(mode: NudgeAnswerMode): void {
     this.answersEl.innerHTML = '';
 
@@ -231,6 +236,7 @@ export class NudgeOverlay {
     }
   }
 
+  // ── Resolve the active nudge and notify the callback ────────────────
   private resolve(response: NudgeResponseValue, dismissedBy: NudgeOverlayResolution['dismissedBy']): void {
     if (!this.active) {
       this.host.style.display = 'none';
@@ -260,6 +266,7 @@ export class NudgeOverlay {
     });
   }
 
+  // ── Position the overlay on screen ──────────────────────────────────
   private applyPosition(position: NudgeOverlayPosition): void {
     if (position === 'middle-right') {
       this.host.style.right = '12px';

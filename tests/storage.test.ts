@@ -128,12 +128,6 @@ describe('StorageManager – conversations & turns', () => {
     const convos = await StorageManager.getAllConversations();
     expect(convos).toEqual([]);
   });
-
-  it('getConversationsCount returns correct number', async () => {
-    await StorageManager.upsertConversationTurns('a', { url: 'u', domain: 'd' }, [makeTurn()]);
-    await StorageManager.upsertConversationTurns('b', { url: 'u', domain: 'd' }, [makeTurn()]);
-    expect(await StorageManager.getConversationsCount()).toBe(2);
-  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -227,23 +221,6 @@ describe('StorageManager – nudge events', () => {
     expect(all.filter((x) => x.id === 'ne-dup')).toHaveLength(1);
   });
 
-  it('clearNudgeEvents removes all events', async () => {
-    await StorageManager.saveNudgeEvent(makeNudgeEvent());
-    await StorageManager.clearNudgeEvents();
-    const all = await StorageManager.getAllNudgeEvents();
-    expect(all).toEqual([]);
-  });
-
-  it('getRecentNudgeEvents respects limit', async () => {
-    for (let i = 0; i < 5; i++) {
-      await StorageManager.saveNudgeEvent(
-        makeNudgeEvent({ id: `ne-${i}`, timestamp: Date.now() + i }),
-      );
-    }
-    const recent = await StorageManager.getRecentNudgeEvents(3);
-    expect(recent).toHaveLength(3);
-  });
-
   it('getNudgeAggregateStats computes correct totals', async () => {
     await StorageManager.saveNudgeEvent(
       makeNudgeEvent({ id: 'ne-a', triggerType: 'copy', response: 'yes' }),
@@ -273,12 +250,6 @@ describe('StorageManager – participant & sync helpers', () => {
     expect(await StorageManager.getParticipantUuid()).toBeUndefined();
     await StorageManager.setParticipantUuid('test-uuid-123');
     expect(await StorageManager.getParticipantUuid()).toBe('test-uuid-123');
-  });
-
-  it('clearParticipantUuid removes the stored UUID', async () => {
-    await StorageManager.setParticipantUuid('x');
-    await StorageManager.clearParticipantUuid();
-    expect(await StorageManager.getParticipantUuid()).toBeUndefined();
   });
 
   it('sync status round-trip', async () => {

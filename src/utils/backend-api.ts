@@ -77,14 +77,3 @@ export async function syncData(
   });
 }
 
-/**
- * Quick health check — returns true when both API and DB are reachable.
- */
-export async function healthCheck(): Promise<boolean> {
-  try {
-    const data = await jsonFetch<BackendHealthResponse>(apiUrl('/health'));
-    return data.status === 'ok' && data.database === 'connected';
-  } catch {
-    return false;
-  }
-}

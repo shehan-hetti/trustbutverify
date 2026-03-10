@@ -86,25 +86,6 @@ export async function getNextNudgeQuestion(
 }
 
 /**
- * Peek at the next question without advancing the pointer.
- * Useful for diagnostics or UI previews.
- */
-export async function peekNextNudgeQuestion(
-  triggerType: NudgeTriggerType
-): Promise<NudgeQuestion | null> {
-  const pool = getActiveNudgeQuestions(triggerType);
-  if (pool.length === 0) {
-    return null;
-  }
-
-  pool.sort((a, b) => a.id.localeCompare(b.id));
-
-  const pointers = await loadPointers();
-  const currentIndex = pointers[triggerType] % pool.length;
-  return pool[currentIndex];
-}
-
-/**
  * Reset the pointer for a specific trigger type (or both).
  * Useful for testing or when the question bank is reconfigured.
  */
