@@ -42,6 +42,32 @@
         <h3>Domain Breakdown</h3>
         <ul id="domainBreakdown"></ul>
       </div>
+
+      <div class="nudge-stats" id="nudgeStatsContainer">
+        <h3>Nudge Feedback</h3>
+        <div class="nudge-stats-grid">
+          <div class="nudge-stat">
+            <span class="nudge-stat-value" id="nudgeShown">0</span>
+            <span class="nudge-stat-label">Shown</span>
+          </div>
+          <div class="nudge-stat">
+            <span class="nudge-stat-value" id="nudgeAnswered">0</span>
+            <span class="nudge-stat-label">Answered</span>
+          </div>
+          <div class="nudge-stat">
+            <span class="nudge-stat-value" id="nudgeSkipped">0</span>
+            <span class="nudge-stat-label">Skipped</span>
+          </div>
+          <div class="nudge-stat">
+            <span class="nudge-stat-value" id="nudgeDismissRate">0%</span>
+            <span class="nudge-stat-label">Dismiss Rate</span>
+          </div>
+        </div>
+        <div class="nudge-dismiss-breakdown">
+          <span class="nudge-dismiss-chip" id="nudgeCopyRate">Copy: 0%</span>
+          <span class="nudge-dismiss-chip" id="nudgeResponseRate">Response: 0%</span>
+        </div>
+      </div>
     </section>
 
     <section class="controls" id="conversationControls">
@@ -69,6 +95,24 @@
       <div id="activitiesList" class="list">
         <p class="empty-state">No copy activities yet</p>
       </div>
+    </section>
+
+    <section class="sync-section" id="syncSection">
+      <div class="sync-header">
+        <h3>Data Sync (Auto)</h3>
+        <span class="sync-status-badge" id="syncStatusBadge">idle</span>
+      </div>
+      <div class="sync-info">
+        <div class="sync-info-row">
+          <span class="sync-info-label">Participant</span>
+          <span class="sync-info-value" id="syncParticipantId">—</span>
+        </div>
+        <div class="sync-info-row">
+          <span class="sync-info-label">Last synced</span>
+          <span class="sync-info-value" id="syncLastTime">Never</span>
+        </div>
+      </div>
+      <div id="syncResultMessage" class="sync-result" hidden></div>
     </section>
 
     <footer>

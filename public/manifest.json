@@ -5,7 +5,9 @@
   "description": "Track copy activities on LLM/Gen AI websites",
   "permissions": [
     "storage",
-    "clipboardRead"
+    "clipboardRead",
+    "alarms",
+    "scripting"
   ],
   "host_permissions": [
     "https://chat.openai.com/*",
@@ -16,11 +18,37 @@
     "https://x.ai/*",
     "https://grok.com/*",
     "https://claude.ai/*",
-    "https://gemini.google.com/*"
+    "https://gemini.google.com/*",
+    "http://86.50.252.163/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js"
   },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/clipboard-bridge.js",
+        "popup/popup.html",
+        "popup/popup.js",
+        "popup/popup.css",
+        "registration/registration.html",
+        "registration/registration.js",
+        "registration/registration.css"
+      ],
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://www.deepseek.com/*",
+        "https://chat.deepseek.com/*",
+        "https://deepseek.com/*",
+        "https://x.ai/*",
+        "https://grok.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ]
+    }
+  ],
   "content_scripts": [
     {
       "matches": [

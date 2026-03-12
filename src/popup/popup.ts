@@ -2,9 +2,16 @@ import type {
   CopyActivity,
   ConversationLog,
   MessageResponse,
-  AnalyticsSummary
+  AnalyticsSummary,
+  NudgeAggregateStats,
+  SyncStatus
 } from '../types';
 
+/**
+ * Controller for the extension popup UI.
+ * Manages conversation list, copy activity list, analytics dashboard,
+ * nudge feedback stats, sync status display, and data export.
+ */
 class PopupController {
   private conversationsList: HTMLElement;
   private activitiesList: HTMLElement;
@@ -23,10 +30,21 @@ class PopupController {
   private statTextTotals: HTMLElement;
   private domainBreakdownList: HTMLElement;
   private analyticsSection: HTMLElement;
+  private nudgeShown: HTMLElement;
+  private nudgeAnswered: HTMLElement;
+  private nudgeSkipped: HTMLElement;
+  private nudgeDismissRate: HTMLElement;
+  private nudgeCopyRate: HTMLElement;
+  private nudgeResponseRate: HTMLElement;
+  private syncStatusBadge: HTMLElement;
+  private syncParticipantId: HTMLElement;
+  private syncLastTime: HTMLElement;
+  private syncResultMessage: HTMLElement;
 
   private conversations: ConversationLog[] = [];
   private activities: CopyActivity[] = [];
   private stats: AnalyticsSummary | null = null;
+  private nudgeStats: NudgeAggregateStats | null = null;
   private currentTab: 'conversations' | 'copies' = 'conversations';
   private currentSearchTerm = '';
   private currentDomain = '';
@@ -51,15 +69,50 @@ class PopupController {
     this.statTextTotals = document.getElementById('statTextTotals')!;
     this.domainBreakdownList = document.getElementById('domainBreakdown')!;
     this.analyticsSection = document.getElementById('analyticsSection')!;
+    this.nudgeShown = document.getElementById('nudgeShown')!;
+    this.nudgeAnswered = document.getElementById('nudgeAnswered')!;
+    this.nudgeSkipped = document.getElementById('nudgeSkipped')!;
+    this.nudgeDismissRate = document.getElementById('nudgeDismissRate')!;
+    this.nudgeCopyRate = document.getElementById('nudgeCopyRate')!;
+    this.nudgeResponseRate = document.getElementById('nudgeResponseRate')!;
+    this.syncStatusBadge = document.getElementById('syncStatusBadge')!;
+    this.syncParticipantId = document.getElementById('syncParticipantId')!;
+    this.syncLastTime = document.getElementById('syncLastTime')!;
+    this.syncResultMessage = document.getElementById('syncResultMessage')!;
 
     this.init();
   }
 
   private async init(): Promise<void> {
     await this.loadAnalytics();
+    await this.loadNudgeStats();
+    await this.loadSyncStatus();
     this.populateDomainFilter();
     await Promise.all([this.loadConversations(), this.loadActivities()]);
     this.bindEvents();
+    this.renderAnalytics();
+    this.renderNudgeStats();
+    this.renderConversations();
+    this.renderActivities();
+    
+    // Listen for storage changes to auto-refresh data
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === 'local') {
+        if (changes.conversationLogs) {
+          this.handleStorageChange();
+        }
+        if (changes.nudgeEvents) {
+          this.loadNudgeStats().then(() => this.renderNudgeStats());
+        }
+      }
+    });
+  }
+
+  /** Reload all data and re-render when chrome.storage changes externally. */
+  private async handleStorageChange(): Promise<void> {
+    await this.loadAnalytics();
+    await Promise.all([this.loadConversations(), this.loadActivities()]);
+    this.populateDomainFilter();
     this.renderAnalytics();
     this.renderConversations();
     this.renderActivities();
@@ -193,6 +246,42 @@ class PopupController {
     }
   }
 
+  private async loadNudgeStats(): Promise<void> {
+    try {
+      const response: MessageResponse = await chrome.runtime.sendMessage({
+        type: 'GET_NUDGE_STATS'
+      });
+      if (response.success && response.data) {
+        this.nudgeStats = response.data as NudgeAggregateStats;
+      }
+    } catch (error) {
+      console.error('[TrustButVerify] Error loading nudge stats:', error);
+    }
+  }
+
+  private renderNudgeStats(): void {
+    if (!this.nudgeStats || this.nudgeStats.totalShown === 0) {
+      this.nudgeShown.textContent = '0';
+      this.nudgeAnswered.textContent = '0';
+      this.nudgeSkipped.textContent = '0';
+      this.nudgeDismissRate.textContent = '0%';
+      this.nudgeCopyRate.textContent = 'Copy: 0%';
+      this.nudgeResponseRate.textContent = 'Response: 0%';
+      return;
+    }
+
+    const { totalShown, answered, skipped, dismissRateByQuestionType } = this.nudgeStats;
+    const overallDismissRate = totalShown > 0 ? Math.round((skipped / totalShown) * 100) : 0;
+
+    this.nudgeShown.textContent = totalShown.toString();
+    this.nudgeAnswered.textContent = answered.toString();
+    this.nudgeSkipped.textContent = skipped.toString();
+    this.nudgeDismissRate.textContent = `${overallDismissRate}%`;
+    this.nudgeCopyRate.textContent = `Copy: ${Math.round((dismissRateByQuestionType.copy || 0) * 100)}%`;
+    this.nudgeResponseRate.textContent = `Response: ${Math.round((dismissRateByQuestionType.response || 0) * 100)}%`;
+  }
+
+  /** Populate the domain dropdown from the current analytics breakdown. */
   private populateDomainFilter(): void {
     if (!this.stats) {
       return;
@@ -222,34 +311,35 @@ class PopupController {
       this.conversationsList.innerHTML = '<p class="empty-state">No conversations found</p>';
       return;
     }
-
-    this.conversationsList.innerHTML = this.conversations
+    // Display newest first by reversing
+    const reversed = [...this.conversations].reverse();
+    this.conversationsList.innerHTML = reversed
       .map((conversation) => this.createConversationHTML(conversation))
       .join('');
   }
 
   private createConversationHTML(conversation: ConversationLog): string {
-    const date = new Date(conversation.timestamp);
+    const date = new Date(conversation.lastUpdatedAt || conversation.createdAt || Date.now());
     const timeAgo = this.getTimeAgo(date);
-    const responseTime = conversation.responseTime ? this.formatDuration(conversation.responseTime) : '—';
     const id = `conversation-${conversation.id}`;
-    const title = conversation.metadata?.conversationTitle;
-    const messageCount = conversation.metadata?.messageCount;
+    const title = conversation.title;
+    const promptCount = conversation.turns.length;
+    const responseCount = conversation.turns.length;
+    const totalPromptLength = conversation.turns.reduce((s, t) => s + t.prompt.textLength, 0);
+    const totalResponseLength = conversation.turns.reduce((s, t) => s + t.response.textLength, 0);
 
     const metaChips = [
-      `Prompt ${conversation.promptLength} chars`,
-      `Response ${conversation.responseLength} chars`
+      `${promptCount} prompts`,
+      `${responseCount} responses`,
+      `Prompt ${totalPromptLength} chars`,
+      `Response ${totalResponseLength} chars`,
+      date.toLocaleString()
     ];
 
-    if (conversation.responseTime) {
-      metaChips.push(`Response time ${responseTime}`);
-    }
-
-    if (messageCount) {
-      metaChips.push(`${messageCount} messages in session`);
-    }
-
-    metaChips.push(date.toLocaleString());
+    // Show last user + assistant turns if available
+    const last = conversation.turns[conversation.turns.length - 1];
+    const lastUserText = last ? last.prompt.text : '(no user turn)';
+    const lastAssistantText = last ? last.response.text : '(no assistant turn)';
 
     return `
       <div class="conversation-item" data-id="${conversation.id}">
@@ -261,12 +351,12 @@ class PopupController {
           ${metaChips.map((chip) => `<span class="meta-chip">${this.escapeHtml(chip)}</span>`).join('')}
         </div>
         <button class="conversation-toggle" data-toggle="${conversation.id}" aria-controls="${id}" aria-expanded="false">
-          View prompt & response
+          View latest turns
           <span class="chevron">▾</span>
         </button>
         <div class="conversation-details" id="${id}">
-          <div class="conversation-block prompt"><strong>Prompt</strong>\n${this.escapeHtml(conversation.userPrompt)}</div>
-          <div class="conversation-block response"><strong>Response</strong>\n${this.escapeHtml(conversation.llmResponse)}</div>
+          <div class="conversation-block prompt"><strong>Latest Prompt</strong>\n${this.escapeHtml(lastUserText)}</div>
+          <div class="conversation-block response"><strong>Latest Response</strong>\n${this.escapeHtml(lastAssistantText)}</div>
         </div>
       </div>
     `;
@@ -280,7 +370,9 @@ class PopupController {
     }
 
     this.clearBtn.disabled = false;
-    this.activitiesList.innerHTML = this.activities
+    // Show newest first by reversing
+    const reversed = [...this.activities].reverse();
+    this.activitiesList.innerHTML = reversed
       .map((activity) => this.createActivityHTML(activity))
       .join('');
   }
@@ -325,6 +417,7 @@ class PopupController {
     }
   }
 
+  /** Export conversations as JSON or CSV download. */
   private handleExport(format: 'json' | 'csv'): void {
     if (this.conversations.length === 0) {
       alert('No conversations available to export yet.');
@@ -353,27 +446,37 @@ class PopupController {
     URL.revokeObjectURL(url);
   }
 
+  /**
+   * Build a CSV string from conversations — one row per turn for easier
+   * analysis in spreadsheet tools.
+   */
   private createCsv(conversations: ConversationLog[]): string {
-    const headers = ['timestamp', 'domain', 'userPrompt', 'llmResponse', 'responseTimeMs', 'promptLength', 'responseLength', 'sessionId', 'url'];
-    const rows = conversations.map((conversation) => {
-      const cells: Array<string | number | undefined> = [
-        new Date(conversation.timestamp).toISOString(),
-        conversation.domain,
-        conversation.userPrompt,
-        conversation.llmResponse,
-        conversation.responseTime,
-        conversation.promptLength,
-        conversation.responseLength,
-        conversation.sessionId,
-        conversation.url
-      ];
-
-      return cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(',');
+    // One row per turn for easier analysis
+    const headers = ['conversationId', 'domain', 'createdAt', 'lastUpdatedAt', 'promptTs', 'responseTs', 'responseTimeMs', 'promptLength', 'responseLength', 'promptText', 'responseText', 'url'];
+    const rows: string[] = [];
+    conversations.forEach((c) => {
+      c.turns.forEach((t) => {
+        const cells: Array<string | number | undefined> = [
+          c.id,
+          c.domain,
+          new Date(c.createdAt).toISOString(),
+          new Date(c.lastUpdatedAt).toISOString(),
+          new Date(t.prompt.ts).toISOString(),
+          new Date(t.response.ts).toISOString(),
+          t.responseTimeMs,
+          t.prompt.textLength,
+          t.response.textLength,
+          t.prompt.text,
+          t.response.text,
+          c.url
+        ];
+        rows.push(cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(','));
+      });
     });
-
     return [headers.join(','), ...rows].join('\n');
   }
 
+  /** Quote and escape a CSV cell value (RFC 4180). */
   private escapeCsv(value: string): string {
     if (value.includes('"') || value.includes(',') || value.includes('\n')) {
       return `"${value.replace(/"/g, '""')}"`;
@@ -419,6 +522,57 @@ class PopupController {
     this.conversationsList.innerHTML = `<p class="empty-state" style="color: #ff4757;">${this.escapeHtml(message)}</p>`;
   }
 
+  /* ---------------------------------------------------------------- */
+  /*  Sync UI                                                          */
+  /* ---------------------------------------------------------------- */
+
+  private async loadSyncStatus(): Promise<void> {
+    try {
+      const response: MessageResponse = await chrome.runtime.sendMessage({
+        type: 'GET_SYNC_STATUS'
+      });
+      if (response.success && response.data) {
+        const data = response.data as {
+          participantUuid?: string;
+          lastSyncAt?: number;
+          syncStatus: SyncStatus;
+        };
+        this.renderSyncStatus(data.syncStatus, data.participantUuid, data.lastSyncAt);
+      }
+    } catch (err) {
+      console.error('[TrustButVerify] Error loading sync status:', err);
+    }
+  }
+
+  private renderSyncStatus(
+    status: SyncStatus,
+    participantUuid?: string,
+    lastSyncAt?: number
+  ): void {
+    // Badge
+    this.syncStatusBadge.textContent = status;
+    this.syncStatusBadge.className = 'sync-status-badge';
+    if (status !== 'idle') {
+      this.syncStatusBadge.classList.add(`status-${status}`);
+    }
+
+    // Participant UUID (truncated)
+    if (participantUuid) {
+      this.syncParticipantId.textContent = participantUuid.substring(0, 8) + '…';
+      this.syncParticipantId.title = participantUuid;
+    } else {
+      this.syncParticipantId.textContent = '—';
+    }
+
+    // Last sync time
+    if (lastSyncAt) {
+      this.syncLastTime.textContent = this.getTimeAgo(new Date(lastSyncAt));
+      this.syncLastTime.title = new Date(lastSyncAt).toLocaleString();
+    } else {
+      this.syncLastTime.textContent = 'Never';
+    }
+  }
+
   private showCopyError(message: string): void {
     this.activitiesList.innerHTML = `<p class="empty-state" style="color: #ff4757;">${this.escapeHtml(message)}</p>`;
   }
@@ -457,6 +611,7 @@ class PopupController {
     return `${text.substring(0, maxLength)}...`;
   }
 
+  /** XSS-safe HTML escaping via textContent round-trip. */
   private escapeHtml(text: string): string {
     const div = document.createElement('div');
     div.textContent = text;
