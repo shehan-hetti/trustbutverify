@@ -17,6 +17,9 @@ export class StorageManager {
   private static readonly MAX_ACTIVITIES = 1000;
   private static readonly MAX_CONVERSATIONS = 500;
   private static readonly MAX_NUDGE_EVENTS = 5000;
+  private static readonly MAX_LOCAL_CONVERSATIONS_AFTER_SYNC = 10;
+  private static readonly MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC = 20;
+  private static readonly MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC = 20;
 
   private static normalizeTurnText(text: string): string {
     return (text || '').replace(/\s+/g, ' ').trim();
@@ -506,6 +509,51 @@ export class StorageManager {
     } catch (error) {
       console.error('Error getting nudge events:', error);
       return [];
+    }
+  }
+
+  /**
+   * After a successful sync, keep only a small rolling local history.
+   * This limits chrome.storage growth while preserving recent context.
+   */
+  static async compactAfterSuccessfulSync(): Promise<void> {
+    try {
+      const conversations = await this.getAllConversations();
+      const events = await this.getAllNudgeEvents();
+
+      const keepConversationIds = new Set(
+        [...conversations]
+          .sort((a, b) => (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0))
+          .slice(0, this.MAX_LOCAL_CONVERSATIONS_AFTER_SYNC)
+          .map((c) => c.id)
+      );
+
+      const compactedConversations = conversations
+        .filter((c) => keepConversationIds.has(c.id))
+        .map((c) => {
+          const copyActivities = [...(c.copyActivities || [])]
+            .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+            .slice(0, this.MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC)
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+          return {
+            ...c,
+            copyActivities
+          };
+        });
+
+      const compactedEvents = [...events]
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        .slice(0, this.MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC)
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+      await chrome.storage.local.set({
+        [this.CONVERSATION_STORAGE_KEY]: compactedConversations,
+        [this.NUDGE_EVENTS_STORAGE_KEY]: compactedEvents
+      });
+    } catch (error) {
+      console.error('Error compacting post-sync data:', error);
+      throw error;
     }
   }
 

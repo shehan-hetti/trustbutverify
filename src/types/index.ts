@@ -224,6 +224,10 @@ export interface NudgeQuestion {
   answerMode: NudgeAnswerMode;
   active: boolean;
   tags?: string[];
+  /** Low/high scale labels for rating questions, e.g. { low: 'not confident', high: 'very confident' } */
+  ratingLabels?: { low: string; high: string };
+  /** Custom label for the "Yes" answer button, e.g. 'Yes (I am editing it)' */
+  yesLabel?: string;
 }
 
 export interface NudgeEvent {
