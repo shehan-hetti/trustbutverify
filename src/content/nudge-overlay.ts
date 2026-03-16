@@ -1,6 +1,6 @@
 import type { NudgeAnswerMode, NudgeResponseValue, NudgeTriggerType } from '../types';
 
-export type NudgeOverlayPosition = 'top-right' | 'middle-right';
+export type NudgeOverlayPosition = 'top-right' | 'middle-right' | 'bottom-right';
 
 export interface NudgeOverlayPayload {
   questionId: string;
@@ -12,6 +12,8 @@ export interface NudgeOverlayPayload {
   copyActivityId?: string;
   timeoutMs?: number;
   position?: NudgeOverlayPosition;
+  ratingLabels?: { low: string; high: string };
+  yesLabel?: string;
 }
 
 export interface NudgeOverlayResolution {
@@ -56,12 +58,12 @@ export class NudgeOverlay {
     this.host.style.display = 'none';
 
     this.card = document.createElement('div');
-    this.card.style.width = 'min(360px, calc(100vw - 24px))';
+    this.card.style.width = 'min(560px, calc(100vw - 24px))';
     this.card.style.background = '#10131a';
     this.card.style.color = '#f4f7ff';
     this.card.style.border = '1px solid rgba(255,255,255,0.12)';
-    this.card.style.borderRadius = '12px';
-    this.card.style.padding = '12px';
+    this.card.style.borderRadius = '16px';
+    this.card.style.padding = '20px';
     this.card.style.boxShadow = '0 10px 28px rgba(0,0,0,0.35)';
     this.card.style.pointerEvents = 'auto';
     this.card.style.fontFamily = 'Inter, system-ui, sans-serif';
@@ -73,9 +75,9 @@ export class NudgeOverlay {
     header.style.marginBottom = '8px';
 
     this.titleEl = document.createElement('div');
-    this.titleEl.style.fontSize = '12px';
-    this.titleEl.style.fontWeight = '600';
-    this.titleEl.style.opacity = '0.86';
+    this.titleEl.style.fontSize = '16px';
+    this.titleEl.style.fontWeight = '700';
+    this.titleEl.style.opacity = '0.95';
 
     this.closeButton = document.createElement('button');
     this.closeButton.type = 'button';
@@ -85,26 +87,26 @@ export class NudgeOverlay {
     this.closeButton.style.background = 'transparent';
     this.closeButton.style.color = '#d7deef';
     this.closeButton.style.cursor = 'pointer';
-    this.closeButton.style.fontSize = '14px';
+    this.closeButton.style.fontSize = '15px';
     this.closeButton.style.padding = '2px 4px';
 
     header.appendChild(this.titleEl);
     header.appendChild(this.closeButton);
 
     this.questionEl = document.createElement('div');
-    this.questionEl.style.fontSize = '13px';
-    this.questionEl.style.lineHeight = '1.4';
-    this.questionEl.style.marginBottom = '10px';
+    this.questionEl.style.fontSize = '15px';
+    this.questionEl.style.lineHeight = '1.55';
+    this.questionEl.style.marginBottom = '18px';
 
     this.answersEl = document.createElement('div');
     this.answersEl.style.display = 'flex';
     this.answersEl.style.flexWrap = 'wrap';
-    this.answersEl.style.gap = '6px';
+    this.answersEl.style.gap = '8px';
 
     const footer = document.createElement('div');
     footer.style.display = 'flex';
     footer.style.justifyContent = 'flex-end';
-    footer.style.marginTop = '10px';
+    footer.style.marginTop = '14px';
 
     this.skipButton = document.createElement('button');
     this.skipButton.type = 'button';
@@ -112,10 +114,10 @@ export class NudgeOverlay {
     this.skipButton.style.border = '1px solid rgba(255,255,255,0.22)';
     this.skipButton.style.background = 'transparent';
     this.skipButton.style.color = '#f4f7ff';
-    this.skipButton.style.borderRadius = '8px';
-    this.skipButton.style.padding = '6px 10px';
+    this.skipButton.style.borderRadius = '10px';
+    this.skipButton.style.padding = '10px 14px';
     this.skipButton.style.cursor = 'pointer';
-    this.skipButton.style.fontSize = '12px';
+    this.skipButton.style.fontSize = '14px';
 
     footer.appendChild(this.skipButton);
 
@@ -144,7 +146,7 @@ export class NudgeOverlay {
     } else {
       document.addEventListener('DOMContentLoaded', attach, { once: true });
     }
-    this.applyPosition('top-right');
+    this.applyPosition('bottom-right');
   }
 
   setOnResolve(handler: (result: NudgeOverlayResolution) => void): void {
@@ -156,13 +158,13 @@ export class NudgeOverlay {
       this.resolve('skip', 'replaced');
     }
 
-    const timeoutMs = Math.max(1000, payload.timeoutMs ?? 25_000);
-    this.applyPosition(payload.position || 'top-right');
+    const timeoutMs = Math.max(1000, payload.timeoutMs ?? 60_000);
+    this.applyPosition(payload.position || 'bottom-right');
 
     this.titleEl.textContent = payload.triggerType === 'copy' ? 'Quick check • Copied text' : 'Quick check • Response';
     this.questionEl.textContent = payload.questionText;
 
-    this.renderAnswerButtons(payload.answerMode);
+    this.renderAnswerButtons(payload.answerMode, payload.yesLabel, payload.ratingLabels);
 
     // Re-attach if somehow removed from DOM
     if (!this.host.isConnected) {
@@ -200,7 +202,11 @@ export class NudgeOverlay {
   }
 
   // ── Answer button rendering per answer mode ─────────────────────────
-  private renderAnswerButtons(mode: NudgeAnswerMode): void {
+  private renderAnswerButtons(
+    mode: NudgeAnswerMode,
+    yesLabel?: string,
+    ratingLabels?: { low: string; high: string }
+  ): void {
     this.answersEl.innerHTML = '';
 
     const addButton = (label: string, value: NudgeResponseValue, primary = false) => {
@@ -210,29 +216,46 @@ export class NudgeOverlay {
       button.style.border = primary ? '1px solid #8db7ff' : '1px solid rgba(255,255,255,0.18)';
       button.style.background = primary ? 'rgba(71, 126, 255, 0.25)' : 'rgba(255,255,255,0.06)';
       button.style.color = '#f4f7ff';
-      button.style.borderRadius = '8px';
-      button.style.padding = '6px 9px';
+      button.style.borderRadius = '10px';
+      button.style.padding = '10px 12px';
       button.style.cursor = 'pointer';
-      button.style.fontSize = '12px';
+      button.style.fontSize = '14px';
       button.addEventListener('click', () => this.resolve(value, 'answer'));
       this.answersEl.appendChild(button);
     };
 
     if (mode === 'yes_no_skip') {
-      addButton('Yes', 'yes', true);
+      addButton(yesLabel ?? 'Yes', 'yes', true);
       addButton('No', 'no');
       return;
     }
 
     if (mode === 'yes_partly_no_skip') {
-      addButton('Yes', 'yes', true);
+      addButton(yesLabel ?? 'Yes', 'yes', true);
       addButton('Partly', 'partly');
       addButton('No', 'no');
       return;
     }
 
     for (let i = 1; i <= 10; i++) {
-      addButton(String(i), i as NudgeResponseValue, i >= 7);
+      addButton(String(i), i as NudgeResponseValue);
+    }
+
+    if (ratingLabels) {
+      const labelRow = document.createElement('div');
+      labelRow.style.width = '100%';
+      labelRow.style.display = 'flex';
+      labelRow.style.justifyContent = 'space-between';
+      labelRow.style.fontSize = '13px';
+      labelRow.style.opacity = '0.6';
+      labelRow.style.marginTop = '2px';
+      const lowSpan = document.createElement('span');
+      lowSpan.textContent = `1 = ${ratingLabels.low}`;
+      const highSpan = document.createElement('span');
+      highSpan.textContent = `10 = ${ratingLabels.high}`;
+      labelRow.appendChild(lowSpan);
+      labelRow.appendChild(highSpan);
+      this.answersEl.appendChild(labelRow);
     }
   }
 
@@ -274,6 +297,15 @@ export class NudgeOverlay {
       this.host.style.transform = 'translateY(-50%)';
       this.host.style.left = 'auto';
       this.host.style.bottom = 'auto';
+      return;
+    }
+
+    if (position === 'bottom-right') {
+      this.host.style.right = '12px';
+      this.host.style.bottom = '12px';
+      this.host.style.transform = 'none';
+      this.host.style.left = 'auto';
+      this.host.style.top = 'auto';
       return;
     }
 

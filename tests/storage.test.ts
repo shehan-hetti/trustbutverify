@@ -264,6 +264,82 @@ describe('StorageManager – participant & sync helpers', () => {
     await StorageManager.setLastSyncAt(now);
     expect(await StorageManager.getLastSyncAt()).toBe(now);
   });
+
+  it('compactAfterSuccessfulSync keeps last 10 conversations, 20 copies per conversation, and 20 nudge events', async () => {
+    const baseTs = Date.now() - 1_000_000;
+
+    // Create 12 conversations with one turn each so they are syncable.
+    for (let i = 0; i < 12; i++) {
+      await StorageManager.upsertConversationTurns(
+        `conv-${i}`,
+        {
+          url: `https://chatgpt.com/c/conv-${i}`,
+          domain: 'chatgpt.com',
+          platform: 'ChatGPT'
+        },
+        [
+          makeTurn({
+            ts: baseTs + i * 1000,
+            prompt: {
+              text: `Prompt ${i}`,
+              textLength: `Prompt ${i}`.length,
+              ts: baseTs + i * 1000 - 300
+            },
+            response: {
+              text: `Response ${i}`,
+              textLength: `Response ${i}`.length,
+              ts: baseTs + i * 1000
+            }
+          })
+        ]
+      );
+    }
+
+    // Add 25 copy activities for each conversation.
+    for (let i = 0; i < 12; i++) {
+      for (let j = 0; j < 25; j++) {
+        await StorageManager.saveActivity(
+          makeCopyActivity({
+            id: `conv-${i}-copy-${j}`,
+            conversationId: `conv-${i}`,
+            timestamp: baseTs + i * 10_000 + j,
+            copiedText: `Copy ${j} for conv-${i}`,
+            textLength: `Copy ${j} for conv-${i}`.length
+          })
+        );
+      }
+    }
+
+    // Add 30 nudge events.
+    for (let i = 0; i < 30; i++) {
+      await StorageManager.saveNudgeEvent(
+        makeNudgeEvent({
+          id: `nudge-${i}`,
+          timestamp: baseTs + i * 500,
+          conversationId: `conv-${i % 12}`
+        })
+      );
+    }
+
+    await StorageManager.compactAfterSuccessfulSync();
+
+    const conversations = await StorageManager.getAllConversations();
+    const nudgeEvents = await StorageManager.getAllNudgeEvents();
+
+    expect(conversations).toHaveLength(10);
+    expect(nudgeEvents).toHaveLength(20);
+
+    for (const convo of conversations) {
+      expect((convo.copyActivities || []).length).toBeLessThanOrEqual(20);
+    }
+
+    // Ensure we kept the most recently updated conversations.
+    const ids = new Set(conversations.map((c) => c.id));
+    expect(ids.has('conv-11')).toBe(true);
+    expect(ids.has('conv-10')).toBe(true);
+    expect(ids.has('conv-0')).toBe(false);
+    expect(ids.has('conv-1')).toBe(false);
+  });
 });
 
 /* ------------------------------------------------------------------ */

@@ -27,7 +27,7 @@ class ActivityTracker {
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
   private static readonly MAX_PAIRED_PROMPT_CHARS = 20000;
   private static readonly CHAT_ACTIVITY_EVENT = 'tbv:chat-activity';
-  private static readonly NUDGE_TIMEOUT_MS = 25_000;
+  private static readonly NUDGE_TIMEOUT_MS = 60_000;
 
   private readonly handleRuntimeMessage = (
     message: unknown,
@@ -46,6 +46,8 @@ class ActivityTracker {
         copyActivityId?: string;
         timeoutMs?: number;
         position?: NudgeOverlayPosition;
+        ratingLabels?: { low: string; high: string };
+        yesLabel?: string;
       };
     };
 
@@ -75,7 +77,9 @@ class ActivityTracker {
         turnId: data.turnId,
         copyActivityId: data.copyActivityId,
         timeoutMs: data.timeoutMs,
-        position: data.position
+        position: data.position,
+        ratingLabels: data.ratingLabels,
+        yesLabel: data.yesLabel
       });
       sendResponse({ success: true });
       return;
@@ -519,16 +523,20 @@ class ActivityTracker {
     if (domain.includes('grok') || domain.includes('x.ai')) {
       const response = anchor.closest('div[id^="response-"]') as HTMLElement | null;
       if (response) {
+        const isUser = response.classList.contains('items-end');
         const content = (response.querySelector('.response-content-markdown') as HTMLElement | null) || response;
         const text = getText(content);
         if (text) {
-          const pairedPromptText = this.findPairedPromptText(content, 'response');
+          const turnSide = isUser ? 'prompt' : 'response';
+          const pairedPromptText = turnSide === 'response'
+            ? this.findPairedPromptText(content, turnSide)
+            : undefined;
           return {
             text,
             context: text.substring(0, 200),
             element: content,
-            strategy: 'grok:response',
-            turnSide: 'response',
+            strategy: isUser ? 'grok:user' : 'grok:response',
+            turnSide,
             containerText: text,
             containerTextLength: text.length,
             pairedPromptText
@@ -782,17 +790,6 @@ class ActivityTracker {
       }
     }
 
-    // If we have the copied text (programmatic copy), match it to the best nearby code/message block.
-    if (copiedText) {
-      const matched = this.findBestMatchByText(anchor, copiedText);
-      if (matched) {
-        const text = getText(matched);
-        if (text) {
-          return this.buildExpandedCopyResult(matched, text, 'matched-by-text');
-        }
-      }
-    }
-
     if (domain.includes('claude')) {
       const root = (anchor.closest('[data-testid="user-message"]') as HTMLElement | null)
         || (anchor.closest('.font-claude-response') as HTMLElement | null);
@@ -823,8 +820,13 @@ class ActivityTracker {
         if (role === 'unknown' && turn) {
           const nestedAssistant = turn.querySelector('div[data-message-author-role="assistant"]');
           const nestedUser = turn.querySelector('div[data-message-author-role="user"]');
-          if (nestedAssistant) role = 'assistant';
-          else if (nestedUser) role = 'user';
+          if (nestedAssistant && nestedUser) {
+            role = 'unknown';
+          } else if (nestedAssistant) {
+            role = 'assistant';
+          } else if (nestedUser) {
+            role = 'user';
+          }
         }
 
         const side = role === 'user' ? 'prompt' : role === 'assistant' ? 'response' : undefined;
@@ -911,6 +913,24 @@ class ActivityTracker {
       }
     }
 
+    // Last-resort fallback for programmatic copies when site-specific side
+    // resolution fails. Keep this at the end so stronger platform heuristics
+    // run first.
+    if (copiedText) {
+      const matched = this.findBestMatchByText(anchor, copiedText);
+      if (matched) {
+        const text = getText(matched.element);
+        if (text) {
+          return this.buildExpandedCopyResult(
+            matched.element,
+            text,
+            'matched-by-text',
+            matched.side
+          );
+        }
+      }
+    }
+
     return null;
   }
 
@@ -970,6 +990,10 @@ class ActivityTracker {
       if (turn) {
         const assistantMsg = turn.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null;
         const userMsg = turn.querySelector('div[data-message-author-role="user"]') as HTMLElement | null;
+        if (assistantMsg && userMsg) {
+          // Ambiguous turn-level fallback: avoid assuming response side.
+          return null;
+        }
         if (assistantMsg) return { wrapper: assistantMsg, side: 'response' };
         if (userMsg) return { wrapper: userMsg, side: 'prompt' };
       }
@@ -1033,6 +1057,10 @@ class ActivityTracker {
       if (msg) {
         const assistant = msg.querySelector('.ds-markdown') as HTMLElement | null;
         const user = msg.querySelector('.fbb737a4') as HTMLElement | null;
+        if (assistant && user) {
+          // Ambiguous mixed message container; do not guess side.
+          return null;
+        }
         if (assistant) return { wrapper: assistant, side: 'response' };
         if (user) return { wrapper: user, side: 'prompt' };
         return null;
@@ -1151,7 +1179,10 @@ class ActivityTracker {
     return t.slice(0, maxChars);
   }
 
-  private findBestMatchByText(anchor: HTMLElement, copiedText: string): HTMLElement | null {
+  private findBestMatchByText(
+    anchor: HTMLElement,
+    copiedText: string
+  ): { element: HTMLElement; side?: 'prompt' | 'response' } | null {
     const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
     const needle = normalize(copiedText).slice(0, 80);
     if (!needle) return null;
@@ -1163,30 +1194,64 @@ class ActivityTracker {
       || (anchor.closest('section') as HTMLElement | null)
       || document.body;
 
-    const candidates = Array.from(
-      container.querySelectorAll('pre.code-block__code, pre, code, .ds-markdown, .response-content-markdown, .font-claude-response')
-    ) as HTMLElement[];
+    const candidateGroups: Array<{ selector: string; side?: 'prompt' | 'response' }> = [
+      // Generic code targets (side often inferred from surrounding container).
+      { selector: 'pre.code-block__code, pre, code' },
 
-    let best: { el: HTMLElement; score: number } | null = null;
-    for (const el of candidates) {
-      const hay = normalize(el.innerText || el.textContent || '');
-      if (!hay) continue;
+      // Response-side candidates.
+      { selector: '.font-claude-response', side: 'response' },
+      { selector: 'div[id^="response-"].items-start .response-content-markdown', side: 'response' },
+      { selector: '.ds-markdown', side: 'response' },
+      { selector: 'div[data-message-author-role="assistant"]', side: 'response' },
+      { selector: 'message-content .markdown.markdown-main-panel', side: 'response' },
 
-      let score = 0;
-      if (hay === normalize(copiedText)) score += 1000;
-      if (hay.startsWith(needle)) score += 400;
-      if (hay.includes(needle)) score += 200;
+      // Prompt-side candidates.
+      { selector: '[data-testid="user-message"]', side: 'prompt' },
+      { selector: 'div[data-message-author-role="user"]', side: 'prompt' },
+      { selector: 'user-query .query-text', side: 'prompt' },
+      { selector: '.fbb737a4', side: 'prompt' },
+      { selector: 'div[id^="response-"].items-end .response-content-markdown', side: 'prompt' }
+    ];
 
-      // Small boost for code containers.
-      if (el.tagName.toLowerCase() === 'pre' || el.tagName.toLowerCase() === 'code') score += 50;
+    let best: { element: HTMLElement; side?: 'prompt' | 'response'; score: number } | null = null;
+    let bestSideAmbiguous = false;
+    for (const group of candidateGroups) {
+      const candidates = Array.from(container.querySelectorAll(group.selector)) as HTMLElement[];
+      for (const el of candidates) {
+        const hay = normalize(el.innerText || el.textContent || '');
+        if (!hay) continue;
 
-      if (!best || score > best.score) {
-        best = { el, score };
+        let score = 0;
+        if (hay === normalize(copiedText)) score += 1000;
+        if (hay.startsWith(needle)) score += 400;
+        if (hay.includes(needle)) score += 200;
+
+        // Small boost for code containers.
+        if (el.tagName.toLowerCase() === 'pre' || el.tagName.toLowerCase() === 'code') score += 50;
+
+        if (!best || score > best.score) {
+          best = { element: el, side: group.side, score };
+          bestSideAmbiguous = false;
+          continue;
+        }
+
+        if (best && score === best.score) {
+          const candidateSide = group.side;
+          const currentBestSide = best.side;
+          if (candidateSide !== currentBestSide) {
+            // Equal-score disagreement between prompt/response/unknown.
+            // Be conservative and avoid forcing a side.
+            bestSideAmbiguous = true;
+          }
+        }
       }
     }
 
     if (best && best.score >= 200) {
-      return best.el;
+      return {
+        element: best.element,
+        side: bestSideAmbiguous ? undefined : best.side
+      };
     }
     return null;
   }
@@ -1316,11 +1381,15 @@ class ActivityTracker {
       return;
     }
 
-    // ── Prompt-side copy filter ──────────────────────────────────────────
-    // User requested: skip copy activity from the prompt/user side.
-    // We still capture pairedPromptText when the user copies from response side.
-    if (extras?.turnSide === 'prompt') {
-      console.log('[TrustButVerify] Skipping prompt-side copy activity');
+    // ── Response-only copy filter ─────────────────────────────────────────
+    // Store copy activity only when it is confidently from the LLM response.
+    // Keep pairedPromptText capture for response-side copies unchanged.
+    if (extras?.turnSide !== 'response') {
+      console.log('[TrustButVerify] Skipping non-response copy activity', {
+        turnSide: extras?.turnSide || null,
+        domain: this.domain,
+        strategy: trigger.extractionStrategy || null
+      });
       return;
     }
 

@@ -6,44 +6,80 @@ import type { NudgeQuestion } from '../types';
  */
 export const NUDGE_QUESTIONS: NudgeQuestion[] = [
   {
-    id: 'copy-confidence-1',
-    text: 'Did you copy this because you trust this response?',
+    id: 'copy-double-check-1',
+    text: 'Any part here you would want to double-check before using?',
     triggerType: 'copy',
     answerMode: 'yes_no_skip',
     active: true,
-    tags: ['reinforce']
+    tags: ['accountability', 'factual-correctness', 'self-reflection']
   },
   {
-    id: 'copy-verify-1',
-    text: 'Will you verify this copied content before using it?',
+    id: 'copy-factual-confidence-1',
+    text: 'On a scale of 1-10, how confident are you this is factually accurate?',
     triggerType: 'copy',
-    answerMode: 'yes_partly_no_skip',
-    active: true,
-    tags: ['confront']
-  },
-  {
-    id: 'response-clarity-1',
-    text: 'How clear was this response for your task?',
-    triggerType: 'response',
     answerMode: 'rating_1_10_skip',
     active: true,
-    tags: ['reinforce']
+    tags: ['factual-correctness'],
+    ratingLabels: { low: 'not confident', high: 'very confident' }
   },
   {
-    id: 'response-reliability-1',
-    text: 'Does this response feel reliable enough to act on?',
-    triggerType: 'response',
-    answerMode: 'yes_partly_no_skip',
-    active: true,
-    tags: ['confront']
-  },
-  {
-    id: 'response-followup-1',
-    text: 'Would you ask a follow-up before using this answer?',
-    triggerType: 'response',
+    id: 'copy-surprises-1',
+    text: 'Is there anything in this output that surprises you?',
+    triggerType: 'copy',
     answerMode: 'yes_no_skip',
     active: true,
-    tags: ['confront']
+    tags: ['accountability']
+  },
+  {
+    id: 'copy-verify-source-1',
+    text: 'Any claim here you would verify with another source first?',
+    triggerType: 'copy',
+    answerMode: 'yes_no_skip',
+    active: true,
+    tags: ['accountability', 'factual-correctness']
+  },
+  {
+    id: 'copy-own-thinking-1',
+    text: 'How much of your own thinking is in this copied output?',
+    triggerType: 'copy',
+    answerMode: 'rating_1_10_skip',
+    active: true,
+    tags: ['accountability'],
+    ratingLabels: { low: 'mostly AI', high: 'mostly me' }
+  },
+  {
+    id: 'copy-editing-1',
+    text: 'Are you adding or changing anything in this output before using it?',
+    triggerType: 'copy',
+    answerMode: 'yes_no_skip',
+    active: true,
+    tags: ['accountability'],
+    yesLabel: 'Yes (I am editing it)'
+  },
+  {
+    id: 'copy-alignment-1',
+    text: 'How well does this align with your original plan or idea?',
+    triggerType: 'copy',
+    answerMode: 'rating_1_10_skip',
+    active: true,
+    tags: ['accountability', 'self-reflection'],
+    ratingLabels: { low: 'not well', high: 'very well' }
+  },
+  {
+    id: 'copy-learning-1',
+    text: 'On a scale of 1-10, how much did you learn from working with this output?',
+    triggerType: 'copy',
+    answerMode: 'rating_1_10_skip',
+    active: true,
+    tags: ['self-reflection']
+  },
+  {
+    id: 'copy-feeling-good-1',
+    text: 'Feeling good about how you used AI for your work?',
+    triggerType: 'copy',
+    answerMode: 'yes_partly_no_skip',
+    active: true,
+    tags: ['self-reflection']
   }
 ];
 
