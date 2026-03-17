@@ -221,6 +221,18 @@ describe('StorageManager – nudge events', () => {
     expect(all.filter((x) => x.id === 'ne-dup')).toHaveLength(1);
   });
 
+  it('persists questionTags including multiple values', async () => {
+    await StorageManager.saveNudgeEvent(
+      makeNudgeEvent({
+        id: 'ne-tags',
+        questionTags: ['accountability', 'self-reflection'],
+      }),
+    );
+    const all = await StorageManager.getAllNudgeEvents();
+    const saved = all.find((x) => x.id === 'ne-tags');
+    expect(saved?.questionTags).toEqual(['accountability', 'self-reflection']);
+  });
+
   it('getNudgeAggregateStats computes correct totals', async () => {
     await StorageManager.saveNudgeEvent(
       makeNudgeEvent({ id: 'ne-a', triggerType: 'copy', response: 'yes' }),
