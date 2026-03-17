@@ -14,6 +14,7 @@ export interface NudgeOverlayPayload {
   position?: NudgeOverlayPosition;
   ratingLabels?: { low: string; high: string };
   yesLabel?: string;
+  questionTags?: string[];
 }
 
 export interface NudgeOverlayResolution {
@@ -25,6 +26,7 @@ export interface NudgeOverlayResolution {
   conversationId?: string;
   turnId?: string;
   copyActivityId?: string;
+  questionTags?: string[];
   dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
 }
 
@@ -285,6 +287,7 @@ export class NudgeOverlay {
       conversationId: payload.conversationId,
       turnId: payload.turnId,
       copyActivityId: payload.copyActivityId,
+      questionTags: payload.questionTags,
       dismissedBy
     });
   }

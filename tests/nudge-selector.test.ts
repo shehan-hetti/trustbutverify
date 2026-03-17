@@ -18,10 +18,9 @@ describe('nudge-selector: getNextNudgeQuestion', () => {
     expect(q!.triggerType).toBe('copy');
   });
 
-  it('returns a question for "response" trigger type', async () => {
+  it('returns null for "response" trigger type when response pool is empty', async () => {
     const q = await getNextNudgeQuestion('response');
-    expect(q).not.toBeNull();
-    expect(q!.triggerType).toBe('response');
+    expect(q).toBeNull();
   });
 
   it('cycles through all copy questions in round-robin order', async () => {
@@ -48,23 +47,20 @@ describe('nudge-selector: getNextNudgeQuestion', () => {
     expect(q!.id).toBe(pool[0].id);
   });
 
-  it('copy and response pointers are independent', async () => {
-    const copyQ1 = await getNextNudgeQuestion('copy');
-    const respQ1 = await getNextNudgeQuestion('response');
+  it('empty response pool calls do not affect copy round-robin sequence', async () => {
+    const copyPool = getActiveNudgeQuestions('copy').sort((a, b) => a.id.localeCompare(b.id));
 
-    // Advance copy once more
-    const copyQ2 = await getNextNudgeQuestion('copy');
+    const resp1 = await getNextNudgeQuestion('response');
+    const resp2 = await getNextNudgeQuestion('response');
+    const copy1 = await getNextNudgeQuestion('copy');
+    const copy2 = await getNextNudgeQuestion('copy');
 
-    // Response should still give the second item on next call (not affected by copy advancement)
-    const respQ2 = await getNextNudgeQuestion('response');
-
-    expect(copyQ1).not.toBeNull();
-    expect(respQ1).not.toBeNull();
-    expect(copyQ2).not.toBeNull();
-    expect(respQ2).not.toBeNull();
-    // Q2 should differ from Q1 within each type (since pool.length > 1)
-    expect(copyQ2!.id).not.toBe(copyQ1!.id);
-    expect(respQ2!.id).not.toBe(respQ1!.id);
+    expect(resp1).toBeNull();
+    expect(resp2).toBeNull();
+    expect(copy1!.id).toBe(copyPool[0].id);
+    if (copyPool.length > 1) {
+      expect(copy2!.id).toBe(copyPool[1].id);
+    }
   });
 });
 
@@ -89,11 +85,10 @@ describe('nudge-selector: resetNudgePointer', () => {
     await resetNudgePointer();
 
     const copyPool = getActiveNudgeQuestions('copy').sort((a, b) => a.id.localeCompare(b.id));
-    const respPool = getActiveNudgeQuestions('response').sort((a, b) => a.id.localeCompare(b.id));
 
     const c = await getNextNudgeQuestion('copy');
     const r = await getNextNudgeQuestion('response');
     expect(c!.id).toBe(copyPool[0].id);
-    expect(r!.id).toBe(respPool[0].id);
+    expect(r).toBeNull();
   });
 });

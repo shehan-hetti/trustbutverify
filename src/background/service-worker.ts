@@ -1347,6 +1347,7 @@ function sendNudgeToTab(
     position?: string;
     ratingLabels?: { low: string; high: string };
     yesLabel?: string;
+    questionTags?: string[];
   }
 ): void {
   chrome.tabs.sendMessage(
@@ -1394,7 +1395,8 @@ async function trySendCopyNudge(
       timeoutMs: 60_000,
       position: 'bottom-right',
       ratingLabels: question.ratingLabels,
-      yesLabel: question.yesLabel
+      yesLabel: question.yesLabel,
+      questionTags: question.tags ? Array.from(new Set(question.tags)) : []
     });
   } catch (error) {
     console.debug('[TrustButVerify] Copy nudge failed:', error);
@@ -1693,6 +1695,7 @@ interface SyncNudgePayload {
   triggerType: string;
   nudgeQuestionId: string;
   nudgeQuestionText: string;
+  questionTags: string[];
   response: string | number;
   responseTimeMs: number;
   dismissedBy: string;
@@ -1755,6 +1758,7 @@ function buildSyncPayload(
     triggerType: e.triggerType,
     nudgeQuestionId: e.nudgeQuestionId,
     nudgeQuestionText: e.nudgeQuestionText,
+    questionTags: e.questionTags ?? [],
     response: e.response,
     responseTimeMs: e.responseTimeMs,
     dismissedBy: e.dismissedBy

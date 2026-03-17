@@ -22,6 +22,7 @@ class ActivityTracker {
   private lastInteractedElement: HTMLElement | null = null;
   private extensionContextInvalidated = false;
   private readonly copySignatureCache = new Map<string, number>();
+  private readonly nudgeEventIdCollisions = new Map<string, number>();
   private static readonly COPY_SIGNATURE_TTL = 2500;
   private static readonly PROGRAMMATIC_COPY_MESSAGE = 'TBV_PROGRAMMATIC_COPY';
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
@@ -48,6 +49,7 @@ class ActivityTracker {
         position?: NudgeOverlayPosition;
         ratingLabels?: { low: string; high: string };
         yesLabel?: string;
+        questionTags?: string[];
       };
     };
 
@@ -79,7 +81,8 @@ class ActivityTracker {
         timeoutMs: data.timeoutMs,
         position: data.position,
         ratingLabels: data.ratingLabels,
-        yesLabel: data.yesLabel
+        yesLabel: data.yesLabel,
+        questionTags: data.questionTags
       });
       sendResponse({ success: true });
       return;
@@ -218,10 +221,12 @@ class ActivityTracker {
       copyActivityId: result.copyActivityId
     });
 
+    const timestamp = Date.now();
+
     // Persist the nudge event via service worker
     const nudgeEvent = {
-      id: `nudge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: Date.now(),
+      id: this.buildNudgeEventId(result.questionId, timestamp),
+      timestamp,
       conversationId: result.conversationId || '',
       turnId: result.turnId,
       copyActivityId: result.copyActivityId,
@@ -229,6 +234,7 @@ class ActivityTracker {
       triggerType: result.triggerType,
       nudgeQuestionId: result.questionId,
       nudgeQuestionText: result.questionText,
+      questionTags: result.questionTags,
       response: result.response,
       responseTimeMs: result.responseTimeMs,
       dismissedBy: result.dismissedBy
@@ -246,6 +252,23 @@ class ActivityTracker {
     } catch {
       // Extension context may be invalidated — safe to ignore
     }
+  }
+
+  private buildNudgeEventId(questionId: string, timestampMs: number): string {
+    const sanitizedQuestionId = (questionId || 'unknown')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'unknown';
+    const baseId = `nudge-${sanitizedQuestionId}-${timestampMs}`;
+    const seenCount = (this.nudgeEventIdCollisions.get(baseId) || 0) + 1;
+    this.nudgeEventIdCollisions.set(baseId, seenCount);
+
+    // Keep this in-memory map bounded; collisions are only relevant short-term.
+    if (this.nudgeEventIdCollisions.size > 500) {
+      this.nudgeEventIdCollisions.clear();
+    }
+
+    return seenCount === 1 ? baseId : `${baseId}-${seenCount}`;
   }
 
   /**

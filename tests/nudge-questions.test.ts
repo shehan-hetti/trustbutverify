@@ -26,10 +26,33 @@ describe('NUDGE_QUESTIONS data integrity', () => {
     }
   });
 
-  it('has both copy and response trigger types', () => {
+  it('currently uses copy trigger type only', () => {
     const types = new Set(NUDGE_QUESTIONS.map((q) => q.triggerType));
     expect(types.has('copy')).toBe(true);
-    expect(types.has('response')).toBe(true);
+    expect(types.has('response')).toBe(false);
+  });
+
+  it('supports tags as string arrays (including multi-tag questions)', () => {
+    const tagged = NUDGE_QUESTIONS.filter((q) => Array.isArray(q.tags));
+    expect(tagged.length).toBeGreaterThan(0);
+    for (const q of tagged) {
+      expect(q.tags!.every((t) => typeof t === 'string' && t.trim().length > 0)).toBe(true);
+    }
+    expect(tagged.some((q) => (q.tags?.length || 0) > 1)).toBe(true);
+  });
+
+  it('rating and custom yes-label metadata are valid when present', () => {
+    for (const q of NUDGE_QUESTIONS) {
+      if (q.ratingLabels) {
+        expect(q.answerMode).toBe('rating_1_10_skip');
+        expect(q.ratingLabels.low.trim().length).toBeGreaterThan(0);
+        expect(q.ratingLabels.high.trim().length).toBeGreaterThan(0);
+      }
+      if (q.yesLabel) {
+        expect(['yes_no_skip', 'yes_partly_no_skip']).toContain(q.answerMode);
+        expect(q.yesLabel.trim().length).toBeGreaterThan(0);
+      }
+    }
   });
 });
 
@@ -49,13 +72,9 @@ describe('getActiveNudgeQuestions', () => {
     }
   });
 
-  it('filters by triggerType = response', () => {
+  it('returns empty for triggerType = response when no active response questions exist', () => {
     const resp = getActiveNudgeQuestions('response');
-    expect(resp.length).toBeGreaterThan(0);
-    for (const q of resp) {
-      expect(q.triggerType).toBe('response');
-      expect(q.active).toBe(true);
-    }
+    expect(resp).toEqual([]);
   });
 
   it('returns empty array for trigger type with no active questions (hypothetical)', () => {

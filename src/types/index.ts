@@ -241,6 +241,7 @@ export interface NudgeEvent {
   triggerType: NudgeTriggerType;
   nudgeQuestionId: string;
   nudgeQuestionText: string;
+  questionTags?: string[];
   response: NudgeResponseValue;
   responseTimeMs: number;
   dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
