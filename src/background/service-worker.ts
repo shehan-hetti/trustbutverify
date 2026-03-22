@@ -47,6 +47,29 @@ const COPY_CATEGORIZATION_MAX_ATTEMPTS = 3;
 const AUTO_SYNC_ALARM = 'tbv:auto-sync';
 const AUTO_SYNC_INTERVAL_MINUTES = 5;
 
+// ── Keepalive (prevents 30 s MV3 worker suspension during long operations) ──
+const KEEPALIVE_ALARM = 'tbv:keepalive';
+
+function startKeepalive(): void {
+  try {
+    // Fire every ~24 s (< 30 s Chrome suspension timer).
+    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
+  } catch {
+    // Alarms unavailable — best-effort only.
+  }
+}
+
+function stopKeepalive(): void {
+  try {
+    chrome.alarms.clear(KEEPALIVE_ALARM);
+  } catch {
+    // ignore
+  }
+}
+
+// ── Sync checkpoint (resume interrupted syncs per-conversation) ──
+const SYNC_CHECKPOINT_KEY = 'syncCheckpointConvId';
+
 type PendingCopyCategorizationItem = {
   id: string;
   attempts: number;
@@ -399,6 +422,8 @@ try {
         void processCopyCategorizationQueue();
       } else if (alarm.name === AUTO_SYNC_ALARM) {
         void runAutoSync();
+      } else if (alarm.name === KEEPALIVE_ALARM) {
+        // No-op: receiving this alarm prevents the service worker from being suspended.
       }
     });
   } else {
@@ -417,6 +442,7 @@ async function runAutoSync(): Promise<void> {
 }
 
 async function processCopyCategorizationQueue(): Promise<void> {
+  startKeepalive();
   try {
     const current = await chrome.storage.local.get(COPY_CATEGORIZATION_QUEUE_KEY);
     const queue = (current[COPY_CATEGORIZATION_QUEUE_KEY] as PendingCopyCategorizationItem[] | undefined) ?? [];
@@ -498,6 +524,8 @@ async function processCopyCategorizationQueue(): Promise<void> {
     }
   } catch (err) {
     console.warn('[TrustButVerify] Failed processing copy categorization queue (non-fatal):', err);
+  } finally {
+    stopKeepalive();
   }
 }
 
@@ -1421,6 +1449,11 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[TrustButVerify] Extension started (browser startup)');
+  reinjectContentScripts();
+});
+
 async function reinjectContentScripts(): Promise<void> {
   const LLM_PATTERNS = [
     'https://chatgpt.com/*',
@@ -1549,9 +1582,7 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     const syncDecision = evaluateSyncNeed(conversations, nudgeEvents, lastSyncAt);
     if (!syncDecision.shouldSync) {
       await StorageManager.setSyncStatus('idle');
-      flowTrace(`sync:skipped-${syncDecision.reason}`, {
-        lastSyncAt
-      });
+      flowTrace(`sync:skipped-${syncDecision.reason}`, { lastSyncAt });
       return {
         success: true,
         data: {
@@ -1569,14 +1600,59 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     await StorageManager.setSyncStatus('syncing');
 
     // Build the sync payload — shape it to match backend SyncRequest
-    const payload = buildSyncPayload(conversations, nudgeEvents);
+    const { conversations: syncConversations, nudgeEvents: syncNudgeEvents } =
+      buildSyncPayload(conversations, nudgeEvents);
 
     flowTrace('sync:start', {
-      conversations: payload.conversations.length,
-      nudgeEvents: payload.nudgeEvents.length
+      conversations: syncConversations.length,
+      nudgeEvents: syncNudgeEvents.length
     });
 
-    const result = await apiSyncData(uuid, payload);
+    // ── Checkpoint-based upload: resume from last successfully synced conversation ──
+    // On interruption (worker killed / network error), the next sync run picks up
+    // from the last saved checkpoint instead of restarting from scratch.
+    const cpResult = await chrome.storage.local.get(SYNC_CHECKPOINT_KEY);
+    const checkpointId = cpResult[SYNC_CHECKPOINT_KEY] as string | undefined;
+    const startIdx = checkpointId
+      ? Math.max(0, syncConversations.findIndex((c) => c.id === checkpointId) + 1)
+      : 0;
+
+    if (startIdx > 0) {
+      flowTrace('sync:resuming-from-checkpoint', { checkpointId, startIdx });
+    }
+
+    // Accumulate totals across all partial uploads.
+    let totalNewConversations = 0;
+    let totalUpdatedConversations = 0;
+    let totalNewTurns = 0;
+    let totalNewCopyActivities = 0;
+    let totalNewNudgeEvents = 0;
+
+    startKeepalive();
+    try {
+      // Upload one conversation at a time so we can checkpoint after each.
+      for (let i = startIdx; i < syncConversations.length; i++) {
+        const partial = await apiSyncData(uuid, {
+          conversations: [syncConversations[i]],
+          nudgeEvents: []
+        });
+        totalNewConversations += (partial.newConversations || 0);
+        totalUpdatedConversations += (partial.updatedConversations || 0);
+        totalNewTurns += (partial.newTurns || 0);
+        totalNewCopyActivities += (partial.newCopyActivities || 0);
+        // Save checkpoint after each successful conversation upload.
+        await chrome.storage.local.set({ [SYNC_CHECKPOINT_KEY]: syncConversations[i].id });
+      }
+
+      // All conversations synced — now sync nudge events.
+      const nudgeResult = await apiSyncData(uuid, { conversations: [], nudgeEvents: syncNudgeEvents });
+      totalNewNudgeEvents = (nudgeResult.newNudgeEvents || 0);
+
+      // Success: clear the checkpoint.
+      await chrome.storage.local.remove(SYNC_CHECKPOINT_KEY);
+    } finally {
+      stopKeepalive();
+    }
 
     const syncedAt = Date.now();
     await StorageManager.setLastSyncAt(syncedAt);
@@ -1585,11 +1661,11 @@ async function handleTriggerSync(): Promise<MessageResponse> {
 
     const syncResult: SyncResult = {
       success: true,
-      newConversations: result.newConversations,
-      updatedConversations: result.updatedConversations,
-      newTurns: result.newTurns,
-      newCopyActivities: result.newCopyActivities,
-      newNudgeEvents: result.newNudgeEvents,
+      newConversations: totalNewConversations,
+      updatedConversations: totalUpdatedConversations,
+      newTurns: totalNewTurns,
+      newCopyActivities: totalNewCopyActivities,
+      newNudgeEvents: totalNewNudgeEvents,
       syncedAt
     };
 
@@ -1599,6 +1675,7 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     await StorageManager.setSyncStatus('error');
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[TrustButVerify] Sync failed:', msg);
+    // Note: checkpoint is intentionally NOT cleared on error, so the next run can resume.
     return {
       success: false,
       data: {

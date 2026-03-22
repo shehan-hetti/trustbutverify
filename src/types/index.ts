@@ -305,7 +305,8 @@ export interface MessagePayload {
     | 'GET_NUDGE_STATS'
     | 'VERIFY_PARTICIPANT'
     | 'TRIGGER_SYNC'
-    | 'GET_SYNC_STATUS';
+    | 'GET_SYNC_STATUS'
+    | 'FLUSH_PENDING_EVENTS';
   data?:
     | CopyActivity
     | ConversationLog

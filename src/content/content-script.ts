@@ -21,6 +21,7 @@ class ActivityTracker {
   private nudgeOverlay: NudgeOverlay | null = null;
   private lastInteractedElement: HTMLElement | null = null;
   private extensionContextInvalidated = false;
+  private reconnectTimer: number | null = null;
   private readonly copySignatureCache = new Map<string, number>();
   private readonly nudgeEventIdCollisions = new Map<string, number>();
   private static readonly COPY_SIGNATURE_TTL = 2500;
@@ -29,6 +30,8 @@ class ActivityTracker {
   private static readonly MAX_PAIRED_PROMPT_CHARS = 20000;
   private static readonly CHAT_ACTIVITY_EVENT = 'tbv:chat-activity';
   private static readonly NUDGE_TIMEOUT_MS = 60_000;
+
+  private readonly boundHandleCopy = this.handleCopy.bind(this);
 
   private readonly handleRuntimeMessage = (
     message: unknown,
@@ -163,7 +166,7 @@ class ActivityTracker {
     this.trackInteractionTargets();
 
     // Initialize copy tracking
-    document.addEventListener('copy', this.handleCopy.bind(this));
+    document.addEventListener('copy', this.boundHandleCopy);
     this.setupProgrammaticCopyTracking();
     
     // Initialize conversation tracking
@@ -179,6 +182,9 @@ class ActivityTracker {
       this.nudgeOverlay?.dispose();
       this.nudgeOverlay = null;
     });
+
+    // Flush any events that were buffered during a prior context invalidation.
+    void this.flushPendingEvents();
   }
 
   private initNudgeOverlay(): void {
@@ -240,18 +246,7 @@ class ActivityTracker {
       dismissedBy: result.dismissedBy
     };
 
-    try {
-      chrome.runtime.sendMessage(
-        { type: 'SAVE_NUDGE_EVENT', data: nudgeEvent },
-        () => {
-          if (chrome.runtime.lastError) {
-            console.debug('[TrustButVerify] Nudge event save failed:', chrome.runtime.lastError.message);
-          }
-        }
-      );
-    } catch {
-      // Extension context may be invalidated — safe to ignore
-    }
+    void this.safeSendToBackground({ type: 'SAVE_NUDGE_EVENT', data: nudgeEvent });
   }
 
   private buildNudgeEventId(questionId: string, timestampMs: number): string {
@@ -1654,41 +1649,88 @@ class ActivityTracker {
    * Send activity to background script
    */
   private async sendToBackground(activity: CopyActivity): Promise<void> {
+    await this.safeSendToBackground({ type: 'COPY_EVENT', data: activity });
+  }
+
+  private teardown(): void {
+    document.removeEventListener('copy', this.boundHandleCopy);
+    window.removeEventListener('message', this.handleBridgeMessage);
     try {
-      const payload = {
-        type: 'COPY_EVENT',
-        data: activity
-      };
+      chrome.runtime.onMessage.removeListener(this.handleRuntimeMessage);
+    } catch { /* ignore */ }
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
 
+  /**
+   * Safe send: buffers to window.sessionStorage on context invalidation and
+   * tears down the script to allow a fresh injection to take over.
+   */
+  private async safeSendToBackground(payload: object): Promise<void> {
+    // Fast path: context already known to be gone, or chrome.runtime.id absent.
+    if (this.extensionContextInvalidated || !chrome?.runtime?.id) {
+      await this.enqueueEvent(payload);
+      this.teardown();
+      return;
+    }
+    try {
       await chrome.runtime.sendMessage(payload);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const lower = message.toLowerCase();
-
-      const isTransientPortIssue =
-        lower.includes('message port closed') ||
-        lower.includes('receiving end does not exist') ||
-        lower.includes('could not establish connection');
-
-      if (isTransientPortIssue && chrome?.runtime?.id) {
-        try {
-          await new Promise((resolve) => window.setTimeout(resolve, 200));
-          await chrome.runtime.sendMessage({
-            type: 'COPY_EVENT',
-            data: activity
-          });
-          return;
-        } catch (retryError) {
-          console.error('[TrustButVerify] Error sending to background (retry failed):', retryError);
-          return;
-        }
-      }
-
-      if (lower.includes('extension context invalidated')) {
+    } catch (err) {
+      const msg = String(err).toLowerCase();
+      if (msg.includes('extension context invalidated')) {
         this.extensionContextInvalidated = true;
+        console.warn('[TrustButVerify] Context invalidated — buffering event and tearing down');
+        await this.enqueueEvent(payload);
+        this.teardown();
+      } else if (
+        msg.includes('message port closed') ||
+        msg.includes('receiving end does not exist') ||
+        msg.includes('could not establish connection')
+      ) {
+        // Transient port issue: wait 200 ms and retry once.
+        await new Promise((r) => window.setTimeout(r, 200));
+        try {
+          await chrome.runtime.sendMessage(payload);
+        } catch (retryErr) {
+          console.error('[TrustButVerify] Error sending to background (retry failed):', retryErr);
+        }
+      } else {
+        console.error('[TrustButVerify] Error sending to background:', err);
       }
+    }
+  }
 
-      console.error('[TrustButVerify] Error sending to background:', error);
+  /** Append one event payload to the persistent pending-events queue in sessionStorage. */
+  private async enqueueEvent(payload: object): Promise<void> {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      const queue: object[] = raw ? JSON.parse(raw) : [];
+      queue.push(payload);
+      window.sessionStorage.setItem('tbv_pending_events', JSON.stringify(queue));
+    } catch (e) {
+      console.debug('[TrustButVerify] enqueueEvent failed:', e);
+    }
+  }
+
+  /** Drain the pending-events queue and send each item to the background. */
+  private async flushPendingEvents(): Promise<void> {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      if (!raw) return;
+      const queue: object[] = JSON.parse(raw);
+      if (!Array.isArray(queue) || queue.length === 0) {
+        return;
+      }
+      // Clear the queue before sending to avoid re-queueing on failure.
+      window.sessionStorage.removeItem('tbv_pending_events');
+      console.log(`[TrustButVerify] Context restored — flushing ${queue.length} buffered event(s)`);
+      for (const payload of queue) {
+        await this.safeSendToBackground(payload);
+      }
+    } catch (e) {
+      console.debug('[TrustButVerify] flushPendingEvents failed:', e);
     }
   }
 
