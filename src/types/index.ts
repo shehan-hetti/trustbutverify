@@ -306,7 +306,8 @@ export interface MessagePayload {
     | 'VERIFY_PARTICIPANT'
     | 'TRIGGER_SYNC'
     | 'GET_SYNC_STATUS'
-    | 'FLUSH_PENDING_EVENTS';
+    | 'FLUSH_PENDING_EVENTS'
+    | 'NUDGE_SESSION_COMPLETE';
   data?:
     | CopyActivity
     | ConversationLog
@@ -318,7 +319,8 @@ export interface MessagePayload {
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
       }
-    | { uuid: string };
+    | { uuid: string }
+    | { fullSkip: boolean; triggerType: NudgeTriggerType };
 }
 
 export interface MessageResponse {

@@ -1,6 +1,6 @@
 import { StorageManager } from '../utils/storage';
 import { computeReadability } from '../utils/readability-metrics';
-import { getNextNudgeQuestion } from '../nudges/nudge-selector';
+import { getActiveNudgeQuestions } from '../nudges/nudge-questions';
 import { verifyParticipant as apiVerifyParticipant, syncData as apiSyncData } from '../utils/backend-api';
 import { evaluateSyncNeed } from './sync-policy';
 import type {
@@ -88,7 +88,7 @@ chrome.runtime.onMessage.addListener(
           error: error.message
         });
       });
-    
+
     // Return true to indicate async response
     return true;
   }
@@ -108,13 +108,13 @@ async function handleMessage(
   switch (message.type) {
     case 'COPY_EVENT':
       return handleCopyEvent(message.data as CopyActivity, sender);
-    
+
     case 'GET_ACTIVITIES':
       return handleGetActivities((message.data as { limit?: number })?.limit);
-    
+
     case 'CLEAR_ACTIVITIES':
       return handleClearActivities();
-    
+
     case 'CONVERSATION_EVENT':
       return handleConversationEvent(message.data as any);
     case 'UPSERT_CONVERSATION_TURNS':
@@ -123,10 +123,10 @@ async function handleMessage(
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
       }, sender);
-    
+
     case 'GET_CONVERSATIONS':
       return handleGetConversations(message.data as GetConversationsParams | undefined);
-    
+
     case 'CLEAR_CONVERSATIONS':
       return handleClearConversations();
 
@@ -147,7 +147,10 @@ async function handleMessage(
 
     case 'GET_SYNC_STATUS':
       return handleGetSyncStatus();
-    
+
+    case 'NUDGE_SESSION_COMPLETE':
+      return handleNudgeSessionComplete(message.data as { fullSkip: boolean, triggerType: import('../types').NudgeTriggerType });
+
     default:
       return {
         success: false,
@@ -232,7 +235,7 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
     ) {
       void trySendCopyNudge(sender.tab?.id, enriched);
     }
-    
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error saving activity:', error);
@@ -896,10 +899,10 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
  */
 async function handleGetActivities(limit?: number): Promise<MessageResponse> {
   try {
-    const activities = limit 
+    const activities = limit
       ? await StorageManager.getRecentActivities(limit)
       : await StorageManager.getAllActivities();
-    
+
     return {
       success: true,
       data: activities
@@ -917,7 +920,7 @@ async function handleClearActivities(): Promise<MessageResponse> {
   try {
     await StorageManager.clearAllActivities();
     console.log('[TrustButVerify] All activities cleared');
-    
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error clearing activities:', error);
@@ -1277,7 +1280,7 @@ async function handleGetConversations(params?: GetConversationsParams): Promise<
         .join('\n');
       return matchesDomain && haystack.includes(searchTerm);
     });
-    
+
     return {
       success: true,
       data: filtered
@@ -1311,7 +1314,7 @@ async function handleClearConversations(): Promise<MessageResponse> {
   try {
     await StorageManager.clearAllConversations();
     console.log('[TrustButVerify] All conversations cleared');
-    
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error clearing conversations:', error);
@@ -1364,18 +1367,21 @@ const NUDGE_COPY_MIN_CHARS = 40;
 function sendNudgeToTab(
   tabId: number,
   data: {
-    questionId: string;
-    questionText: string;
-    answerMode: string;
     triggerType: string;
     conversationId?: string;
     turnId?: string;
     copyActivityId?: string;
     timeoutMs?: number;
     position?: string;
-    ratingLabels?: { low: string; high: string };
-    yesLabel?: string;
-    questionTags?: string[];
+    textPreview?: string;
+    questions: {
+      questionId: string;
+      questionText: string;
+      answerMode: string;
+      ratingLabels?: { low: string; high: string };
+      yesLabel?: string;
+      questionTags?: string[];
+    }[];
   }
 ): void {
   chrome.tabs.sendMessage(
@@ -1391,40 +1397,101 @@ function sendNudgeToTab(
   );
 }
 
-/**
- * Try to fire a copy-triggered nudge after a qualifying copy event.
- */
+const NUDGE_COOLDOWN_KEY = 'nudgeCooldownState';
+
+interface NudgeCooldownState {
+  continuousSkips: number;
+  pausedUntil: number;
+}
+
+async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType: import('../types').NudgeTriggerType }): Promise<MessageResponse> {
+  if (data.triggerType !== 'copy') {
+    return { success: true };
+  }
+
+  try {
+    const stateObj = await chrome.storage.local.get(NUDGE_COOLDOWN_KEY);
+    const state: NudgeCooldownState = stateObj[NUDGE_COOLDOWN_KEY] || { continuousSkips: 0, pausedUntil: 0 };
+
+    if (data.fullSkip) {
+      state.continuousSkips += 1;
+      console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
+      if (state.continuousSkips >= 3) {
+        state.pausedUntil = Date.now() + 10 * 60 * 1000; // 10 minutes
+        console.log('[TrustButVerify] Nudges paused for 10 minutes due to 3 continuous skips');
+      }
+    } else {
+      if (state.continuousSkips > 0) {
+        console.log('[TrustButVerify] User answered a question, resetting continuous skips count to 0');
+      }
+      state.continuousSkips = 0;
+    }
+
+    await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error handling nudge session complete:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
 async function trySendCopyNudge(
   tabId: number | undefined,
   activity: CopyActivity
 ): Promise<void> {
+  console.log('[TrustButVerify:DEBUG] trySendCopyNudge entered', { tabId, domain: activity.domain, textLength: activity.textLength });
+
   if (!tabId) {
+    console.log('[TrustButVerify:DEBUG] trySendCopyNudge returning early - NO TAB ID');
     return;
   }
   try {
-    const question = await getNextNudgeQuestion('copy');
-    if (!question) {
+    const stateObj = await chrome.storage.local.get(NUDGE_COOLDOWN_KEY);
+    const state: NudgeCooldownState = stateObj[NUDGE_COOLDOWN_KEY] || { continuousSkips: 0, pausedUntil: 0 };
+
+    console.log('[TrustButVerify:DEBUG] Cooldown state:', state);
+
+    if (Date.now() < state.pausedUntil) {
+      console.log('[TrustButVerify] Nudges are currently paused due to cooldown.');
       return;
     }
+
+    const questions = getActiveNudgeQuestions('copy');
+    console.log('[TrustButVerify:DEBUG] Fetched questions array length:', questions?.length);
+
+    if (!questions || questions.length === 0) {
+      console.log('[TrustButVerify:DEBUG] trySendCopyNudge returning early - NO QUESTIONS');
+      return;
+    }
+
     flowTrace('nudge:copy-trigger', {
       tabId,
-      questionId: question.id,
+      questionCount: questions.length,
       copyActivityId: activity.id,
       textLength: activity.textLength
     });
+
+    const formattedQuestions = questions.map(q => ({
+      questionId: q.id,
+      questionText: q.text,
+      answerMode: q.answerMode,
+      ratingLabels: q.ratingLabels,
+      yesLabel: q.yesLabel,
+      questionTags: q.tags ? Array.from(new Set(q.tags)) : []
+    }));
+
+    const previewWords = activity.copiedText.split(/\s+/).slice(0, 15).join(' ');
+    const textPreview = previewWords.length < activity.copiedText.length ? previewWords + '...' : previewWords;
+
     sendNudgeToTab(tabId, {
-      questionId: question.id,
-      questionText: question.text,
-      answerMode: question.answerMode,
       triggerType: 'copy',
       conversationId: activity.conversationId,
       turnId: activity.turnId,
       copyActivityId: activity.id,
       timeoutMs: 60_000,
       position: 'bottom-right',
-      ratingLabels: question.ratingLabels,
-      yesLabel: question.yesLabel,
-      questionTags: question.tags ? Array.from(new Set(question.tags)) : []
+      textPreview,
+      questions: formattedQuestions
     });
   } catch (error) {
     console.debug('[TrustButVerify] Copy nudge failed:', error);

@@ -41,18 +41,21 @@ class ActivityTracker {
     const payload = (message || {}) as {
       type?: string;
       data?: {
-        questionId?: string;
-        questionText?: string;
-        answerMode?: NudgeAnswerMode;
         triggerType?: NudgeTriggerType;
         conversationId?: string;
         turnId?: string;
         copyActivityId?: string;
         timeoutMs?: number;
         position?: NudgeOverlayPosition;
-        ratingLabels?: { low: string; high: string };
-        yesLabel?: string;
-        questionTags?: string[];
+        textPreview?: string;
+        questions?: {
+          questionId: string;
+          questionText: string;
+          answerMode: NudgeAnswerMode;
+          ratingLabels?: { low: string; high: string };
+          yesLabel?: string;
+          questionTags?: string[];
+        }[];
       };
     };
 
@@ -67,25 +70,21 @@ class ActivityTracker {
       }
 
       const data = payload.data;
-      if (!data || !data.questionId || !data.questionText || !data.answerMode || !data.triggerType) {
+      if (!data || !data.triggerType || !data.questions || data.questions.length === 0) {
         console.warn('[TrustButVerify] Invalid nudge payload:', data);
         sendResponse({ success: false, error: 'Invalid nudge payload' });
         return;
       }
 
       this.showNudgeOverlay({
-        questionId: data.questionId,
-        questionText: data.questionText,
-        answerMode: data.answerMode,
         triggerType: data.triggerType,
         conversationId: data.conversationId,
         turnId: data.turnId,
         copyActivityId: data.copyActivityId,
         timeoutMs: data.timeoutMs,
         position: data.position,
-        ratingLabels: data.ratingLabels,
-        yesLabel: data.yesLabel,
-        questionTags: data.questionTags
+        textPreview: data.textPreview,
+        questions: data.questions
       });
       sendResponse({ success: true });
       return;
@@ -195,6 +194,7 @@ class ActivityTracker {
     try {
       this.nudgeOverlay = new NudgeOverlay();
       this.nudgeOverlay.setOnResolve((result) => this.handleNudgeResolution(result));
+      this.nudgeOverlay.setOnSessionComplete((fullSkip, triggerType) => this.handleNudgeSessionComplete(fullSkip, triggerType));
     } catch (error) {
       console.debug('[TrustButVerify] Nudge overlay init failed:', error);
       this.nudgeOverlay = null;
@@ -208,10 +208,18 @@ class ActivityTracker {
       return;
     }
 
-    console.log('[TrustButVerify] Showing nudge overlay:', data.questionId, data.questionText);
+    console.log('[TrustButVerify] Showing nudge overlay with multiple questions');
     this.nudgeOverlay.show({
       ...data,
       timeoutMs: data.timeoutMs ?? ActivityTracker.NUDGE_TIMEOUT_MS
+    });
+  }
+
+  private handleNudgeSessionComplete(fullSkip: boolean, triggerType: NudgeTriggerType): void {
+    console.debug('[TrustButVerify] Nudge session complete, full skip:', fullSkip);
+    void this.safeSendToBackground({
+      type: 'NUDGE_SESSION_COMPLETE',
+      data: { fullSkip, triggerType }
     });
   }
 
