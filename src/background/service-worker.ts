@@ -1540,7 +1540,7 @@ async function reinjectContentScripts(): Promise<void> {
       if (!tab.id) continue;
       try {
         await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
+          target: { tabId: tab.id, allFrames: false },
           files: ['content/content-script.js']
         });
         console.log('[TrustButVerify] Re-injected content script into tab:', tab.id, tab.url);
@@ -1554,8 +1554,9 @@ async function reinjectContentScripts(): Promise<void> {
   }
 }
 
-// Also check on service-worker startup (browser restart)
-routePopup();
+// Also check on service-worker startup (browser restart).
+// Delay to ensure storage APIs are ready after rapid reloads.
+setTimeout(() => routePopup(), 500);
 
 function deriveThreadIdFromUrl(url: string, domain: string): string {
   try {

@@ -22,8 +22,9 @@ class ActivityTracker {
   private lastInteractedElement: HTMLElement | null = null;
   private extensionContextInvalidated = false;
   private reconnectTimer: number | null = null;
-  private readonly copySignatureCache = new Map<string, number>();
-  private readonly nudgeEventIdCollisions = new Map<string, number>();
+  private copySignatureCache = new Map<string, number>();
+  private nudgeEventIdCollisions = new Map<string, number>();
+  private flushIntervalTimer: number | null = null;
   private static readonly COPY_SIGNATURE_TTL = 2500;
   private static readonly PROGRAMMATIC_COPY_MESSAGE = 'TBV_PROGRAMMATIC_COPY';
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
@@ -150,7 +151,25 @@ class ActivityTracker {
 
 
 
+  private readonly _instanceId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  private static readonly STAMP_KEY = 'tbv_active_instance';
+
   constructor() {
+    // Takeover: if a previous instance exists in this exact same isolated world, tear it down
+    const prev = (window as any).__tbv_active_tracker as ActivityTracker | undefined;
+    if (prev && typeof prev.teardown === 'function') {
+      try { prev.teardown(); } catch { /* ignore */ }
+    }
+    (window as any).__tbv_active_tracker = this;
+
+    // Stamp sessionStorage so ALL content-script worlds know who's the current owner.
+    // sessionStorage is shared across isolated worlds (like the DOM) but unlike DOM
+    // attributes it cannot be stripped by frameworks (e.g. ChatGPT's Next.js removes
+    // custom data-* attributes from <html> during hydration).
+    try {
+      sessionStorage.setItem(ActivityTracker.STAMP_KEY, this._instanceId);
+    } catch { /* sessionStorage unavailable — isActiveInstance will fall back to true */ }
+
     this.domain = window.location.hostname;
     this.conversationDetector = new ConversationDetector(this.domain);
     this.init();
@@ -184,6 +203,9 @@ class ActivityTracker {
 
     // Flush any events that were buffered during a prior context invalidation.
     void this.flushPendingEvents();
+
+    // Periodically flush any orphaned pending events (defense-in-depth)
+    this.flushIntervalTimer = window.setInterval(() => void this.flushPendingEvents(), 30_000);
   }
 
   private initNudgeOverlay(): void {
@@ -275,9 +297,31 @@ class ActivityTracker {
   }
 
   /**
+   * Check whether this instance is the current "owner" via sessionStorage.
+   * Only the most recently created instance will match.
+   */
+  private isActiveInstance(): boolean {
+    try {
+      return sessionStorage.getItem(ActivityTracker.STAMP_KEY) === this._instanceId;
+    } catch {
+      return true; // sessionStorage unavailable — assume active to avoid dropping events
+    }
+  }
+
+  /**
    * Handle copy event
    */
   private async handleCopy(event: ClipboardEvent): Promise<void> {
+    // Bail out if this tracker's context is already invalidated (zombie instance)
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] handleCopy: skipped — extensionContextInvalidated');
+      return;
+    }
+    // Cross-world dedup: only the instance whose ID matches the DOM stamp processes events
+    if (!this.isActiveInstance()) {
+      console.debug('[TrustButVerify] handleCopy: skipped — not active instance');
+      return;
+    }
     try {
       const selection = window.getSelection();
       let copiedText = selection?.toString()?.trim() || '';
@@ -605,17 +649,17 @@ class ActivityTracker {
     }
   }
 
-  private trackInteractionTargets(): void {
-    const updateTarget = (event: Event) => {
-      const target = event.target as HTMLElement | null;
-      if (target) {
-        this.lastInteractedElement = target;
-      }
-    };
+  private readonly boundUpdateTarget = (event: Event) => {
+    const target = event.target as HTMLElement | null;
+    if (target) {
+      this.lastInteractedElement = target;
+    }
+  };
 
-    document.addEventListener('pointerdown', updateTarget, true);
-    document.addEventListener('focusin', updateTarget, true);
-    document.addEventListener('keydown', updateTarget, true);
+  private trackInteractionTargets(): void {
+    document.addEventListener('pointerdown', this.boundUpdateTarget, true);
+    document.addEventListener('focusin', this.boundUpdateTarget, true);
+    document.addEventListener('keydown', this.boundUpdateTarget, true);
   }
 
   private setupProgrammaticCopyTracking(): void {
@@ -627,11 +671,17 @@ class ActivityTracker {
 
   private patchClipboardWriteText(): void {
     const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.writeText !== 'function' || clipboard.__TBV_WRITE_PATCHED__) {
+    if (!clipboard || typeof clipboard.writeText !== 'function') {
       return;
     }
 
-    const original = clipboard.writeText.bind(clipboard);
+    // Store the TRULY original function only once, on the very first patch.
+    // This prevents patch chaining where each new instance wraps the previous
+    // instance's patched function, causing duplicate events.
+    if (!(window as any).__tbv_original_writeText) {
+      (window as any).__tbv_original_writeText = clipboard.writeText.bind(clipboard);
+    }
+    const original = (window as any).__tbv_original_writeText as typeof clipboard.writeText;
     const tracker = this;
 
     const patched = async function patchedWriteText(...args: Parameters<Clipboard['writeText']>) {
@@ -658,11 +708,15 @@ class ActivityTracker {
 
   private patchClipboardWrite(): void {
     const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean } & { __TBV_WRITE_DATA_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.write !== 'function' || clipboard.__TBV_WRITE_DATA_PATCHED__) {
+    if (!clipboard || typeof clipboard.write !== 'function') {
       return;
     }
 
-    const original = clipboard.write.bind(clipboard);
+    // Store the TRULY original function only once (same pattern as writeText)
+    if (!(window as any).__tbv_original_write) {
+      (window as any).__tbv_original_write = clipboard.write.bind(clipboard);
+    }
+    const original = (window as any).__tbv_original_write as typeof clipboard.write;
     const tracker = this;
 
     const patched = async function patchedWrite(...args: Parameters<Clipboard['write']>) {
@@ -727,6 +781,16 @@ class ActivityTracker {
     method: string,
     metadata?: { context?: string | null; trigger?: Partial<CopyActivityTrigger> | undefined }
   ): void {
+    // Bail out if this tracker's context is already invalidated (zombie instance)
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] handleProgrammaticCopy: skipped — extensionContextInvalidated');
+      return;
+    }
+    // Cross-world dedup: only the instance whose ID matches the DOM stamp processes events
+    if (!this.isActiveInstance()) {
+      console.debug('[TrustButVerify] handleProgrammaticCopy: skipped — not active instance');
+      return;
+    }
     const trimmed = text?.trim();
     if (!trimmed) {
       return;
@@ -816,6 +880,14 @@ class ActivityTracker {
       }
     }
 
+    // Last-resort fallback for programmatic copies when site-specific side
+    // resolution fails. Keep this at the end so stronger platform heuristics
+    // run first.
+    let bestMatchFromText = null;
+    if (copiedText) {
+      bestMatchFromText = this.findBestMatchByText(anchor, copiedText);
+    }
+
     if (domain.includes('claude')) {
       const root = (anchor.closest('[data-testid="user-message"]') as HTMLElement | null)
         || (anchor.closest('.font-claude-response') as HTMLElement | null);
@@ -825,6 +897,9 @@ class ActivityTracker {
           const side = root.matches('[data-testid="user-message"]') ? 'prompt' : 'response';
           return this.buildExpandedCopyResult(root, text, side === 'prompt' ? 'claude:user-message' : 'claude:assistant-message', side);
         }
+      } else if (bestMatchFromText && bestMatchFromText.side) {
+        const text = getText(bestMatchFromText.element);
+        if (text) return this.buildExpandedCopyResult(bestMatchFromText.element, text, 'matched-by-text', bestMatchFromText.side);
       }
     }
 
@@ -841,8 +916,6 @@ class ActivityTracker {
           ? (root.getAttribute('data-message-author-role') || 'unknown')
           : 'unknown';
 
-        // Fallback: if role is unknown (e.g. copy button outside the role
-        // wrapper but inside the turn article), infer from nested children.
         if (role === 'unknown' && turn) {
           const nestedAssistant = turn.querySelector('div[data-message-author-role="assistant"]');
           const nestedUser = turn.querySelector('div[data-message-author-role="user"]');
@@ -856,14 +929,16 @@ class ActivityTracker {
         }
 
         const side = role === 'user' ? 'prompt' : role === 'assistant' ? 'response' : undefined;
+        const resolvedSide = side || bestMatchFromText?.side; // OVERRIDE undefined side using text matching
+
         const strategy = root.matches('div[data-message-author-role]') ? `chatgpt:message:${role}` : 'chatgpt:conversation-turn';
-        const text = this.sanitizeCapturedText(getText(root), side, strategy);
+        const text = this.sanitizeCapturedText(getText(root), resolvedSide, strategy);
         if (text) {
           return this.buildExpandedCopyResult(
             root,
             text,
             strategy,
-            side
+            resolvedSide
           );
         }
       }
@@ -939,21 +1014,16 @@ class ActivityTracker {
       }
     }
 
-    // Last-resort fallback for programmatic copies when site-specific side
-    // resolution fails. Keep this at the end so stronger platform heuristics
-    // run first.
-    if (copiedText) {
-      const matched = this.findBestMatchByText(anchor, copiedText);
-      if (matched) {
-        const text = getText(matched.element);
-        if (text) {
-          return this.buildExpandedCopyResult(
-            matched.element,
-            text,
-            'matched-by-text',
-            matched.side
-          );
-        }
+    // If all else fails and we have the exact match from earlier:
+    if (bestMatchFromText) {
+      const text = getText(bestMatchFromText.element);
+      if (text) {
+        return this.buildExpandedCopyResult(
+          bestMatchFromText.element,
+          text,
+          'matched-by-text',
+          bestMatchFromText.side
+        );
       }
     }
 
@@ -1661,7 +1731,30 @@ class ActivityTracker {
   }
 
   private teardown(): void {
+    this.extensionContextInvalidated = true;
+
+    // Restore original clipboard methods to prevent patch chaining on next instance
+    try {
+      const clipboard = navigator.clipboard;
+      if ((window as any).__tbv_original_writeText) {
+        Object.defineProperty(clipboard, 'writeText', {
+          value: (window as any).__tbv_original_writeText,
+          configurable: true
+        });
+      }
+      if ((window as any).__tbv_original_write) {
+        Object.defineProperty(clipboard, 'write', {
+          value: (window as any).__tbv_original_write,
+          configurable: true
+        });
+      }
+    } catch { /* ignore */ }
+
     document.removeEventListener('copy', this.boundHandleCopy);
+    document.removeEventListener('pointerdown', this.boundUpdateTarget, true);
+    document.removeEventListener('focusin', this.boundUpdateTarget, true);
+    document.removeEventListener('keydown', this.boundUpdateTarget, true);
+
     window.removeEventListener('message', this.handleBridgeMessage);
     try {
       chrome.runtime.onMessage.removeListener(this.handleRuntimeMessage);
@@ -1670,39 +1763,77 @@ class ActivityTracker {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.flushIntervalTimer) {
+      window.clearInterval(this.flushIntervalTimer);
+      this.flushIntervalTimer = null;
+    }
   }
 
   /**
    * Safe send: buffers to window.sessionStorage on context invalidation and
    * tears down the script to allow a fresh injection to take over.
+   *
+   * IMPORTANT: We distinguish between two very different states:
+   *  1. True context invalidation (extension was uninstalled/updated) → teardown
+   *  2. Transient worker sleep (MV3 30s suspension) → buffer only, do NOT teardown
+   *
+   * Calling teardown() on transient sleep permanently kills the tracker instance,
+   * causing all future copy events to be silently dropped. This was the root cause
+   * of the ChatGPT-only copy tracking failure.
    */
   private async safeSendToBackground(payload: object): Promise<void> {
-    // Fast path: context already known to be gone, or chrome.runtime.id absent.
-    if (this.extensionContextInvalidated || !chrome?.runtime?.id) {
+    // If we already know the context is truly invalidated, just buffer.
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] safeSend: context already invalidated, buffering');
       await this.enqueueEvent(payload);
-      this.teardown();
-      return;
+      return;  // Already torn down previously
     }
+
+    // chrome.runtime.id being absent can mean:
+    //  (a) Extension truly uninstalled/updated → context gone forever
+    //  (b) MV3 service worker is sleeping → transient, will wake on next message
+    // We CANNOT distinguish (a) from (b) here, so we MUST NOT teardown.
+    // Instead, buffer and let the periodic flush (30s interval) retry.
+    if (!chrome?.runtime?.id) {
+      console.debug('[TrustButVerify] safeSend: chrome.runtime.id absent (worker may be sleeping), buffering');
+      await this.enqueueEvent(payload);
+      return;  // Do NOT teardown — worker may wake up
+    }
+
     try {
       await chrome.runtime.sendMessage(payload);
+      // Successful send — clear any stale pending events
+      this.clearPendingEventsIfNeeded();
     } catch (err) {
       const msg = String(err).toLowerCase();
       if (msg.includes('extension context invalidated')) {
+        // True invalidation: the extension was updated or uninstalled.
         this.extensionContextInvalidated = true;
         console.warn('[TrustButVerify] Context invalidated — buffering event and tearing down');
         await this.enqueueEvent(payload);
         this.teardown();
       } else if (
         msg.includes('message port closed') ||
+        msg.includes('message channel closed') ||
         msg.includes('receiving end does not exist') ||
         msg.includes('could not establish connection')
       ) {
-        // Transient port issue: wait 200 ms and retry once.
-        await new Promise((r) => window.setTimeout(r, 200));
+        // Transient port/channel issue (worker sleeping or restarting).
+        // Buffer the event AND retry after a short delay.
+        console.debug('[TrustButVerify] Transient send error, buffering and retrying:', msg.substring(0, 80));
+        await this.enqueueEvent(payload);
+        await new Promise((r) => window.setTimeout(r, 300));
         try {
-          await chrome.runtime.sendMessage(payload);
+          // If the worker woke up, this will succeed and we can flush.
+          if (chrome?.runtime?.id) {
+            await chrome.runtime.sendMessage(payload);
+            // Retry succeeded — flush the buffer too
+            this.clearPendingEventsIfNeeded();
+          }
         } catch (retryErr) {
-          console.error('[TrustButVerify] Error sending to background (retry failed):', retryErr);
+          // Retry failed — that's OK, the event is buffered.
+          // The 30s periodic flush will pick it up.
+          console.debug('[TrustButVerify] Retry also failed (event is buffered):', String(retryErr).substring(0, 80));
         }
       } else {
         console.error('[TrustButVerify] Error sending to background:', err);
@@ -1715,6 +1846,15 @@ class ActivityTracker {
     try {
       const raw = window.sessionStorage.getItem('tbv_pending_events');
       const queue: object[] = raw ? JSON.parse(raw) : [];
+
+      // Deduplicate: check if an identical payload already exists in the queue.
+      const payloadStr = JSON.stringify(payload);
+      const isDuplicate = queue.some(item => JSON.stringify(item) === payloadStr);
+      if (isDuplicate) {
+        console.debug('[TrustButVerify] Skipping duplicate enqueue');
+        return;
+      }
+
       queue.push(payload);
       window.sessionStorage.setItem('tbv_pending_events', JSON.stringify(queue));
     } catch (e) {
@@ -1733,13 +1873,44 @@ class ActivityTracker {
       }
       // Clear the queue before sending to avoid re-queueing on failure.
       window.sessionStorage.removeItem('tbv_pending_events');
-      console.log(`[TrustButVerify] Context restored — flushing ${queue.length} buffered event(s)`);
-      for (const payload of queue) {
+
+      // Deduplicate queue entries and discard stale events from previous sessions
+      const MAX_EVENT_AGE_MS = 60_000; // 60 seconds
+      const now = Date.now();
+      const seen = new Set<string>();
+      const uniqueQueue = queue.filter(item => {
+        const key = JSON.stringify(item);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        // Discard events older than MAX_EVENT_AGE_MS
+        const data = (item as any)?.data;
+        if (data?.timestamp && now - data.timestamp > MAX_EVENT_AGE_MS) {
+          console.debug('[TrustButVerify] Discarding stale event:', data.id);
+          return false;
+        }
+        return true;
+      });
+
+      console.log(`[TrustButVerify] Context restored — flushing ${uniqueQueue.length} buffered event(s)`);
+      for (const payload of uniqueQueue) {
         await this.safeSendToBackground(payload);
       }
     } catch (e) {
       console.debug('[TrustButVerify] flushPendingEvents failed:', e);
     }
+  }
+
+  /** Clear the pending-events queue if it exists and is empty (stale). */
+  private clearPendingEventsIfNeeded(): void {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      if (raw) {
+        const queue = JSON.parse(raw);
+        if (!Array.isArray(queue) || queue.length === 0) {
+          window.sessionStorage.removeItem('tbv_pending_events');
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   /**
@@ -1750,9 +1921,11 @@ class ActivityTracker {
   }
 }
 
-// Initialize tracker when DOM is ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => new ActivityTracker());
-} else {
-  new ActivityTracker();
+// Only run in the top frame — copies bubble up from iframes anyway.
+if (window.top === window.self) {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => new ActivityTracker());
+  } else {
+    new ActivityTracker();
+  }
 }

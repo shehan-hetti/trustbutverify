@@ -108,10 +108,10 @@ export class ConversationDetector {
     // restore a persisted prompt or start full DOM settling.
     this.isDomSettling = true;
     this.asyncInitSettling();
-    
+
     // Use MutationObserver to detect new messages
     this.observeConversations();
-    
+
     // Listen for form submissions (prompts)
     this.observePromptSubmissions();
 
@@ -536,10 +536,10 @@ export class ConversationDetector {
     document.addEventListener('pointerdown', (event) => {
       if (event.isTrusted) {
         markUserInteraction();
-        this.traceFlow('observePromptSubmissions:pointerdown', {
-          threadId: this.getConversationId(),
-          tag: (event.target as HTMLElement | null)?.tagName || null
-        });
+        // this.traceFlow('observePromptSubmissions:pointerdown', {
+        //   threadId: this.getConversationId(),
+        //   tag: (event.target as HTMLElement | null)?.tagName || null
+        // });
       }
     }, true);
 
@@ -557,11 +557,11 @@ export class ConversationDetector {
         if (hasComposerContext) {
           this.lastPromptIntentAt = Date.now();
           this.lastPromptThreadId = this.getConversationId();
-          this.traceFlow('observePromptSubmissions:keydownIntent', {
-            threadId: this.lastPromptThreadId,
-            key: event.key,
-            isTrusted: event.isTrusted
-          });
+          // this.traceFlow('observePromptSubmissions:keydownIntent', {
+          //   threadId: this.lastPromptThreadId,
+          //   key: event.key,
+          //   isTrusted: event.isTrusted
+          // });
         }
       }
     }, true);
@@ -888,14 +888,14 @@ export class ConversationDetector {
    * Detect if a new element is a conversation message
    */
   private detectMessage(element: Element): void {
-    this.traceFlow('detectMessage:start', {
-      tag: element.tagName,
-      className: (element as HTMLElement).className || '',
-      id: (element as HTMLElement).id || ''
-    });
+    // this.traceFlow('detectMessage:start', {
+    //   tag: element.tagName,
+    //   className: (element as HTMLElement).className || '',
+    //   id: (element as HTMLElement).id || ''
+    // });
     // Platform-specific selectors
     const selectors = this.getMessageSelectors();
-    
+
     for (const selector of selectors) {
       const candidates: Element[] = [];
 
@@ -1348,7 +1348,7 @@ export class ConversationDetector {
       hasPendingPrompt: Boolean(this.pendingPrompt),
       pendingPromptThreadId: this.pendingPrompt?.threadId || null
     });
-    
+
     if (!text || text.length < 2) {
       this.logDebug('Extracted text too short', text);
       return;
@@ -1632,7 +1632,7 @@ export class ConversationDetector {
   private extractText(element: Element): string {
     // Remove code blocks and other non-text elements for cleaner extraction
     const clone = element.cloneNode(true) as Element;
-    
+
     // Remove script and style elements
     clone.querySelectorAll('script, style').forEach(el => el.remove());
 
@@ -1653,7 +1653,7 @@ export class ConversationDetector {
         .replace(/\s*do you like this personality\?\s*$/i, '')
         .trim();
     }
-    
+
     return text;
   }
 
@@ -1685,11 +1685,11 @@ export class ConversationDetector {
   // private getMessageCount(): number {
   //   const selectors = this.getMessageSelectors();
   //   let count = 0;
-    
+
   //   for (const selector of selectors) {
   //     count += document.querySelectorAll(selector).length;
   //   }
-    
+
   //   return count;
   // }
 
@@ -1849,11 +1849,11 @@ export class ConversationDetector {
 
     if (domain.includes('deepseek')) {
       return [
-        '[data-role="user"]', 
-        '[class*="message-user"]', 
-        '[class*="user-message"]', 
-        '[data-testid*="user-message"]', 
-        '.message-content[data-role="user"]', 
+        '[data-role="user"]',
+        '[class*="message-user"]',
+        '[class*="user-message"]',
+        '[data-testid*="user-message"]',
+        '.message-content[data-role="user"]',
         '[class*="user"]:not([class*="assistant"])'
       ];
     }
