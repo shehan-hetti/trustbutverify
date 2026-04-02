@@ -136,6 +136,9 @@ async function handleMessage(
     case 'SAVE_NUDGE_EVENT':
       return handleSaveNudgeEvent(message.data as import('../types').NudgeEvent);
 
+    case 'SAVE_NUDGE_EVENTS_BATCH':
+      return handleSaveNudgeEventsBatch(message.data as import('../types').NudgeEvent[]);
+
     case 'GET_NUDGE_STATS':
       return handleGetNudgeStats();
 
@@ -1203,9 +1206,16 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
       }
 
       const maxToProcess = 2;
-      const now = Date.now();
 
-      for (const { t: turn, idx } of pending.slice(0, maxToProcess)) {
+      // Collect categorization results first, then batch-write to storage.
+      // This avoids holding a stale snapshot during multi-second LLM calls.
+      const results: Array<{
+        turnId: string;
+        category: string;
+        summary: string;
+      }> = [];
+
+      for (const { t: turn } of pending.slice(0, maxToProcess)) {
         if (!turn || turn.category !== 'pending') {
           continue;
         }
@@ -1225,23 +1235,68 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
             turnId: turn.id,
             contentPreview: (completion ?? '').slice(0, 400)
           });
-
-          // Avoid leaving 'pending' forever. This preserves flow without breaking matching.
-          convo.turns[idx].category = 'Uncategorized';
-          convo.turns[idx].summary = 'LLM-2 returned invalid categorization format.';
-          convo.lastUpdatedAt = now;
+          results.push({
+            turnId: turn.id,
+            category: 'Uncategorized',
+            summary: 'LLM-2 returned invalid categorization format.'
+          });
           continue;
         }
 
-        convo.turns[idx].category = extracted.category;
-        convo.turns[idx].summary = extracted.summary;
-        convo.lastUpdatedAt = now;
-
-        // Keep copy activities in sync when they reference this turn.
-        await StorageManager.updateCopyCategoriesForTurn(convo.turns[idx].id, extracted.category);
+        results.push({
+          turnId: turn.id,
+          category: extracted.category,
+          summary: extracted.summary
+        });
       }
 
-      await chrome.storage.local.set({ conversationLogs: conversations });
+      // ── Atomic re-read → patch → write ──────────────────────────────
+      // Re-read the LATEST state from storage to avoid overwriting any
+      // concurrent writes (new turns, copy activities, etc.) that happened
+      // while the LLM calls were in flight.
+      if (results.length > 0) {
+        const freshConversations = await StorageManager.getAllConversations();
+        const freshConvo = freshConversations.find(c => c.id === threadId);
+        if (!freshConvo || !Array.isArray(freshConvo.turns)) {
+          return;
+        }
+
+        const now = Date.now();
+        let anyPatched = false;
+
+        for (const result of results) {
+          const turnIndex = freshConvo.turns.findIndex(t => t.id === result.turnId);
+          if (turnIndex === -1) {
+            continue;
+          }
+
+          // Only patch if the turn is still pending — another code path
+          // (e.g. copy enrichment) may have already categorized it.
+          const currentCategory = freshConvo.turns[turnIndex].category;
+          if (currentCategory && currentCategory !== 'pending') {
+            flowTrace('categorizeLatestPendingTurn:skipAlreadyCategorized', {
+              threadId,
+              turnId: result.turnId,
+              currentCategory
+            });
+            continue;
+          }
+
+          freshConvo.turns[turnIndex].category = result.category;
+          freshConvo.turns[turnIndex].summary = result.summary;
+          freshConvo.lastUpdatedAt = now;
+          anyPatched = true;
+
+          // Keep copy activities in sync when they reference this turn.
+          if (result.category !== 'Uncategorized') {
+            await StorageManager.updateCopyCategoriesForTurn(result.turnId, result.category);
+          }
+        }
+
+        if (anyPatched) {
+          await chrome.storage.local.set({ conversationLogs: freshConversations });
+        }
+      }
     } catch (err) {
       console.warn('[TrustButVerify] LLM-2 categorization failed (non-fatal):', err);
     }
@@ -1343,6 +1398,20 @@ async function handleSaveNudgeEvent(event: import('../types').NudgeEvent): Promi
   }
 }
 
+async function handleSaveNudgeEventsBatch(events: import('../types').NudgeEvent[]): Promise<MessageResponse> {
+  try {
+    await StorageManager.saveNudgeEventsBatch(events);
+    flowTrace('nudge:batch-saved', {
+      count: events.length,
+      ids: events.map((e) => e.id)
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error saving nudge events batch:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
 async function handleGetNudgeStats(): Promise<MessageResponse> {
   try {
     const stats = await StorageManager.getNudgeAggregateStats();
@@ -1417,7 +1486,7 @@ async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType
       state.continuousSkips += 1;
       console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
       if (state.continuousSkips >= 3) {
-        state.pausedUntil = Date.now() + 10 * 60 * 1000; // 10 minutes
+        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 10 minutes
         console.log('[TrustButVerify] Nudges paused for 10 minutes due to 3 continuous skips');
       }
     } else {
@@ -1456,6 +1525,14 @@ async function trySendCopyNudge(
       return;
     }
 
+    // Pause expired → reset the skip counter so the user gets a fresh 3-skip allowance.
+    if (state.continuousSkips >= 3) {
+      state.continuousSkips = 0;
+      state.pausedUntil = 0;
+      await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
+      console.log('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
+    }
+
     const questions = getActiveNudgeQuestions('copy');
     console.log('[TrustButVerify:DEBUG] Fetched questions array length:', questions?.length);
 
@@ -1488,7 +1565,7 @@ async function trySendCopyNudge(
       conversationId: activity.conversationId,
       turnId: activity.turnId,
       copyActivityId: activity.id,
-      timeoutMs: 60_000,
+      timeoutMs: 120_000,
       position: 'bottom-right',
       textPreview,
       questions: formattedQuestions

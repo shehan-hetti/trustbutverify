@@ -245,6 +245,8 @@ export interface NudgeEvent {
   response: NudgeResponseValue;
   responseTimeMs: number;
   dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
+  /** True when the user changed their initial answer before finishing the session. */
+  edited?: boolean;
 }
 
 export interface NudgeAggregateStats {
@@ -302,6 +304,7 @@ export interface MessagePayload {
     | 'CLEAR_CONVERSATIONS'
     | 'GET_ANALYTICS'
     | 'SAVE_NUDGE_EVENT'
+    | 'SAVE_NUDGE_EVENTS_BATCH'
     | 'GET_NUDGE_STATS'
     | 'VERIFY_PARTICIPANT'
     | 'TRIGGER_SYNC'
@@ -314,6 +317,7 @@ export interface MessagePayload {
     | { limit?: number }
     | GetConversationsParams
     | NudgeEvent
+    | NudgeEvent[]
     | {
         threadId: string;
         threadInfo?: Partial<ConversationLog>;

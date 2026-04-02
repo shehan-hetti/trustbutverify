@@ -33,6 +33,8 @@ export interface NudgeOverlayResolution {
   copyActivityId?: string;
   questionTags?: string[];
   dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
+  /** True when the user changed their initial answer before finishing the session. */
+  edited?: boolean;
 }
 
 interface ActiveNudgeState {
@@ -41,6 +43,8 @@ interface ActiveNudgeState {
   timeoutId: number;
   unansweredQuestions: Set<string>;
   explicitlyAnsweredCount: number;
+  /** Resolutions collected during this session (both interactive and bulk). */
+  collectedResolutions: NudgeOverlayResolution[];
 }
 
 export class NudgeOverlay {
@@ -55,6 +59,7 @@ export class NudgeOverlay {
   private readonly closeButton: HTMLButtonElement;
   private active: ActiveNudgeState | null = null;
   private onResolve?: (result: NudgeOverlayResolution) => void;
+  private onBatchResolve?: (results: NudgeOverlayResolution[]) => void;
   private onSessionComplete?: (fullSkip: boolean, triggerType: NudgeTriggerType) => void;
 
   constructor() {
@@ -144,7 +149,7 @@ export class NudgeOverlay {
     this.previewContainer.style.padding = '8px 12px';
     this.previewContainer.style.background = 'rgba(255,255,255,0.04)';
     this.previewContainer.style.borderRadius = '6px';
-    this.previewContainer.style.borderLeft = '3px solid #8db7ff';
+    this.previewContainer.style.borderLeft = '3px solid rgb(95 154 255)';
     this.previewContainer.style.display = 'none';
     this.previewContainer.style.flexShrink = '0';
 
@@ -192,6 +197,7 @@ export class NudgeOverlay {
     this.skipButton.style.padding = '10px 14px';
     this.skipButton.style.cursor = 'pointer';
     this.skipButton.style.fontSize = '14px';
+    this.skipButton.style.transition = 'all 0.2s ease';
 
     footer.appendChild(this.scrollIndicator);
     footer.appendChild(this.skipButton);
@@ -208,7 +214,12 @@ export class NudgeOverlay {
     });
 
     this.skipButton.addEventListener('click', () => {
-      this.resolveRemaining('skip');
+      // If all questions are answered, this button says "Done" — just close.
+      if (this.active && this.active.unansweredQuestions.size === 0) {
+        this.finishSession();
+      } else {
+        this.resolveRemaining('skip');
+      }
     });
 
     this.questionsContainer.addEventListener('scroll', () => {
@@ -232,6 +243,10 @@ export class NudgeOverlay {
     this.onResolve = handler;
   }
 
+  setOnBatchResolve(handler: (results: NudgeOverlayResolution[]) => void): void {
+    this.onBatchResolve = handler;
+  }
+
   setOnSessionComplete(handler: (fullSkip: boolean, triggerType: NudgeTriggerType) => void): void {
     this.onSessionComplete = handler;
   }
@@ -241,7 +256,7 @@ export class NudgeOverlay {
       this.resolveRemaining('replaced');
     }
 
-    const timeoutMs = Math.max(1000, payload.timeoutMs ?? 60_000);
+    const timeoutMs = Math.max(1000, payload.timeoutMs ?? 120_000);
     this.applyPosition(payload.position || 'bottom-right');
 
     const typeLabel = payload.triggerType === 'copy' ? 'Copied text' : 'Response';
@@ -257,6 +272,7 @@ export class NudgeOverlay {
 
     // Render questions
     this.questionsContainer.innerHTML = '';
+    this.resetSkipButton();
     const unansweredQuestions = new Set<string>();
 
     payload.questions.forEach((q) => {
@@ -285,7 +301,8 @@ export class NudgeOverlay {
       shownAt: Date.now(),
       timeoutId,
       unansweredQuestions,
-      explicitlyAnsweredCount: 0
+      explicitlyAnsweredCount: 0,
+      collectedResolutions: []
     };
   }
 
@@ -318,6 +335,45 @@ export class NudgeOverlay {
     }
   }
 
+  // ── Update the footer button text/style based on answered count ─────
+  private updateSkipButtonState(): void {
+    if (!this.active) return;
+
+    const answered = this.active.explicitlyAnsweredCount;
+    const remaining = this.active.unansweredQuestions.size;
+
+    if (remaining === 0) {
+      // All answered — show "Done" with highlighted style, hide close button,
+      // and clear the auto-close timeout so the popup stays open until the
+      // user explicitly clicks "Done".
+      this.skipButton.textContent = 'Done';
+      this.skipButton.style.border = '1px solid rgb(74 140 255)';
+      this.skipButton.style.background = 'rgb(17 62 167)';
+      this.skipButton.style.fontWeight = '600';
+      this.closeButton.style.display = 'none';
+      window.clearTimeout(this.active.timeoutId);
+    } else if (answered > 0) {
+      // Some answered — show "Skip Rest", ensure close button visible
+      this.skipButton.textContent = 'Skip Rest';
+      this.skipButton.style.border = '1px solid rgba(255,255,255,0.22)';
+      this.skipButton.style.background = 'transparent';
+      this.skipButton.style.fontWeight = '';
+      this.closeButton.style.display = '';
+    } else {
+      // No answers yet — keep "Skip All", ensure close button visible
+      this.closeButton.style.display = '';
+    }
+  }
+
+  // ── Reset skip button to initial state ──────────────────────────────
+  private resetSkipButton(): void {
+    this.skipButton.textContent = 'Skip All';
+    this.skipButton.style.border = '1px solid rgba(255,255,255,0.22)';
+    this.skipButton.style.background = 'transparent';
+    this.skipButton.style.fontWeight = '';
+    this.closeButton.style.display = '';
+  }
+
   // ── Render individual question ──────────────────────────────────────
   private renderQuestion(q: NudgeOverlayQuestionPayload): void {
     const qWrapper = document.createElement('div');
@@ -336,26 +392,28 @@ export class NudgeOverlay {
     answersEl.style.flexWrap = 'wrap';
     answersEl.style.gap = '8px';
 
-    const addButton = (label: string, value: NudgeResponseValue, primary = false) => {
+    const addButton = (label: string, value: NudgeResponseValue) => {
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = label;
-      button.style.border = primary ? '1px solid #8db7ff' : '1px solid rgba(255,255,255,0.18)';
-      button.style.background = primary ? 'rgba(71, 126, 255, 0.25)' : 'rgba(255,255,255,0.06)';
+      button.setAttribute('data-tbv-answer-value', String(value));
+      button.style.border = '1px solid rgba(255,255,255,0.18)';
+      button.style.background = 'rgba(255,255,255,0.06)';
       button.style.color = '#f4f7ff';
       button.style.borderRadius = '10px';
       button.style.padding = '8px 12px';
       button.style.cursor = 'pointer';
       button.style.fontSize = '13px';
+      button.style.transition = 'all 0.15s ease';
       button.addEventListener('click', () => this.resolveSpecific(q.questionId, value));
       answersEl.appendChild(button);
     };
 
     if (q.answerMode === 'yes_no_skip') {
-      addButton(q.yesLabel ?? 'Yes', 'yes', true);
+      addButton(q.yesLabel ?? 'Yes', 'yes');
       addButton('No', 'no');
     } else if (q.answerMode === 'yes_partly_no_skip') {
-      addButton(q.yesLabel ?? 'Yes', 'yes', true);
+      addButton(q.yesLabel ?? 'Yes', 'yes');
       addButton('Partly', 'partly');
       addButton('No', 'no');
     } else {
@@ -391,46 +449,92 @@ export class NudgeOverlay {
   private resolveSpecific(questionId: string, response: NudgeResponseValue): void {
     if (!this.active) return;
 
-    if (!this.active.unansweredQuestions.has(questionId)) return;
-
-    this.active.unansweredQuestions.delete(questionId);
-    this.active.explicitlyAnsweredCount += 1;
-
     const qPayload = this.active.payload.questions.find(q => q.questionId === questionId);
     if (!qPayload) return;
 
-    if (this.onResolve) {
-      this.onResolve({
-        questionId: qPayload.questionId,
-        questionText: qPayload.questionText,
-        response,
-        responseTimeMs: Math.max(0, Date.now() - this.active.shownAt),
-        triggerType: this.active.payload.triggerType,
-        conversationId: this.active.payload.conversationId,
-        turnId: this.active.payload.turnId,
-        copyActivityId: this.active.payload.copyActivityId,
-        questionTags: qPayload.questionTags,
-        dismissedBy: 'answer'
-      });
+    // Determine if this is a first answer or an edit of a previous answer
+    const isFirstAnswer = this.active.unansweredQuestions.has(questionId);
+    const existingIdx = this.active.collectedResolutions.findIndex(
+      r => r.questionId === questionId && r.dismissedBy === 'answer'
+    );
+    const isEdit = !isFirstAnswer && existingIdx !== -1;
+
+    // If it's an edit and the same value was clicked again, ignore
+    if (isEdit && this.active.collectedResolutions[existingIdx].response === response) {
+      return;
     }
 
-    // Visually disable the question
+    if (isFirstAnswer) {
+      this.active.unansweredQuestions.delete(questionId);
+      this.active.explicitlyAnsweredCount += 1;
+    }
+
+    const resolution: NudgeOverlayResolution = {
+      questionId: qPayload.questionId,
+      questionText: qPayload.questionText,
+      response,
+      responseTimeMs: Math.max(0, Date.now() - this.active.shownAt),
+      triggerType: this.active.payload.triggerType,
+      conversationId: this.active.payload.conversationId,
+      turnId: this.active.payload.turnId,
+      copyActivityId: this.active.payload.copyActivityId,
+      questionTags: qPayload.questionTags,
+      dismissedBy: 'answer',
+      edited: isEdit ? true : undefined
+    };
+
+    if (this.onResolve) {
+      this.onResolve(resolution);
+    }
+
+    // Update or push into collected resolutions
+    if (isEdit && existingIdx !== -1) {
+      // Replace the previous resolution with the updated one
+      this.active.collectedResolutions[existingIdx] = resolution;
+    } else {
+      this.active.collectedResolutions.push(resolution);
+    }
+
+    // Visually update buttons: highlight selected, dim (but keep clickable) the rest
     const qWrapper = this.host.querySelector(`#__tbv_q_${questionId}`) as HTMLDivElement;
     if (qWrapper) {
-      qWrapper.style.opacity = '0.4';
-      qWrapper.style.pointerEvents = 'none';
-      const selectedText = document.createElement('div');
-      selectedText.style.fontSize = '12px';
-      selectedText.style.marginTop = '4px';
-      selectedText.style.color = '#8db7ff';
-      selectedText.textContent = `✓ Answer recorded`;
-      qWrapper.appendChild(selectedText);
+      const allButtons = qWrapper.querySelectorAll('button[data-tbv-answer-value]');
+      allButtons.forEach((btn) => {
+        const b = btn as HTMLButtonElement;
+        if (b.getAttribute('data-tbv-answer-value') === String(response)) {
+          // Highlight the selected answer
+          b.style.border = '1px solid rgb(74 140 255)';
+          b.style.background = 'rgb(19 77 211 / 40%)';
+          b.style.fontWeight = '600';
+          b.style.opacity = '1';
+        } else {
+          // Dim unselected but keep clickable for potential edits
+          b.style.border = '1px solid rgba(255,255,255,0.18)';
+          b.style.background = 'rgba(255,255,255,0.06)';
+          b.style.fontWeight = '';
+          b.style.opacity = '0.45';
+        }
+        // Keep buttons clickable so user can change their answer
+        b.style.pointerEvents = 'auto';
+        b.style.cursor = 'pointer';
+      });
+
+      // Add or update confirmation text
+      const confirmId = `__tbv_confirm_${questionId}`;
+      let confirmEl = qWrapper.querySelector(`#${confirmId}`) as HTMLDivElement | null;
+      if (!confirmEl) {
+        confirmEl = document.createElement('div');
+        confirmEl.id = confirmId;
+        confirmEl.style.fontSize = '12px';
+        confirmEl.style.marginTop = '4px';
+        confirmEl.style.color = '#8db7ff';
+        qWrapper.appendChild(confirmEl);
+      }
+      confirmEl.textContent = isEdit ? '✓ Answer edited' : '✓ Answer recorded';
     }
 
-    // Check if we are done
-    if (this.active.unansweredQuestions.size === 0) {
-      this.finishSession();
-    }
+    // Update the footer button text based on progress
+    this.updateSkipButtonState();
   }
 
   // ── Resolve remaining questions ─────────────────────────────────────
@@ -440,15 +544,16 @@ export class NudgeOverlay {
       return;
     }
 
-    // Capture unanswered questions
+    // Capture unanswered questions and build resolutions.
+    // Do NOT call onResolve here — collect into the batch instead.
     const remaining = Array.from(this.active.unansweredQuestions);
 
     remaining.forEach(questionId => {
       this.active!.unansweredQuestions.delete(questionId);
       const qPayload = this.active!.payload.questions.find(q => q.questionId === questionId);
 
-      if (qPayload && this.onResolve) {
-        this.onResolve({
+      if (qPayload) {
+        this.active!.collectedResolutions.push({
           questionId: qPayload.questionId,
           questionText: qPayload.questionText,
           response: 'skip',
@@ -473,12 +578,20 @@ export class NudgeOverlay {
     const explicitlyAnsweredCount = this.active.explicitlyAnsweredCount;
     const fullSkip = explicitlyAnsweredCount === 0;
     const triggerType = this.active.payload.triggerType;
+    const allResolutions = this.active.collectedResolutions;
 
     const timeoutId = this.active.timeoutId;
     this.active = null;
     window.clearTimeout(timeoutId);
 
     this.host.style.display = 'none';
+
+    // Emit all resolutions as a single batch for atomic storage.
+    // This is the PRIMARY save path — prevents the read-modify-write
+    // race that occurred when individual onResolve calls fired concurrently.
+    if (this.onBatchResolve && allResolutions.length > 0) {
+      this.onBatchResolve(allResolutions);
+    }
 
     if (this.onSessionComplete) {
       this.onSessionComplete(fullSkip, triggerType);

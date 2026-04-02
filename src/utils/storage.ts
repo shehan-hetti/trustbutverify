@@ -499,6 +499,42 @@ export class StorageManager {
   }
 
   /**
+   * Save multiple nudge events atomically in a single read-push-write.
+   * This prevents the race condition where concurrent saveNudgeEvent calls
+   * each read a stale array and overwrite each other's writes.
+   */
+  static async saveNudgeEventsBatch(newEvents: NudgeEvent[]): Promise<void> {
+    if (!newEvents || newEvents.length === 0) {
+      return;
+    }
+    try {
+      const events = await this.getAllNudgeEvents();
+      const existingIds = new Set(events.map((e) => e.id));
+
+      let added = 0;
+      for (const event of newEvents) {
+        if (!existingIds.has(event.id)) {
+          events.push(event);
+          existingIds.add(event.id);
+          added++;
+        }
+      }
+
+      if (added === 0) {
+        return; // All duplicates — nothing to write
+      }
+
+      events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      this.trimNudgeEvents(events);
+
+      await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
+    } catch (error) {
+      console.error('Error saving nudge events batch:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Get all stored nudge events.
    */
   static async getAllNudgeEvents(): Promise<NudgeEvent[]> {

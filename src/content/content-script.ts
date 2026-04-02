@@ -30,7 +30,7 @@ class ActivityTracker {
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
   private static readonly MAX_PAIRED_PROMPT_CHARS = 20000;
   private static readonly CHAT_ACTIVITY_EVENT = 'tbv:chat-activity';
-  private static readonly NUDGE_TIMEOUT_MS = 60_000;
+  private static readonly NUDGE_TIMEOUT_MS = 120_000;
 
   private readonly boundHandleCopy = this.handleCopy.bind(this);
 
@@ -216,6 +216,7 @@ class ActivityTracker {
     try {
       this.nudgeOverlay = new NudgeOverlay();
       this.nudgeOverlay.setOnResolve((result) => this.handleNudgeResolution(result));
+      this.nudgeOverlay.setOnBatchResolve((results) => this.handleNudgeBatchResolution(results));
       this.nudgeOverlay.setOnSessionComplete((fullSkip, triggerType) => this.handleNudgeSessionComplete(fullSkip, triggerType));
     } catch (error) {
       console.debug('[TrustButVerify] Nudge overlay init failed:', error);
@@ -246,6 +247,9 @@ class ActivityTracker {
   }
 
   private handleNudgeResolution(result: NudgeOverlayResolution): void {
+    // Individual resolution callback — used for debug logging only.
+    // Actual persistence is handled by handleNudgeBatchResolution at session end
+    // to prevent the concurrent read-modify-write race on chrome.storage.local.
     console.debug('[TrustButVerify] Nudge resolved:', {
       questionId: result.questionId,
       response: result.response,
@@ -256,27 +260,46 @@ class ActivityTracker {
       turnId: result.turnId,
       copyActivityId: result.copyActivityId
     });
+  }
 
-    const timestamp = Date.now();
+  /**
+   * Handle a batch of nudge resolutions from a completed session.
+   * Sends all events in a single SAVE_NUDGE_EVENTS_BATCH message to the
+   * service worker, which writes them atomically in one storage operation.
+   * This prevents the read-modify-write race that caused lost events when
+   * individual SAVE_NUDGE_EVENT messages fired concurrently.
+   */
+  private handleNudgeBatchResolution(results: NudgeOverlayResolution[]): void {
+    if (!results || results.length === 0) {
+      return;
+    }
 
-    // Persist the nudge event via service worker
-    const nudgeEvent = {
-      id: this.buildNudgeEventId(result.questionId, timestamp),
-      timestamp,
-      conversationId: result.conversationId || '',
-      turnId: result.turnId,
-      copyActivityId: result.copyActivityId,
-      domain: this.domain,
-      triggerType: result.triggerType,
-      nudgeQuestionId: result.questionId,
-      nudgeQuestionText: result.questionText,
-      questionTags: result.questionTags,
-      response: result.response,
-      responseTimeMs: result.responseTimeMs,
-      dismissedBy: result.dismissedBy
-    };
+    console.debug('[TrustButVerify] Nudge batch resolution:', {
+      count: results.length,
+      questionIds: results.map(r => r.questionId)
+    });
 
-    void this.safeSendToBackground({ type: 'SAVE_NUDGE_EVENT', data: nudgeEvent });
+    const nudgeEvents = results.map(result => {
+      const timestamp = Date.now();
+      return {
+        id: this.buildNudgeEventId(result.questionId, timestamp),
+        timestamp,
+        conversationId: result.conversationId || '',
+        turnId: result.turnId,
+        copyActivityId: result.copyActivityId,
+        domain: this.domain,
+        triggerType: result.triggerType,
+        nudgeQuestionId: result.questionId,
+        nudgeQuestionText: result.questionText,
+        questionTags: result.questionTags,
+        response: result.response,
+        responseTimeMs: result.responseTimeMs,
+        dismissedBy: result.dismissedBy,
+        edited: result.edited
+      };
+    });
+
+    void this.safeSendToBackground({ type: 'SAVE_NUDGE_EVENTS_BATCH', data: nudgeEvents });
   }
 
   private buildNudgeEventId(questionId: string, timestampMs: number): string {
@@ -495,7 +518,7 @@ class ActivityTracker {
     }
 
     if (domain.includes('chatgpt') || domain.includes('openai')) {
-      const turn = anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      const turn = anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       const nestedTurnMessage = turn
         ? (turn.querySelector('div[data-message-author-role="assistant"], div[data-message-author-role="user"]') as HTMLElement | null)
         : null;
@@ -796,17 +819,31 @@ class ActivityTracker {
       return;
     }
 
-    const element = this.lastInteractedElement || (document.activeElement as HTMLElement | null);
-    const expanded = this.expandCopyFromElement(element, trimmed);
+    // Resolve the best element for turn identification.
+    // lastInteractedElement is often a copy *button* which sits OUTSIDE the
+    // turn's content hierarchy.  Try to climb from the button to the actual
+    // turn container first.
+    const rawElement = this.lastInteractedElement || (document.activeElement as HTMLElement | null);
+    const resolvedElement = this.resolveElementForCopyButton(rawElement) || rawElement;
+
+    console.debug('[TrustButVerify] handleProgrammaticCopy element resolution:', {
+      rawTag: rawElement?.tagName,
+      rawClasses: rawElement?.className ? String(rawElement.className).substring(0, 80) : null,
+      resolvedTag: resolvedElement?.tagName,
+      resolvedClasses: resolvedElement?.className ? String(resolvedElement.className).substring(0, 80) : null,
+      isResolved: resolvedElement !== rawElement
+    });
+
+    const expanded = this.expandCopyFromElement(resolvedElement, trimmed);
 
     const candidateContext = metadata?.context?.trim() ? metadata.context.trim() : '';
     const context = candidateContext
       && !this.looksLikeScriptNoise(candidateContext)
       && !this.looksLikeUselessContext(candidateContext)
         ? candidateContext.substring(0, 200)
-        : expanded?.context || this.buildContextFromElement(expanded?.element || element, trimmed);
+        : expanded?.context || this.buildContextFromElement(expanded?.element || resolvedElement, trimmed);
 
-    const fallbackMetadata = this.describeElement(expanded?.element || element) || {};
+    const fallbackMetadata = this.describeElement(expanded?.element || resolvedElement) || {};
     const combinedMetadata = this.mergeTriggerMetadata(fallbackMetadata, metadata?.trigger);
 
     const trigger: CopyActivityTrigger = {
@@ -840,6 +877,125 @@ class ActivityTracker {
     });
   }
 
+  /**
+   * Resolve a better element when the clicked element is a copy button or
+   * toolbar icon sitting OUTSIDE the turn's content DOM hierarchy.
+   * 
+   * Copy buttons on all platforms are structurally outside the message content:
+   *   ChatGPT: button inside article but outside div[data-message-author-role]
+   *   Claude:  button in toolbar sibling of .font-claude-response
+   *   Gemini:  button inside model-response but outside message-content
+   *   Grok:    button inside div[id^="response-"] (usually works already)
+   *   DeepSeek: button in toolbar sibling of .ds-markdown
+   *
+   * This method walks UP from the button and then searches DOWN into the
+   * turn container to find the actual message content element.
+   */
+  private resolveElementForCopyButton(element: HTMLElement | null): HTMLElement | null {
+    if (!element) return null;
+
+    const domain = this.domain;
+    const tag = element.tagName?.toLowerCase() || '';
+    const isCopyButtonLike = tag === 'button' || tag === 'svg' || tag === 'path'
+      || element.closest('button') !== null
+      || element.closest('[role="button"]') !== null;
+
+    // Only run this resolution when the element looks like a button/icon.
+    // If the user clicked directly on message content, let the normal flow handle it.
+    if (!isCopyButtonLike) return null;
+
+    // ── ChatGPT ─────────────────────────────────────────────────────────
+    if (domain.includes('chatgpt') || domain.includes('openai')) {
+      // Copy button is inside section/article[data-testid^="conversation-turn-"]
+      // but outside div[data-message-author-role].
+      // NOTE: ChatGPT changed from <article> to <section> in 2026.
+      const turnSection = element.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      if (turnSection) {
+        const msgDiv = (turnSection.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null)
+          || (turnSection.querySelector('div[data-message-author-role="user"]') as HTMLElement | null);
+        if (msgDiv) return msgDiv;
+        return turnSection;
+      }
+    }
+
+    // ── Claude ───────────────────────────────────────────────────────────
+    if (domain.includes('claude')) {
+      // Walk up looking for the response wrapper or user message.
+      let cursor: HTMLElement | null = element;
+      for (let i = 0; i < 12 && cursor; i++) {
+        // Check if this level contains the response or user message.
+        const claude = (cursor.querySelector('.font-claude-response') as HTMLElement | null)
+          || (cursor.querySelector('[data-testid="user-message"]') as HTMLElement | null);
+        if (claude) return claude;
+        // Also check direct matches (in case cursor IS the wrapper).
+        if (cursor.matches('.font-claude-response') || cursor.matches('[data-testid="user-message"]')) {
+          return cursor;
+        }
+        cursor = cursor.parentElement;
+      }
+    }
+
+    // ── Gemini ───────────────────────────────────────────────────────────
+    if (domain.includes('gemini')) {
+      // User prompt copy button: resolve to user-query content.
+      const userQuery = element.closest('user-query') as HTMLElement | null;
+      if (userQuery) {
+        const queryText = userQuery.querySelector('.query-text') as HTMLElement | null;
+        if (queryText) return queryText;
+        return userQuery;
+      }
+      // Response copy button: resolve to model response content.
+      const modelResp = element.closest('model-response') as HTMLElement | null;
+      if (modelResp) {
+        const md = (modelResp.querySelector('.markdown.markdown-main-panel') as HTMLElement | null)
+          || (modelResp.querySelector('message-content') as HTMLElement | null);
+        if (md) return md;
+        return modelResp;
+      }
+      // Also check broader containers.
+      const msgContent = element.closest('message-content') as HTMLElement | null;
+      if (msgContent) return msgContent;
+    }
+
+    // ── Grok ─────────────────────────────────────────────────────────────
+    if (domain.includes('grok') || domain.includes('x.ai')) {
+      const responseDiv = element.closest('div[id^="response-"]') as HTMLElement | null;
+      if (responseDiv) {
+        const md = responseDiv.querySelector('.response-content-markdown') as HTMLElement | null;
+        if (md) return md;
+        return responseDiv;
+      }
+    }
+
+    // ── DeepSeek ─────────────────────────────────────────────────────────
+    if (domain.includes('deepseek')) {
+      const msg = element.closest('.ds-message') as HTMLElement | null;
+      if (msg) {
+        const md = (msg.querySelector('.ds-markdown') as HTMLElement | null)
+          || (msg.querySelector('.fbb737a4') as HTMLElement | null);
+        if (md) return md;
+        return msg;
+      }
+    }
+
+    // ── Generic: walk up a few levels looking for common turn wrappers ──
+    let cursor: HTMLElement | null = element;
+    for (let i = 0; i < 12 && cursor; i++) {
+      // Check common turn wrapper patterns.
+      if (cursor.matches?.('[data-testid^="conversation-turn-"]')) return cursor;
+      if (cursor.matches?.('div[data-message-author-role]')) return cursor;
+      if (cursor.matches?.('.font-claude-response')) return cursor;
+      if (cursor.matches?.('[data-testid="user-message"]')) return cursor;
+      if (cursor.matches?.('message-content')) return cursor;
+      if (cursor.matches?.('.ds-message')) return cursor;
+      const id = cursor.id || '';
+      if (id.startsWith('response-')) return cursor;
+      cursor = cursor.parentElement;
+    }
+
+    return null;
+  }
+
   private expandCopyFromElement(
     element: HTMLElement | null,
     copiedText?: string
@@ -853,6 +1009,28 @@ class ActivityTracker {
     pairedPromptText?: string;
   } | null {
     if (!element) {
+      // When element is null but we have copiedText, try pure text matching
+      // against the entire page. This handles cases where both lastInteractedElement
+      // and activeElement failed to resolve.
+      if (copiedText) {
+        const broadMatch = this.findBestMatchByText(document.body as HTMLElement, copiedText);
+        if (broadMatch) {
+          const getText = (el: Element | null) => ((el as HTMLElement | null)?.innerText || (el as HTMLElement | null)?.textContent || '').replace(/\s+$/g, '').trim();
+          const text = getText(broadMatch.element);
+          if (text) {
+            console.debug('[TrustButVerify] expandCopyFromElement: resolved via broad text match (null element)', {
+              side: broadMatch.side,
+              textLength: text.length
+            });
+            return this.buildExpandedCopyResult(
+              broadMatch.element,
+              text,
+              'matched-by-text:broad',
+              broadMatch.side
+            );
+          }
+        }
+      }
       return null;
     }
 
@@ -861,31 +1039,34 @@ class ActivityTracker {
     const normalizeText = (value: string | undefined | null) => (value || '').replace(/\s+$/g, '').trim();
     const getText = (el: Element | null) => normalizeText((el as HTMLElement | null)?.innerText || (el as HTMLElement | null)?.textContent || '');
 
-    const codeRoot = (anchor.closest('pre.code-block__code') as HTMLElement | null)
-      || (anchor.closest('pre') as HTMLElement | null)
-      || (anchor.closest('code') as HTMLElement | null);
+    // NOTE: code-block / code-block-nearby checks used to run here FIRST,
+    // but that caused wrong turnSide detection (e.g. Claude user prompts
+    // wrapped in <pre class="code-block__code"> were misidentified).
+    // They are now a generic fallback AFTER all platform-specific checks.
+    // See the "Generic code-block fallback" section at the end of this method.
 
-    if (codeRoot) {
-      const text = getText(codeRoot);
-      if (text) {
-        return this.buildExpandedCopyResult(codeRoot, text, 'code-block');
-      }
-    }
-
-    const nearbyCode = this.findNearbyCodeBlock(anchor);
-    if (nearbyCode) {
-      const text = getText(nearbyCode);
-      if (text) {
-        return this.buildExpandedCopyResult(nearbyCode, text, 'code-block-nearby');
-      }
-    }
-
-    // Last-resort fallback for programmatic copies when site-specific side
-    // resolution fails. Keep this at the end so stronger platform heuristics
-    // run first.
-    let bestMatchFromText = null;
+    // Compute text-matching fallback early so platform branches can use it.
+    // Use a broader search scope to handle copy buttons outside conversation structure.
+    let bestMatchFromText: { element: HTMLElement; side?: 'prompt' | 'response' } | null = null;
     if (copiedText) {
+      // First try scoped search from the anchor's context.
       bestMatchFromText = this.findBestMatchByText(anchor, copiedText);
+      // If scoped search failed (anchor is in a toolbar far from message content),
+      // try searching from the main content area.
+      if (!bestMatchFromText) {
+        const mainContainer = (document.querySelector('main') as HTMLElement | null)
+          || (document.querySelector('[role="main"]') as HTMLElement | null)
+          || (document.body as HTMLElement);
+        if (mainContainer !== anchor) {
+          bestMatchFromText = this.findBestMatchByText(mainContainer, copiedText);
+          if (bestMatchFromText) {
+            console.debug('[TrustButVerify] expandCopyFromElement: resolved via broad text match', {
+              side: bestMatchFromText.side,
+              strategy: 'broad-text-search'
+            });
+          }
+        }
+      }
     }
 
     if (domain.includes('claude')) {
@@ -904,7 +1085,7 @@ class ActivityTracker {
     }
 
     if (domain.includes('chatgpt') || domain.includes('openai')) {
-      const turn = anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      const turn = anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       const nestedTurnMessage = turn
         ? (turn.querySelector('div[data-message-author-role="assistant"], div[data-message-author-role="user"]') as HTMLElement | null)
         : null;
@@ -939,6 +1120,18 @@ class ActivityTracker {
             text,
             strategy,
             resolvedSide
+          );
+        }
+      } else if (bestMatchFromText) {
+        // ChatGPT: closest() failed entirely — button is outside all turn wrappers.
+        // Use the text-matched element instead.
+        const text = this.sanitizeCapturedText(getText(bestMatchFromText.element), bestMatchFromText.side, 'chatgpt:matched-by-text');
+        if (text) {
+          return this.buildExpandedCopyResult(
+            bestMatchFromText.element,
+            text,
+            'chatgpt:matched-by-text',
+            bestMatchFromText.side
           );
         }
       }
@@ -1014,7 +1207,36 @@ class ActivityTracker {
       }
     }
 
-    // If all else fails and we have the exact match from earlier:
+    // ── Generic code-block fallback ────────────────────────────────────
+    // Runs AFTER all platform-specific checks so it doesn't short-circuit
+    // proper turn detection. Uses the ANCHOR's turn context (not the code
+    // block's) to determine turnSide.
+    {
+      const codeRoot = (anchor.closest('pre.code-block__code') as HTMLElement | null)
+        || (anchor.closest('pre') as HTMLElement | null)
+        || (anchor.closest('code') as HTMLElement | null);
+
+      if (codeRoot) {
+        const text = getText(codeRoot);
+        if (text) {
+          // Determine turnSide from the anchor's turn context, not the code block.
+          const anchorTurn = this.resolveTurnContainer(anchor);
+          return this.buildExpandedCopyResult(codeRoot, text, 'code-block', anchorTurn?.side);
+        }
+      }
+
+      const nearbyCode = this.findNearbyCodeBlock(anchor);
+      if (nearbyCode) {
+        const text = getText(nearbyCode);
+        if (text) {
+          // Determine turnSide from the anchor's turn context, not the code block.
+          const anchorTurn = this.resolveTurnContainer(anchor);
+          return this.buildExpandedCopyResult(nearbyCode, text, 'code-block-nearby', anchorTurn?.side);
+        }
+      }
+    }
+
+    // If all else fails and we have the text match from earlier:
     if (bestMatchFromText) {
       const text = getText(bestMatchFromText.element);
       if (text) {
@@ -1081,8 +1303,8 @@ class ActivityTracker {
       }
 
       // Fallback: copy buttons sit outside div[data-message-author-role] but
-      // inside the turn article. Check for nested role elements.
-      const turn = element.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      // inside the turn section/article. Check for nested role elements.
+      const turn = element.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       if (turn) {
         const assistantMsg = turn.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null;
         const userMsg = turn.querySelector('div[data-message-author-role="user"]') as HTMLElement | null;
@@ -1284,7 +1506,7 @@ class ActivityTracker {
     if (!needle) return null;
 
     // Restrict search to a reasonable container to avoid scanning the whole page.
-    const container = (anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null)
+    const container = (anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null)
       || (anchor.closest('div[data-message-author-role]') as HTMLElement | null)
       || (anchor.closest('main') as HTMLElement | null)
       || (anchor.closest('section') as HTMLElement | null)
