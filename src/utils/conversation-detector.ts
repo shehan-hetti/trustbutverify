@@ -1030,11 +1030,6 @@ export class ConversationDetector {
     // finalizeIfReady will detect the mismatch and bail out.
     const capturedGeneration = this.settlingGeneration;
 
-    this.traceFlow('waitForContent:start', {
-      threadId: this.getConversationId(),
-      key: this.getElementKey(element),
-      tag: element.tagName
-    });
     if (this.processedElements.has(element)) {
       return;
     }
@@ -1053,18 +1048,29 @@ export class ConversationDetector {
 
     let observer: MutationObserver | null = null;
     let fallbackTimeout: number | null = null;
+    let absoluteMaxTimeout: number | null = null;
     let stabilityTimer: number | null = null;
     let lastStableText = '';
     let retryCount = 0;
-    let placeholderCount = 0;
-    let lastLoggedPlaceholderCount = 0;
-    let placeholderWaitActive = false;
+    let waitRetryCount = 0;
+    let lastLoggedWaitRetryCount = 0;
+    let waitRetryActive = false;
 
-    const STABILITY_DELAY = 2000;
-    const FALLBACK_DELAY = 60000;
+    const STABILITY_DELAY = 3000;
+    const FALLBACK_DELAY = 180_000;
+    const ABSOLUTE_MAX_WAIT_MS = 300_000;
     const PROMPT_WAIT_RETRY_MS = 150;
     const PROMPT_WAIT_MAX_RETRIES = 10;
-    const PLACEHOLDER_MAX_RETRIES = 80;
+    const WAIT_RETRY_MAX = 120;
+
+    this.traceFlow('waitForContent:start', {
+      stabilityDelay: STABILITY_DELAY,
+      fallbackDelay: FALLBACK_DELAY,
+      absoluteMax: ABSOLUTE_MAX_WAIT_MS,
+      threadId: this.getConversationId(),
+      key: this.getElementKey(element),
+      tag: element.tagName
+    });
 
     const cleanup = () => {
       if (observer) {
@@ -1075,16 +1081,20 @@ export class ConversationDetector {
         window.clearTimeout(fallbackTimeout);
         fallbackTimeout = null;
       }
+      if (absoluteMaxTimeout !== null) {
+        window.clearTimeout(absoluteMaxTimeout);
+        absoluteMaxTimeout = null;
+      }
       if (stabilityTimer !== null) {
         window.clearTimeout(stabilityTimer);
         stabilityTimer = null;
       }
     };
 
-    const schedulePlaceholderRetry = () => {
-      if (placeholderCount >= PLACEHOLDER_MAX_RETRIES) {
-        this.logDebug('Gemini placeholder retry limit reached', {
-          placeholderCount,
+    const scheduleWaitRetry = () => {
+      if (waitRetryCount >= WAIT_RETRY_MAX) {
+        this.logDebug('Wait retry limit reached', {
+          waitRetryCount,
           messageKey: this.getElementKey(element)
         });
         cleanup();
@@ -1092,22 +1102,22 @@ export class ConversationDetector {
         return;
       }
 
-      placeholderCount += 1;
+      waitRetryCount += 1;
 
-      if (!placeholderWaitActive) {
-        placeholderWaitActive = true;
+      if (!waitRetryActive) {
+        waitRetryActive = true;
         const logDetails = {
           normalized: this.normalizeText(element.textContent || ''),
-          placeholderCount
+          waitRetryCount
         };
 
-        if ((placeholderCount <= 3 || placeholderCount % 10 === 0) && placeholderCount !== lastLoggedPlaceholderCount) {
-          lastLoggedPlaceholderCount = placeholderCount;
-          this.logDebug('Gemini placeholder detected, waiting for final content', logDetails);
+        if ((waitRetryCount <= 3 || waitRetryCount % 10 === 0) && waitRetryCount !== lastLoggedWaitRetryCount) {
+          lastLoggedWaitRetryCount = waitRetryCount;
+          this.logDebug('Placeholder/streaming detected, waiting for final content', logDetails);
         }
 
         window.setTimeout(() => {
-          placeholderWaitActive = false;
+          waitRetryActive = false;
           finalizeIfReady();
         }, STABILITY_DELAY);
       }
@@ -1136,8 +1146,25 @@ export class ConversationDetector {
       if (text.length >= 2) {
         const normalizedText = this.normalizeText(text);
 
-        if (this.isGeminiDomain() && this.isGeminiPlaceholder(normalizedText)) {
-          schedulePlaceholderRetry();
+        // Check for placeholder/status text across all platforms
+        if (this.isPlaceholderText(normalizedText)) {
+          this.traceFlow('waitForContent:placeholderBlocked', {
+            text: normalizedText.substring(0, 80),
+            waitRetryCount,
+            key: this.getElementKey(element)
+          });
+          scheduleWaitRetry();
+          return;
+        }
+
+        // Check platform-specific streaming signals (DOM attributes)
+        if (this.isPlatformStreaming(element)) {
+          this.traceFlow('waitForContent:streamingBlocked', {
+            domain: this.domain,
+            waitRetryCount,
+            key: this.getElementKey(element)
+          });
+          scheduleWaitRetry();
           return;
         }
 
@@ -1153,8 +1180,9 @@ export class ConversationDetector {
 
         cleanup();
         const messageKey = this.getElementKey(element);
-        if (this.isGeminiDomain() && this.isGeminiPlaceholder(normalizedText)) {
-          schedulePlaceholderRetry();
+        // Final check after cleanup — content may have changed
+        if (this.isPlaceholderText(normalizedText)) {
+          scheduleWaitRetry();
           return;
         }
 
@@ -1172,7 +1200,7 @@ export class ConversationDetector {
           retryCount
         });
         this.extractAndSaveMessage(element);
-        placeholderCount = 0;
+        waitRetryCount = 0;
       }
     };
 
@@ -1216,6 +1244,33 @@ export class ConversationDetector {
       if (text !== lastStableText) {
         this.logDebug('Mutation observed', text.substring(0, 120));
         scheduleStabilityCheck(text);
+
+        // Reset the activity watchdog — LLM is still generating.
+        // The absolute max timer (ABSOLUTE_MAX_WAIT_MS) is never reset.
+        if (fallbackTimeout !== null) {
+          window.clearTimeout(fallbackTimeout);
+          this.traceFlow('waitForContent:watchdogReset', {
+            key: this.getElementKey(element),
+            textLength: text.length
+          });
+        }
+        fallbackTimeout = window.setTimeout(() => {
+          const fbText = (element.textContent || '').trim();
+          const fbNormalized = this.normalizeText(fbText);
+          this.logDebug('Fallback timeout hit (reset)', {
+            textPreview: fbText.substring(0, 120),
+            normalized: fbNormalized
+          });
+          if (!fbNormalized) {
+            window.setTimeout(finalizeIfReady, STABILITY_DELAY);
+            return;
+          }
+          if (this.isPlaceholderText(fbNormalized)) {
+            scheduleWaitRetry();
+            return;
+          }
+          finalizeIfReady();
+        }, FALLBACK_DELAY);
       }
     });
 
@@ -1238,13 +1293,28 @@ export class ConversationDetector {
         return;
       }
 
-      if (this.isGeminiDomain() && this.isGeminiPlaceholder(normalizedText)) {
-        schedulePlaceholderRetry();
+      if (this.isPlaceholderText(normalizedText)) {
+        scheduleWaitRetry();
         return;
       }
 
       finalizeIfReady();
     }, FALLBACK_DELAY);
+
+    // Absolute safety cap — never reset, ensures cleanup even if watchdog keeps resetting.
+    absoluteMaxTimeout = window.setTimeout(() => {
+      if (this.processedElements.has(element)) return;
+      this.logDebug('Absolute max wait reached, forcing finalization', {
+        textPreview: (element.textContent || '').substring(0, 120)
+      });
+      cleanup();
+      const messageKey = this.getElementKey(element);
+      this.markProcessed(element, messageKey);
+      const absText = element.textContent?.trim() || '';
+      if (absText.length >= 2 && !this.isPlaceholderText(this.normalizeText(absText))) {
+        this.extractAndSaveMessage(element);
+      }
+    }, ABSOLUTE_MAX_WAIT_MS);
   }
 
   /**
@@ -1393,7 +1463,7 @@ export class ConversationDetector {
     if (
       this.pendingPrompt
       && pendingPromptMatchesThread
-      && Date.now() - this.pendingPrompt.timestamp < 45000
+      && Date.now() - this.pendingPrompt.timestamp < 180_000
     ) {
       const responseTime = Date.now() - this.pendingPrompt.timestamp;
       const threadId = currentThreadId;
@@ -1441,8 +1511,8 @@ export class ConversationDetector {
     } else {
       // Cold-load safety: if no prompt interaction was captured recently,
       // do not infer prompt/response pairs from historical DOM.
-      const RECENT_PROMPT_WINDOW_MS = 30_000;
-      const RECENT_INTERACTION_WINDOW_MS = 30_000;
+      const RECENT_PROMPT_WINDOW_MS = 180_000;
+      const RECENT_INTERACTION_WINDOW_MS = 180_000;
       const latestPromptSignalAt = Math.max(this.lastPromptCapturedAt, this.lastPromptIntentAt);
       const hasRecentPromptIntent = latestPromptSignalAt > 0
         && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
@@ -2078,7 +2148,12 @@ export class ConversationDetector {
     return isPromptFallback && isCurrentConcrete;
   }
 
-  private isGeminiPlaceholder(text: string): boolean {
+  /**
+   * Detect transient placeholder/status text across all LLM platforms.
+   * Returns true if the text looks like a temporary status message rather
+   * than a real response.  Used by waitForContent to keep waiting.
+   */
+  private isPlaceholderText(text: string): boolean {
     if (!text) {
       return true;
     }
@@ -2098,33 +2173,66 @@ export class ConversationDetector {
     }
 
     const placeholderPhrases = new Set([
+      // Gemini
       'just a second',
-      'thinking',
-      'loading',
       'one moment',
       'one sec',
       'just a moment',
       'give me a moment',
       'show thinking',
       'gemini said',
-      'you said'
+      'you said',
+      // Claude
+      'pondering, stand by...',
+      'pondering stand by...',
+      'pondering, stand by',
+      'pondering stand by',
+      'searched the web',
+      'searching the web',
+      'searching',
+      'scanning',
+      'analyzing',
+      'analyzing...',
+      // ChatGPT
+      'browsing the web',
+      'searching the web...',
+      'searching...',
+      // DeepSeek
+      'deep thinking',
+      'deep thinking...',
+      // Cross-platform
+      'thinking',
+      'thinking...',
+      'loading',
+      'loading...',
+      'Thought for'
     ]);
 
     if (placeholderPhrases.has(normalized)) {
       return true;
     }
 
+    // Strip known prefixes and re-check — handles composite text like
+    // "Show thinking\nJust a second" on Gemini.
     const stripped = normalized
       .replace(/^show thinking/, '')
+      .replace(/^Searched the web/, '')
+      .replace(/^Thought for/, '')
       .replace(/^gemini said/, '')
       .replace(/^you said/, '')
       .replace(/^just a second/, '')
-      .replace(/^thinking/, '')
-      .replace(/^loading/, '')
+      .replace(/^thinking\.{0,3}/, '')
+      .replace(/^loading\.{0,3}/, '')
       .replace(/^one moment/, '')
       .replace(/^one sec/, '')
       .replace(/^just a moment/, '')
       .replace(/^give me a moment/, '')
+      .replace(/^pondering,? stand by\.{0,3}/, '')
+      .replace(/^search(ing|ed) the web\.{0,3}/, '')
+      .replace(/^browsing the web\.{0,3}/, '')
+      .replace(/^scanning\.{0,3}/, '')
+      .replace(/^analyzing\.{0,3}/, '')
+      .replace(/^deep thinking\.{0,3}/, '')
       .trim();
 
     if (!stripped) {
@@ -2133,6 +2241,30 @@ export class ConversationDetector {
 
     if (placeholderPhrases.has(stripped)) {
       return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check platform-specific DOM signals to determine if the LLM is still
+   * actively streaming/generating.  This supplements text-based placeholder
+   * detection with structural DOM checks.
+   */
+  private isPlatformStreaming(element: Element): boolean {
+    // Claude: data-is-streaming="true" on the response container
+    if (this.domain.includes('claude')) {
+      const container = element.closest('[data-is-streaming]');
+      if (container?.getAttribute('data-is-streaming') === 'true') {
+        return true;
+      }
+    }
+
+    // ChatGPT: .result-streaming class while generating
+    if (this.domain.includes('chatgpt') || this.domain.includes('openai')) {
+      if (element.closest('.result-streaming') || element.querySelector('.result-streaming')) {
+        return true;
+      }
     }
 
     return false;
