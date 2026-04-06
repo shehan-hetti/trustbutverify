@@ -12,13 +12,28 @@ export class ConversationDetector {
   private lastPromptIntentAt = 0;
   private lastPromptThreadId: string | null = null;
   private lastUserInteractionAt = 0;
+  /** Tracks the last prompt text that was successfully consumed (paired turn). */
+  private lastConsumedPromptText: string | null = null;
+  private lastConsumedPromptAt = 0;
   private readonly processedElements = new WeakSet<Element>();
   private readonly processedMessageKeys = new Set<string>();
+  // Elements currently being tracked by an active waitForContent chain.
+  // Prevents duplicate detectMessage → waitForContent calls for the same element.
+  private readonly activeWaitElements = new WeakSet<Element>();
   private readonly processedMessageKeyQueue: string[] = [];
   private readonly recentPrompts: Array<{ text: string; timestamp: number }> = [];
   private extensionContextInvalidated = false;
   /** Currently observed thread ID, updated by monitorThreadChanges. */
   private currentThreadId = '';
+  /**
+   * Previous thread ID from the most recent prompt-migration.
+   * When a new-chat URL redirect changes the thread ID while a prompt is pending,
+   * we store the OLD thread here. Elements detected on the old thread (stamped
+   * with tbvDetectedThread before the URL changed) are still valid.
+   * Cleared after 15 s or on genuine navigation.
+   */
+  private migratedFromThreadId: string | null = null;
+  private migratedFromThreadAt = 0;
   /** Whether the DOM is still settling after SPA navigation (captures blocked). */
   private isDomSettling = false;
   /** Handle for the thread-change polling interval so we can clear on teardown. */
@@ -278,7 +293,7 @@ export class ConversationDetector {
   /**
    * Poll for SPA navigation by comparing the current thread ID to the last known one.
    * On thread change:
-   *  - If a prompt was captured very recently (≤5 s), update its threadId to the new one
+   *  - If a prompt was captured very recently (≤15 s), update its threadId to the new one
    *    (handles new-chat URL rewrite race).
    *  - Otherwise, reset capture state and start DOM-settling detection.
    */
@@ -288,7 +303,10 @@ export class ConversationDetector {
     }
 
     const POLL_MS = 500;
-    const PROMPT_GRACE_MS = 5_000;
+    // Must be generous enough for slow redirects (ChatGPT takes ~9 s).
+    // Aligned with the 15 s freshness check in asyncInitSettling /
+    // tryRestorePromptThenSettle.
+    const PROMPT_GRACE_MS = 15_000;
 
     this.threadChangeIntervalId = setInterval(() => {
       const newThreadId = this.getConversationId();
@@ -317,6 +335,10 @@ export class ConversationDetector {
           from: this.pendingPrompt.threadId,
           to: newThreadId
         });
+        // Remember the old thread ID so threadGate allows elements stamped
+        // before the URL redirect.
+        this.migratedFromThreadId = this.pendingPrompt.threadId;
+        this.migratedFromThreadAt = Date.now();
         this.pendingPrompt.threadId = newThreadId;
         this.lastPromptThreadId = newThreadId;
         return;
@@ -329,6 +351,8 @@ export class ConversationDetector {
       this.lastPromptThreadId = null;
       this.lastUserInteractionAt = 0;
       this.recentPrompts.length = 0;
+      this.migratedFromThreadId = null;
+      this.migratedFromThreadAt = 0;
 
       // Before settling, check chrome.storage.session for a recently-stored
       // prompt. This handles the case where a new-chat prompt was persisted
@@ -533,13 +557,15 @@ export class ConversationDetector {
     };
 
     // Track explicit, trusted user interactions only.
+    // Also snapshot the composer text on pointerdown. This fires BEFORE
+    // React/framework handlers on the send button, ensuring we capture the
+    // prompt text even if the platform clears the composer synchronously
+    // on its own click/pointerdown handler (ChatGPT does this).
     document.addEventListener('pointerdown', (event) => {
       if (event.isTrusted) {
         markUserInteraction();
-        // this.traceFlow('observePromptSubmissions:pointerdown', {
-        //   threadId: this.getConversationId(),
-        //   tag: (event.target as HTMLElement | null)?.tagName || null
-        // });
+        // Snapshot composer text — it may be cleared by the time mousedown fires.
+        updateCachedPrompt();
       }
     }, true);
 
@@ -982,6 +1008,35 @@ export class ConversationDetector {
           return;
         }
 
+        // ── ChatGPT tool-use / web-search widget filter ─────────────
+        // ChatGPT renders MULTIPLE [data-message-author-role="assistant"]
+        // elements per response when using tools (web search, DALL-E,
+        // code interpreter).  The tool-output element has a
+        // data-message-id like "agg_w_XXX:request-WEB:…".  These are
+        // NOT the final text response and must be excluded, otherwise
+        // the first element consumes pendingPrompt and the second falls
+        // into the inferred-turn path — creating a phantom duplicate.
+        if (this.isChatGPTDomain()) {
+          const msgId = (candidate instanceof HTMLElement
+            ? candidate.getAttribute('data-message-id') || ''
+            : ''
+          ).toLowerCase();
+          if (
+            msgId.includes('request-web') ||
+            msgId.includes('request-dall') ||
+            msgId.includes('request-code') ||
+            msgId.includes('request-tool')
+          ) {
+            this.traceFlow('detectMessage:skippedToolElement', {
+              threadId: this.getConversationId(),
+              messageKey,
+              msgId
+            });
+            this.markProcessed(candidate, messageKey);
+            return;
+          }
+        }
+
         this.logDebug('Message selector matched', {
           selector,
           tag: candidate.tagName,
@@ -990,6 +1045,11 @@ export class ConversationDetector {
           messageKey,
           textPreview: (candidate.textContent || '').substring(0, 120)
         });
+
+        // Skip if a waitForContent chain is already active for this element
+        if (this.activeWaitElements.has(candidate)) {
+          return;
+        }
 
         // Wait for content to load (streaming responses)
         this.traceFlow('detectMessage:assistantCandidate', {
@@ -1007,8 +1067,11 @@ export class ConversationDetector {
         // periodic re-seed in startDomSettling handles marking elements as
         // processed.  Starting timers here would only create stale captures
         // that fire after settling finishes.
+        // IMPORTANT: Do NOT markProcessed here — elements blocked during
+        // settling must remain eligible for detection after settling finishes.
+        // The final seedExistingAssistantMessages() call + MutationObserver
+        // will re-detect them.
         if (this.isDomSettling) {
-          this.markProcessed(candidate, messageKey);
           this.traceFlow('detectMessage:blockedDuringSettling', {
             threadId: this.getConversationId(),
             messageKey
@@ -1034,6 +1097,9 @@ export class ConversationDetector {
       return;
     }
 
+    // Mark element as actively being tracked to prevent duplicate chains
+    this.activeWaitElements.add(element);
+
     const initialKey = this.getElementKey(element);
     if (initialKey && this.processedMessageKeys.has(initialKey)) {
       this.logDebug('Element already processed before waiting', {
@@ -1047,16 +1113,21 @@ export class ConversationDetector {
     }
 
     let observer: MutationObserver | null = null;
+    let platformSignalObserver: MutationObserver | null = null;
     let fallbackTimeout: number | null = null;
     let absoluteMaxTimeout: number | null = null;
     let stabilityTimer: number | null = null;
+    let platformSettleTimer: number | null = null;
     let lastStableText = '';
     let retryCount = 0;
     let waitRetryCount = 0;
     let lastLoggedWaitRetryCount = 0;
     let waitRetryActive = false;
+    let platformSignalFired = false;
+    let lastWatchdogLogLength = 0;
 
     const STABILITY_DELAY = 3000;
+    const PLATFORM_SETTLE_MS = 3000;   // settle time after platform signal fires
     const FALLBACK_DELAY = 180_000;
     const ABSOLUTE_MAX_WAIT_MS = 300_000;
     const PROMPT_WAIT_RETRY_MS = 150;
@@ -1065,6 +1136,7 @@ export class ConversationDetector {
 
     this.traceFlow('waitForContent:start', {
       stabilityDelay: STABILITY_DELAY,
+      platformSettleMs: PLATFORM_SETTLE_MS,
       fallbackDelay: FALLBACK_DELAY,
       absoluteMax: ABSOLUTE_MAX_WAIT_MS,
       threadId: this.getConversationId(),
@@ -1073,9 +1145,15 @@ export class ConversationDetector {
     });
 
     const cleanup = () => {
+      // Remove from active tracking so element can be re-detected if needed
+      this.activeWaitElements.delete(element);
       if (observer) {
         observer.disconnect();
         observer = null;
+      }
+      if (platformSignalObserver) {
+        platformSignalObserver.disconnect();
+        platformSignalObserver = null;
       }
       if (fallbackTimeout !== null) {
         window.clearTimeout(fallbackTimeout);
@@ -1088,6 +1166,10 @@ export class ConversationDetector {
       if (stabilityTimer !== null) {
         window.clearTimeout(stabilityTimer);
         stabilityTimer = null;
+      }
+      if (platformSettleTimer !== null) {
+        window.clearTimeout(platformSettleTimer);
+        platformSettleTimer = null;
       }
     };
 
@@ -1151,17 +1233,53 @@ export class ConversationDetector {
           this.traceFlow('waitForContent:placeholderBlocked', {
             text: normalizedText.substring(0, 80),
             waitRetryCount,
+            platformSignalFired,
             key: this.getElementKey(element)
           });
           scheduleWaitRetry();
           return;
         }
 
+        // ─── Claude element-level gate ───
+        // Claude's thinking/notification text (e.g. "Contemplating, stand by...")
+        // appears in DOM elements that have NO [data-is-streaming] ancestor.
+        // Real responses ALWAYS have a [data-is-streaming] ancestor.
+        // Only finalize when the element's container explicitly has
+        // data-is-streaming="false" (streaming complete for THIS element).
+        if (this.domain.includes('claude')) {
+          const streamContainer = element.closest('[data-is-streaming]');
+          if (!streamContainer) {
+            // No streaming ancestor → thinking bubble / notification, not a response
+            this.traceFlow('waitForContent:claudeNoStreamAncestor', {
+              key: this.getElementKey(element),
+              textPreview: normalizedText.substring(0, 60),
+              waitRetryCount
+            });
+            scheduleWaitRetry();
+            return;
+          }
+          if (streamContainer.getAttribute('data-is-streaming') === 'true') {
+            // Still actively streaming
+            this.traceFlow('waitForContent:claudeStillStreaming', {
+              key: this.getElementKey(element),
+              waitRetryCount
+            });
+            scheduleWaitRetry();
+            return;
+          }
+          // data-is-streaming="false" → this element's response is complete
+        }
+
         // Check platform-specific streaming signals (DOM attributes)
-        if (this.isPlatformStreaming(element)) {
+        // IMPORTANT: If the platform signal observer already fired, trust it
+        // over the poll. ChatGPT's .streaming-animation class can persist on
+        // other DOM elements after the response element finishes streaming,
+        // causing isPlatformStreamingDone() to incorrectly return false.
+        if (!platformSignalFired && this.isPlatformStreaming(element)) {
           this.traceFlow('waitForContent:streamingBlocked', {
             domain: this.domain,
             waitRetryCount,
+            platformSignalFired,
             key: this.getElementKey(element)
           });
           scheduleWaitRetry();
@@ -1190,14 +1308,16 @@ export class ConversationDetector {
           textLength: text.length,
           hasPrompt: Boolean(this.pendingPrompt),
           retries: retryCount,
-          messageKey
+          messageKey,
+          triggeredBySignal: platformSignalFired
         });
         this.markProcessed(element, messageKey);
         this.traceFlow('waitForContent:ready', {
           threadId: this.getConversationId(),
           key: messageKey,
           textLength: text.length,
-          retryCount
+          retryCount,
+          platformSignalFired
         });
         this.extractAndSaveMessage(element);
         waitRetryCount = 0;
@@ -1222,6 +1342,19 @@ export class ConversationDetector {
         }
 
         if (currentText === lastStableText) {
+          // For platforms WITH a signal, also check if streaming is done
+          // before finalizing via text-stability.  If signal says still
+          // streaming, reschedule — the signal callback will pick it up.
+          const signalState = this.isPlatformStreamingDone();
+          if (signalState === false) {
+            this.traceFlow('waitForContent:stabilityWaitingForSignal', {
+              key: this.getElementKey(element),
+              textLength: currentText.length
+            });
+            scheduleStabilityCheck(currentText);
+            return;
+          }
+          // signalState === true (done) or null (no signal) → finalize
           finalizeIfReady();
         } else {
           scheduleStabilityCheck(currentText);
@@ -1235,6 +1368,7 @@ export class ConversationDetector {
       scheduleStabilityCheck(immediateText);
     }
 
+    // ── Text content MutationObserver (existing, unchanged logic) ──
     observer = new MutationObserver(() => {
       const text = element.textContent?.trim() || '';
       if (!text) {
@@ -1249,10 +1383,16 @@ export class ConversationDetector {
         // The absolute max timer (ABSOLUTE_MAX_WAIT_MS) is never reset.
         if (fallbackTimeout !== null) {
           window.clearTimeout(fallbackTimeout);
-          this.traceFlow('waitForContent:watchdogReset', {
-            key: this.getElementKey(element),
-            textLength: text.length
-          });
+          // Throttle: only log watchdogReset when textLength changes by ≥20 chars.
+          // Claude streams character-by-character, so a delta-1 threshold still
+          // produces 100+ log lines per response.
+          if (Math.abs(text.length - lastWatchdogLogLength) >= 20 || lastWatchdogLogLength === 0) {
+            lastWatchdogLogLength = text.length;
+            this.traceFlow('waitForContent:watchdogReset', {
+              key: this.getElementKey(element),
+              textLength: text.length
+            });
+          }
         }
         fallbackTimeout = window.setTimeout(() => {
           const fbText = (element.textContent || '').trim();
@@ -1301,6 +1441,38 @@ export class ConversationDetector {
       finalizeIfReady();
     }, FALLBACK_DELAY);
 
+    // ── Platform "streaming done" signal observer ──
+    // This is the PRIMARY finalization trigger for platforms with reliable signals.
+    // When the signal fires, we wait PLATFORM_SETTLE_MS to let final DOM rendering
+    // complete (LaTeX, tables, widgets) then try to finalize.
+    // If finalizeIfReady() can't proceed (placeholder text, streaming still active),
+    // the text-stability timer above continues as a fallback.
+    platformSignalObserver = this.observePlatformDoneSignal(() => {
+      if (platformSignalFired) return;  // debounce — process only the first signal
+      platformSignalFired = true;
+
+      this.traceFlow('waitForContent:platformSignalReceived', {
+        key: this.getElementKey(element),
+        textLength: element.textContent?.trim().length || 0
+      });
+
+      // Wait for final rendering to settle, then try to finalize
+      platformSettleTimer = window.setTimeout(() => {
+        this.traceFlow('waitForContent:platformSettleComplete', {
+          key: this.getElementKey(element),
+          textLength: element.textContent?.trim().length || 0
+        });
+        finalizeIfReady();
+      }, PLATFORM_SETTLE_MS);
+    });
+
+    if (platformSignalObserver) {
+      this.traceFlow('waitForContent:platformSignalActive', {
+        domain: this.domain,
+        key: this.getElementKey(element)
+      });
+    }
+
     // Absolute safety cap — never reset, ensures cleanup even if watchdog keeps resetting.
     absoluteMaxTimeout = window.setTimeout(() => {
       if (this.processedElements.has(element)) return;
@@ -1324,17 +1496,20 @@ export class ConversationDetector {
     const domain = this.domain;
 
     // ChatGPT / OpenAI
+    // NOTE: .agent-turn was removed — it wraps [data-message-author-role="assistant"]
+    // and caused duplicate turns (same text, two elements, two waitForContent chains).
     if (domain.includes('chatgpt') || domain.includes('openai')) {
       return [
-        '[data-message-author-role="assistant"]',
-        '.agent-turn'
+        '[data-message-author-role="assistant"]'
       ];
     }
 
     // Claude
+    // NOTE: data-is-streaming="false" was previously a selector here but caused
+    // duplicate turns — it matches the same element as .font-claude-response.
+    // Now it's used as a streaming-done SIGNAL in isPlatformStreamingDone().
     if (domain.includes('claude')) {
       return [
-        '[data-is-streaming="false"]',
         '.font-claude-response'
       ];
     }
@@ -1349,10 +1524,11 @@ export class ConversationDetector {
     }
 
     // Grok
+    // NOTE: div[id^="response-"] was removed — it wraps .response-content-markdown
+    // and caused duplicate turns.
     if (domain.includes('grok') || domain.includes('x.ai')) {
       return [
-        'div[id^="response-"] .response-content-markdown',
-        'div[id^="response-"]'
+        'div[id^="response-"] .response-content-markdown'
       ];
     }
 
@@ -1396,19 +1572,36 @@ export class ConversationDetector {
 
     // ── Thread-gate guard ──────────────────────────────────────────────
     // If this element was detected on a different thread (waitForContent
-    // timer survived a navigation), discard it.
+    // timer survived a navigation), discard it — UNLESS it matches the
+    // pre-migration thread (new-chat URL redirect race).
     if (element instanceof HTMLElement && element.dataset.tbvDetectedThread) {
       if (element.dataset.tbvDetectedThread !== currentThreadId) {
-        this.traceFlow('extractAndSaveMessage:threadGate', {
+        // Allow elements from the pre-migration thread within 15 s of migration.
+        const MIGRATION_GRACE_MS = 15_000;
+        const isMigratedThread =
+          this.migratedFromThreadId !== null &&
+          element.dataset.tbvDetectedThread === this.migratedFromThreadId &&
+          (Date.now() - this.migratedFromThreadAt) < MIGRATION_GRACE_MS;
+
+        if (!isMigratedThread) {
+          this.traceFlow('extractAndSaveMessage:threadGate', {
+            detectedThread: element.dataset.tbvDetectedThread,
+            currentThread: currentThreadId,
+            textPreview: (text || '').substring(0, 80)
+          });
+          this.logDebug('Discarding stale capture from different thread', {
+            detectedThread: element.dataset.tbvDetectedThread,
+            currentThread: currentThreadId
+          });
+          return;
+        }
+
+        // Element is from the pre-migration thread — allow it through.
+        this.traceFlow('extractAndSaveMessage:threadGateMigrated', {
           detectedThread: element.dataset.tbvDetectedThread,
-          currentThread: currentThreadId,
-          textPreview: (text || '').substring(0, 80)
-        });
-        this.logDebug('Discarding stale capture from different thread', {
-          detectedThread: element.dataset.tbvDetectedThread,
+          migratedFrom: this.migratedFromThreadId,
           currentThread: currentThreadId
         });
-        return;
       }
     }
 
@@ -1463,7 +1656,7 @@ export class ConversationDetector {
     if (
       this.pendingPrompt
       && pendingPromptMatchesThread
-      && Date.now() - this.pendingPrompt.timestamp < 180_000
+      && Date.now() - this.pendingPrompt.timestamp < 600_000
     ) {
       const responseTime = Date.now() - this.pendingPrompt.timestamp;
       const threadId = currentThreadId;
@@ -1504,6 +1697,11 @@ export class ConversationDetector {
           this.recentPrompts.splice(index, 1);
         }
       }
+
+      // Track the consumed prompt so duplicate inferred turns can be detected.
+      this.lastConsumedPromptText = normalizedPrompt || this.normalizeText(this.pendingPrompt!.text);
+      this.lastConsumedPromptAt = Date.now();
+
       this.pendingPrompt = null;
 
       // Clear persisted prompt now that it has been successfully consumed.
@@ -1511,8 +1709,8 @@ export class ConversationDetector {
     } else {
       // Cold-load safety: if no prompt interaction was captured recently,
       // do not infer prompt/response pairs from historical DOM.
-      const RECENT_PROMPT_WINDOW_MS = 180_000;
-      const RECENT_INTERACTION_WINDOW_MS = 180_000;
+      const RECENT_PROMPT_WINDOW_MS = 600_000;
+      const RECENT_INTERACTION_WINDOW_MS = 600_000;
       const latestPromptSignalAt = Math.max(this.lastPromptCapturedAt, this.lastPromptIntentAt);
       const hasRecentPromptIntent = latestPromptSignalAt > 0
         && (Date.now() - latestPromptSignalAt) <= RECENT_PROMPT_WINDOW_MS;
@@ -1544,6 +1742,26 @@ export class ConversationDetector {
       const normalizedInferredPrompt = this.normalizeText(inferredPromptText);
 
       if (normalizedInferredPrompt && normalizedInferredPrompt.length >= 2) {
+        // ── Duplicate-inferred-turn guard ────────────────────────
+        // When ChatGPT uses web search it renders MULTIPLE assistant
+        // elements for a single prompt.  The first one consumes
+        // pendingPrompt (paired turn); the second arrives with no
+        // pending prompt and falls here.  If the inferred prompt text
+        // matches the one we just consumed within 30 s, skip it.
+        const DUPLICATE_INFERRED_WINDOW_MS = 30_000;
+        if (
+          this.lastConsumedPromptText
+          && this.lastConsumedPromptAt > 0
+          && (Date.now() - this.lastConsumedPromptAt) < DUPLICATE_INFERRED_WINDOW_MS
+          && normalizedInferredPrompt === this.lastConsumedPromptText
+        ) {
+          this.traceFlow('extractAndSaveMessage:skippedDuplicateInferred', {
+            threadId: currentThreadId,
+            promptPreview: inferredPromptText.substring(0, 80)
+          });
+          return;
+        }
+
         const threadId = currentThreadId;
         const responseTs = Date.now();
         const promptTs = responseTs;
@@ -2115,6 +2333,10 @@ export class ConversationDetector {
     return this.domain.includes('gemini');
   }
 
+  private isChatGPTDomain(): boolean {
+    return this.domain.includes('chatgpt') || this.domain.includes('openai');
+  }
+
   /**
    * When starting a brand-new Grok chat, prompt capture can happen before URL
    * changes to /c/<id>. In that case prompt threadId is the fallback hash and
@@ -2187,6 +2409,18 @@ export class ConversationDetector {
       'pondering stand by...',
       'pondering, stand by',
       'pondering stand by',
+      'ruminating on it, stand by...',
+      'ruminating on it stand by...',
+      'ruminating on it, stand by',
+      'ruminating on it stand by',
+      'ruminating on it...',
+      'ruminating on it',
+      'mulling it over, stand by...',
+      'mulling it over stand by...',
+      'mulling it over, stand by',
+      'mulling it over stand by',
+      'mulling it over...',
+      'mulling it over',
       'searched the web',
       'searching the web',
       'searching',
@@ -2197,6 +2431,11 @@ export class ConversationDetector {
       'browsing the web',
       'searching the web...',
       'searching...',
+      'thought for',
+      'thinkinganswer now',
+      'answer now',
+      'ranking the contenders',
+      'ranking the contenders...',
       // DeepSeek
       'deep thinking',
       'deep thinking...',
@@ -2205,7 +2444,6 @@ export class ConversationDetector {
       'thinking...',
       'loading',
       'loading...',
-      'Thought for'
     ]);
 
     if (placeholderPhrases.has(normalized)) {
@@ -2216,8 +2454,11 @@ export class ConversationDetector {
     // "Show thinking\nJust a second" on Gemini.
     const stripped = normalized
       .replace(/^show thinking/, '')
-      .replace(/^Searched the web/, '')
-      .replace(/^Thought for/, '')
+      .replace(/^searched the web/, '')
+      .replace(/^thought for[^]*/, '')  // "thought for 30 seconds" etc.
+      .replace(/^thinkinganswer now/, '')
+      .replace(/^answer now/, '')
+      .replace(/^ranking the contenders\.{0,3}/, '')
       .replace(/^gemini said/, '')
       .replace(/^you said/, '')
       .replace(/^just a second/, '')
@@ -2228,11 +2469,16 @@ export class ConversationDetector {
       .replace(/^just a moment/, '')
       .replace(/^give me a moment/, '')
       .replace(/^pondering,? stand by\.{0,3}/, '')
+      .replace(/^ruminating on it,? stand by\.{0,3}/, '')
+      .replace(/^ruminating on it\.{0,3}/, '')
+      .replace(/^mulling it over,? stand by\.{0,3}/, '')
+      .replace(/^mulling it over\.{0,3}/, '')
       .replace(/^search(ing|ed) the web\.{0,3}/, '')
       .replace(/^browsing the web\.{0,3}/, '')
       .replace(/^scanning\.{0,3}/, '')
       .replace(/^analyzing\.{0,3}/, '')
       .replace(/^deep thinking\.{0,3}/, '')
+      .replace(/\s+/g, ' ')
       .trim();
 
     if (!stripped) {
@@ -2252,22 +2498,228 @@ export class ConversationDetector {
    * detection with structural DOM checks.
    */
   private isPlatformStreaming(element: Element): boolean {
-    // Claude: data-is-streaming="true" on the response container
+    const done = this.isPlatformStreamingDone();
+    if (done === false) return true;   // platform confirms still streaming
+    if (done === true) return false;   // platform confirms done
+
+    // Legacy element-level checks as fallback
     if (this.domain.includes('claude')) {
       const container = element.closest('[data-is-streaming]');
       if (container?.getAttribute('data-is-streaming') === 'true') {
         return true;
       }
     }
-
-    // ChatGPT: .result-streaming class while generating
     if (this.domain.includes('chatgpt') || this.domain.includes('openai')) {
       if (element.closest('.result-streaming') || element.querySelector('.result-streaming')) {
         return true;
       }
     }
-
     return false;
+  }
+
+  /**
+   * Poll-based check: is the platform's streaming-done signal present NOW?
+   * Returns true  = confirmed done.
+   * Returns false = confirmed still streaming.
+   * Returns null  = this platform has no reliable signal (use timer).
+   */
+  private isPlatformStreamingDone(): boolean | null {
+    const domain = this.domain;
+
+    // Claude: data-is-streaming attribute on response container
+    if (domain.includes('claude')) {
+      const el = document.querySelector('[data-is-streaming]');
+      if (!el) return null;  // no streaming element exists yet
+      return el.getAttribute('data-is-streaming') === 'false';
+    }
+
+    // ChatGPT: stop button removed = done
+    if (domain.includes('chatgpt') || domain.includes('openai')) {
+      const stopBtn = document.querySelector('button[data-testid="stop-button"]');
+      if (stopBtn) return false;  // stop button present = still streaming
+      // Secondary: streaming-animation class on response div
+      const streamingDiv = document.querySelector('.streaming-animation');
+      if (streamingDiv) return false;
+      // No stop button and no streaming class = done (or not started)
+      // Check if send button is present as confirmation
+      const sendBtn = document.querySelector('button[data-testid="send-button"]');
+      return sendBtn !== null ? true : null;
+    }
+
+    // Gemini: send button label toggles "Stop response" ↔ "Send message"
+    if (domain.includes('gemini')) {
+      const stopBtn = document.querySelector('button[aria-label="Stop response"]');
+      if (stopBtn) return false;
+      const sendBtn = document.querySelector('button[aria-label="Send message"]');
+      return sendBtn !== null ? true : null;
+    }
+
+    // Grok: stop button present vs voice mode button present
+    if (domain.includes('grok') || domain.includes('x.ai')) {
+      const stopBtn = document.querySelector('button[aria-label="Stop model response"]');
+      if (stopBtn) return false;
+      const voiceBtn = document.querySelector('button[aria-label*="Enter voice mode"]');
+      return voiceBtn !== null ? true : null;
+    }
+
+    // DeepSeek and unknown: no reliable signal
+    return null;
+  }
+
+  /**
+   * Event-based observer: watches for the platform-specific "streaming done"
+   * signal and calls onDone() once when it fires.
+   * Returns the MutationObserver (for cleanup), or null if no signal available.
+   */
+  private observePlatformDoneSignal(onDone: () => void): MutationObserver | null {
+    const domain = this.domain;
+    let doneObserver: MutationObserver;
+
+    // ─── Claude: data-is-streaming attribute change to "false" ───
+    if (domain.includes('claude')) {
+      doneObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'attributes' && m.attributeName === 'data-is-streaming') {
+            const el = m.target as Element;
+            if (el.getAttribute('data-is-streaming') === 'false') {
+              this.traceFlow('platformSignal:done', {
+                platform: 'claude',
+                signal: 'data-is-streaming=false'
+              });
+              // Disconnect immediately to prevent repeated fires for all
+              // existing [data-is-streaming="false"] elements in the conversation
+              doneObserver.disconnect();
+              onDone();
+              return;
+            }
+          }
+        }
+      });
+      doneObserver.observe(document.body, {
+        attributes: true,
+        subtree: true,
+        attributeFilter: ['data-is-streaming']
+      });
+      return doneObserver;
+    }
+
+    // ─── ChatGPT: stop button removed OR streaming-animation class removed ───
+    if (domain.includes('chatgpt') || domain.includes('openai')) {
+      doneObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          // Stop button removed from DOM
+          if (m.type === 'childList') {
+            for (const node of Array.from(m.removedNodes)) {
+              if (node instanceof Element) {
+                if (node.getAttribute?.('data-testid') === 'stop-button' ||
+                    node.querySelector?.('[data-testid="stop-button"]')) {
+                  this.traceFlow('platformSignal:done', {
+                    platform: 'chatgpt',
+                    signal: 'stop-button-removed'
+                  });
+                  onDone();
+                  return;
+                }
+              }
+            }
+          }
+          // streaming-animation class removed
+          if (m.type === 'attributes' && m.attributeName === 'class') {
+            const el = m.target as Element;
+            const oldVal = m.oldValue || '';
+            const newVal = el.className || '';
+            if (oldVal.includes('streaming-animation') && !newVal.includes('streaming-animation')) {
+              this.traceFlow('platformSignal:done', {
+                platform: 'chatgpt',
+                signal: 'streaming-animation-removed'
+              });
+              onDone();
+              return;
+            }
+          }
+        }
+      });
+      doneObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeOldValue: true,
+        attributeFilter: ['class']
+      });
+      return doneObserver;
+    }
+
+    // ─── Gemini: aria-label changes from "Stop response" to "Send message" ───
+    if (domain.includes('gemini')) {
+      doneObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'attributes' && m.attributeName === 'aria-label') {
+            const el = m.target as Element;
+            const oldVal = m.oldValue || '';
+            const newVal = el.getAttribute('aria-label') || '';
+            if (oldVal === 'Stop response' && newVal === 'Send message') {
+              this.traceFlow('platformSignal:done', {
+                platform: 'gemini',
+                signal: 'stop-to-send'
+              });
+              onDone();
+              return;
+            }
+          }
+        }
+      });
+      doneObserver.observe(document.body, {
+        attributes: true,
+        subtree: true,
+        attributeOldValue: true,
+        attributeFilter: ['aria-label']
+      });
+      return doneObserver;
+    }
+
+    // ─── Grok: voice mode button appears (replaces stop button) ───
+    // Check both the added node itself AND its descendants, because
+    // the button may appear inside a container element.
+    if (domain.includes('grok') || domain.includes('x.ai')) {
+      doneObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'childList') {
+            for (const node of Array.from(m.addedNodes)) {
+              if (node instanceof Element) {
+                // Check the added node itself
+                const label = node.getAttribute?.('aria-label') || '';
+                if (label.includes('Enter voice mode')) {
+                  this.traceFlow('platformSignal:done', {
+                    platform: 'grok',
+                    signal: 'voice-mode-button-added'
+                  });
+                  onDone();
+                  return;
+                }
+                // Also search descendants of the added node
+                const voiceBtn = node.querySelector?.('button[aria-label*="Enter voice mode"]');
+                if (voiceBtn) {
+                  this.traceFlow('platformSignal:done', {
+                    platform: 'grok',
+                    signal: 'voice-mode-button-added-descendant'
+                  });
+                  onDone();
+                  return;
+                }
+              }
+            }
+          }
+        }
+      });
+      doneObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+      return doneObserver;
+    }
+
+    // DeepSeek / unknown: no signal available
+    return null;
   }
 
   private cleanGeminiText(text: string): string {

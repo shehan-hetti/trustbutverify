@@ -768,14 +768,21 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     turnSide: activity.turnSide || bestSide,
     bestScore,
     bestPrimaryScore,
-    bestPromptScore
+    bestPromptScore,
+    turnCategory: bestTurn.category || 'pending'
   });
+
+  // Don't inherit "pending" — the turn's LLM-2 categorization hasn't finished.
+  // Leave copyCategory undefined so enqueueCopyCategorizationIfNeeded() picks it
+  // up for deferred re-categorization once the turn has a real category.
+  const hasFinalCategory = bestTurn.category && bestTurn.category !== 'pending';
+
   return {
     ...activity,
     turnId: bestTurn.id,
     turnSide: activity.turnSide || bestSide,
-    copyCategory: bestTurn.category || 'pending',
-    copyCategorySource: 'turn'
+    copyCategory: hasFinalCategory ? bestTurn.category : undefined,
+    copyCategorySource: hasFinalCategory ? 'turn' : undefined
   };
 }
 
