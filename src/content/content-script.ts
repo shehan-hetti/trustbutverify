@@ -231,7 +231,7 @@ class ActivityTracker {
       return;
     }
 
-    console.log('[TrustButVerify] Showing nudge overlay with multiple questions');
+    console.debug('[TrustButVerify] Showing nudge overlay with multiple questions');
     this.nudgeOverlay.show({
       ...data,
       timeoutMs: data.timeoutMs ?? ActivityTracker.NUDGE_TIMEOUT_MS
@@ -412,7 +412,7 @@ class ActivityTracker {
           : undefined
       });
 
-      console.log('[TrustButVerify] Copy event tracked:', {
+      console.debug('[TrustButVerify] Copy event tracked:', {
         domain: this.domain,
         length: finalText.length,
         method: 'copy',
@@ -868,7 +868,7 @@ class ActivityTracker {
       console.error('[TrustButVerify] Error tracking programmatic copy:', error);
     });
 
-    console.log('[TrustButVerify] Copy event tracked:', {
+    console.debug('[TrustButVerify] Copy event tracked:', {
       domain: this.domain,
       length: trimmed.length,
       method,
@@ -1695,7 +1695,7 @@ class ActivityTracker {
     // when the user clicks "Share". Skip these — they're not user-selected
     // content from a conversation.
     if (this.looksLikeShareLink(trimmed)) {
-      console.log('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
+      console.debug('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
       return;
     }
 
@@ -1703,7 +1703,7 @@ class ActivityTracker {
     // Store copy activity only when it is confidently from the LLM response.
     // Keep pairedPromptText capture for response-side copies unchanged.
     if (extras?.turnSide !== 'response') {
-      console.log('[TrustButVerify] Skipping non-response copy activity', {
+      console.debug('[TrustButVerify] Skipping non-response copy activity', {
         turnSide: extras?.turnSide || null,
         domain: this.domain,
         strategy: trigger.extractionStrategy || null

@@ -583,11 +583,7 @@ export class ConversationDetector {
         if (hasComposerContext) {
           this.lastPromptIntentAt = Date.now();
           this.lastPromptThreadId = this.getConversationId();
-          // this.traceFlow('observePromptSubmissions:keydownIntent', {
-          //   threadId: this.lastPromptThreadId,
-          //   key: event.key,
-          //   isTrusted: event.isTrusted
-          // });
+
         }
       }
     }, true);
@@ -914,11 +910,7 @@ export class ConversationDetector {
    * Detect if a new element is a conversation message
    */
   private detectMessage(element: Element): void {
-    // this.traceFlow('detectMessage:start', {
-    //   tag: element.tagName,
-    //   className: (element as HTMLElement).className || '',
-    //   id: (element as HTMLElement).id || ''
-    // });
+
     // Platform-specific selectors
     const selectors = this.getMessageSelectors();
 
@@ -1230,13 +1222,15 @@ export class ConversationDetector {
 
         // Check for placeholder/status text across all platforms
         if (this.isPlaceholderText(normalizedText)) {
+        if (waitRetryCount <= 1 || waitRetryCount % 5 === 0) {
           this.traceFlow('waitForContent:placeholderBlocked', {
             text: normalizedText.substring(0, 80),
             waitRetryCount,
             platformSignalFired,
             key: this.getElementKey(element)
           });
-          scheduleWaitRetry();
+        }
+        scheduleWaitRetry();
           return;
         }
 
@@ -1250,20 +1244,24 @@ export class ConversationDetector {
           const streamContainer = element.closest('[data-is-streaming]');
           if (!streamContainer) {
             // No streaming ancestor → thinking bubble / notification, not a response
-            this.traceFlow('waitForContent:claudeNoStreamAncestor', {
-              key: this.getElementKey(element),
-              textPreview: normalizedText.substring(0, 60),
-              waitRetryCount
-            });
+            if (waitRetryCount <= 1 || waitRetryCount % 5 === 0) {
+              this.traceFlow('waitForContent:claudeNoStreamAncestor', {
+                key: this.getElementKey(element),
+                textPreview: normalizedText.substring(0, 60),
+                waitRetryCount
+              });
+            }
             scheduleWaitRetry();
             return;
           }
           if (streamContainer.getAttribute('data-is-streaming') === 'true') {
             // Still actively streaming
-            this.traceFlow('waitForContent:claudeStillStreaming', {
-              key: this.getElementKey(element),
-              waitRetryCount
-            });
+            if (waitRetryCount <= 1 || waitRetryCount % 5 === 0) {
+              this.traceFlow('waitForContent:claudeStillStreaming', {
+                key: this.getElementKey(element),
+                waitRetryCount
+              });
+            }
             scheduleWaitRetry();
             return;
           }
@@ -1855,6 +1853,11 @@ export class ConversationDetector {
     this.pruneRecentPrompts(timestamp);
   }
 
+  /**
+   * Extract prompt text from a user-authored DOM element.
+   * Used as a fallback when the prompt wasn't captured via composer/Enter/click.
+   * Deduplicates against recently-captured prompts to avoid double-counting.
+   */
   private capturePromptFromUserElement(element: Element): void {
     const text = this.extractText(element);
     const normalized = this.normalizeText(text);
@@ -1915,7 +1918,8 @@ export class ConversationDetector {
   }
 
   /**
-   * Extract text content from element
+   * Extract text content from a message element, stripping platform-specific
+   * UI artifacts (buttons, toolbars, status badges) to produce clean text.
    */
   private extractText(element: Element): string {
     // Remove code blocks and other non-text elements for cleaner extraction
@@ -2098,6 +2102,10 @@ export class ConversationDetector {
     return false;
   }
 
+  /**
+   * Return true if the element is authored by the user (prompt side).
+   * Used to skip user messages during assistant response detection.
+   */
   private isUserAuthoredElement(element: Element): boolean {
     const selectors = this.getUserMessageSelectors();
     return selectors.some((selector) => {
@@ -2185,6 +2193,7 @@ export class ConversationDetector {
     }
   }
 
+  /** Derive a deduplication key from an element's text content and position. */
   private getElementKey(element: Element): string | undefined {
     if (element instanceof HTMLElement) {
       const datasetKey = element.dataset.tbvKey;
@@ -2196,6 +2205,7 @@ export class ConversationDetector {
     return this.getMessageKey(element);
   }
 
+  /** Derive a stable message key from platform-specific attributes (data-message-id, aria-label, etc.). */
   private getMessageKey(element: Element): string | undefined {
     if (!(element instanceof HTMLElement)) {
       return undefined;
@@ -2301,6 +2311,7 @@ export class ConversationDetector {
     return null;
   }
 
+  /** Mark an element and its key as processed to prevent duplicate captures. */
   private markProcessed(element: Element, messageKey?: string): void {
     this.processedElements.add(element);
 
@@ -2371,9 +2382,9 @@ export class ConversationDetector {
   }
 
   /**
-   * Detect transient placeholder/status text across all LLM platforms.
-   * Returns true if the text looks like a temporary status message rather
-   * than a real response.  Used by waitForContent to keep waiting.
+   * Return true if text looks like a platform placeholder or status indicator
+   * (e.g. "Thinking...", "Searching the web", "Analyzing") rather than
+   * actual response content. Used by waitForContent to keep waiting.
    */
   private isPlaceholderText(text: string): boolean {
     if (!text) {
@@ -2493,9 +2504,9 @@ export class ConversationDetector {
   }
 
   /**
-   * Check platform-specific DOM signals to determine if the LLM is still
-   * actively streaming/generating.  This supplements text-based placeholder
-   * detection with structural DOM checks.
+   * Return true if the platform's DOM signals indicate streaming is still
+   * in progress for the given element (e.g. .result-streaming, data-is-streaming).
+   * Supplements text-based placeholder detection with structural DOM checks.
    */
   private isPlatformStreaming(element: Element): boolean {
     const done = this.isPlatformStreamingDone();
@@ -2733,6 +2744,7 @@ export class ConversationDetector {
     return cleaned.trim();
   }
 
+  /** Collapse whitespace and lowercase for comparison purposes. */
   private normalizeText(text: string): string {
     return text.replace(/\s+/g, ' ').trim();
   }
