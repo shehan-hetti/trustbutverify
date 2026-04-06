@@ -115,8 +115,6 @@ async function handleMessage(
     case 'CLEAR_ACTIVITIES':
       return handleClearActivities();
 
-    case 'CONVERSATION_EVENT':
-      return handleConversationEvent(message.data as any);
     case 'UPSERT_CONVERSATION_TURNS':
       return handleUpsertConversationTurns(message.data as {
         threadId: string;
@@ -221,7 +219,7 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       copyCategory: enriched.copyCategory || null,
       textLength: enriched.textLength
     });
-    console.log('[TrustButVerify] Copy activity saved:', {
+    console.debug('[TrustButVerify] Copy activity saved:', {
       domain: enriched.domain,
       length: enriched.textLength,
       trigger: enriched.trigger?.method || enriched.trigger?.type,
@@ -768,14 +766,21 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     turnSide: activity.turnSide || bestSide,
     bestScore,
     bestPrimaryScore,
-    bestPromptScore
+    bestPromptScore,
+    turnCategory: bestTurn.category || 'pending'
   });
+
+  // Don't inherit "pending" — the turn's LLM-2 categorization hasn't finished.
+  // Leave copyCategory undefined so enqueueCopyCategorizationIfNeeded() picks it
+  // up for deferred re-categorization once the turn has a real category.
+  const hasFinalCategory = bestTurn.category && bestTurn.category !== 'pending';
+
   return {
     ...activity,
     turnId: bestTurn.id,
     turnSide: activity.turnSide || bestSide,
-    copyCategory: bestTurn.category || 'pending',
-    copyCategorySource: 'turn'
+    copyCategory: hasFinalCategory ? bestTurn.category : undefined,
+    copyCategorySource: hasFinalCategory ? 'turn' : undefined
   };
 }
 
@@ -922,7 +927,7 @@ async function handleGetActivities(limit?: number): Promise<MessageResponse> {
 async function handleClearActivities(): Promise<MessageResponse> {
   try {
     await StorageManager.clearAllActivities();
-    console.log('[TrustButVerify] All activities cleared');
+    console.debug('[TrustButVerify] All activities cleared');
 
     return { success: true };
   } catch (error) {
@@ -931,61 +936,7 @@ async function handleClearActivities(): Promise<MessageResponse> {
   }
 }
 
-/**
- * Handle conversation event from content script
- */
-async function handleConversationEvent(conversation: any): Promise<MessageResponse> {
-  try {
-    // Backward compatibility: if an old-style conversation arrives, convert to turns
-    if (conversation && conversation.userPrompt && conversation.llmResponse) {
-      const threadId = deriveThreadIdFromUrl(conversation.url, conversation.domain);
-      const promptTs = conversation.timestamp - (conversation.responseTime || 0);
-      const responseTs = conversation.timestamp;
-      const turns: ConversationTurn[] = [
-        {
-          id: `${responseTs}-turn`,
-          ts: responseTs,
-          responseTimeMs: conversation.responseTime || undefined,
-          prompt: {
-            text: conversation.userPrompt,
-            textLength: conversation.userPrompt.length,
-            ts: promptTs
-          },
-          response: {
-            text: conversation.llmResponse,
-            textLength: conversation.llmResponse.length,
-            ts: responseTs
-          }
-        }
-      ];
 
-      await StorageManager.upsertConversationTurns(threadId, {
-        id: threadId,
-        url: conversation.url,
-        domain: conversation.domain,
-        title: conversation.metadata?.conversationTitle,
-        metadata: { messageCount: conversation.metadata?.messageCount }
-      }, turns);
-
-      console.log('[TrustButVerify] Conversation upserted (legacy payload):', {
-        domain: conversation.domain,
-        turns: turns.length
-      });
-      return { success: true };
-    }
-
-    // If new format accidentally sent here, try to upsert
-    if (conversation && conversation.id && Array.isArray(conversation.turns)) {
-      await StorageManager.upsertConversationTurns(conversation.id, conversation, conversation.turns);
-      return { success: true };
-    }
-
-    return { success: true };
-  } catch (error) {
-    console.error('[TrustButVerify] Error saving conversation:', error);
-    throw error;
-  }
-}
 
 async function handleUpsertConversationTurns(payload: {
   threadId: string;
@@ -1486,12 +1437,12 @@ async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType
       state.continuousSkips += 1;
       console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
       if (state.continuousSkips >= 3) {
-        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 10 minutes
-        console.log('[TrustButVerify] Nudges paused for 10 minutes due to 3 continuous skips');
+        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 1 minute
+        console.debug('[TrustButVerify] Nudges paused for 1 minute due to 3 continuous skips');
       }
     } else {
       if (state.continuousSkips > 0) {
-        console.log('[TrustButVerify] User answered a question, resetting continuous skips count to 0');
+        console.debug('[TrustButVerify] User answered a question, resetting continuous skips count to 0');
       }
       state.continuousSkips = 0;
     }
@@ -1508,20 +1459,20 @@ async function trySendCopyNudge(
   tabId: number | undefined,
   activity: CopyActivity
 ): Promise<void> {
-  console.log('[TrustButVerify:DEBUG] trySendCopyNudge entered', { tabId, domain: activity.domain, textLength: activity.textLength });
+  console.debug('[TrustButVerify] trySendCopyNudge entered', { tabId, domain: activity.domain, textLength: activity.textLength });
 
   if (!tabId) {
-    console.log('[TrustButVerify:DEBUG] trySendCopyNudge returning early - NO TAB ID');
+    console.debug('[TrustButVerify] trySendCopyNudge returning early - NO TAB ID');
     return;
   }
   try {
     const stateObj = await chrome.storage.local.get(NUDGE_COOLDOWN_KEY);
     const state: NudgeCooldownState = stateObj[NUDGE_COOLDOWN_KEY] || { continuousSkips: 0, pausedUntil: 0 };
 
-    console.log('[TrustButVerify:DEBUG] Cooldown state:', state);
+    console.debug('[TrustButVerify] Cooldown state:', state);
 
     if (Date.now() < state.pausedUntil) {
-      console.log('[TrustButVerify] Nudges are currently paused due to cooldown.');
+      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.');
       return;
     }
 
@@ -1530,14 +1481,14 @@ async function trySendCopyNudge(
       state.continuousSkips = 0;
       state.pausedUntil = 0;
       await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
-      console.log('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
+      console.debug('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
     }
 
     const questions = getActiveNudgeQuestions('copy');
-    console.log('[TrustButVerify:DEBUG] Fetched questions array length:', questions?.length);
+    console.debug('[TrustButVerify] Fetched questions array length:', questions?.length);
 
     if (!questions || questions.length === 0) {
-      console.log('[TrustButVerify:DEBUG] trySendCopyNudge returning early - NO QUESTIONS');
+      console.debug('[TrustButVerify] trySendCopyNudge returning early - NO QUESTIONS');
       return;
     }
 
@@ -1635,34 +1586,7 @@ async function reinjectContentScripts(): Promise<void> {
 // Delay to ensure storage APIs are ready after rapid reloads.
 setTimeout(() => routePopup(), 500);
 
-function deriveThreadIdFromUrl(url: string, domain: string): string {
-  try {
-    const u = new URL(url);
-    const path = u.pathname;
 
-    // ChatGPT
-    const chatgpt = path.match(/\/c\/([^/?#]+)/);
-    if (chatgpt) return `${domain}::${chatgpt[1]}`;
-
-    // Gemini
-    const gemApp = path.match(/\/app\/([^/?#]+)/);
-    if (gemApp) return `${domain}::${gemApp[1]}`;
-
-    // Grok
-    const grokC = path.match(/\/c\/([^/?#]+)/);
-    if (grokC) return `${domain}::${grokC[1]}`;
-
-    // Fallback: hash origin+path
-    const key = `${u.origin}${u.pathname}`;
-    let hash = 0;
-    for (let i = 0; i < key.length; i++) {
-      hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-    }
-    return `${domain}::h${hash.toString(36)}`;
-  } catch {
-    return `${domain}::unknown`;
-  }
-}
 
 /* ------------------------------------------------------------------ */
 /*  Popup routing: registration vs main                                */

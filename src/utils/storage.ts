@@ -21,10 +21,21 @@ export class StorageManager {
   private static readonly MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC = 20;
   private static readonly MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC = 20;
 
+  /** Collapse whitespace for turn text comparison. */
   private static normalizeTurnText(text: string): string {
     return (text || '').replace(/\s+/g, ' ').trim();
   }
 
+  /**
+   * Simple substring-based containment similarity for turn deduplication.
+   * Returns ratio of shorter text length to longer when one contains the other.
+   *
+   * NOTE: This is intentionally simpler than service-worker's `containmentScore()`
+   * which uses a 3-pass strategy (soft/hard normalization + token overlap) for
+   * copy→turn pairing. The two serve different purposes:
+   * - containmentSimilarity: fast dedup during storage upsert (exact/substring match)
+   * - containmentScore: fuzzy matching for copy activity enrichment
+   */
   private static containmentSimilarity(a: string, b: string): number {
     const x = this.normalizeTurnText(a).toLowerCase();
     const y = this.normalizeTurnText(b).toLowerCase();

@@ -298,7 +298,6 @@ export interface MessagePayload {
     | 'COPY_EVENT'
     | 'GET_ACTIVITIES'
     | 'CLEAR_ACTIVITIES'
-    | 'CONVERSATION_EVENT'
     | 'UPSERT_CONVERSATION_TURNS'
     | 'GET_CONVERSATIONS'
     | 'CLEAR_CONVERSATIONS'
@@ -309,7 +308,6 @@ export interface MessagePayload {
     | 'VERIFY_PARTICIPANT'
     | 'TRIGGER_SYNC'
     | 'GET_SYNC_STATUS'
-    | 'FLUSH_PENDING_EVENTS'
     | 'NUDGE_SESSION_COMPLETE';
   data?:
     | CopyActivity
