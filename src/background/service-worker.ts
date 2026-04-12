@@ -48,22 +48,31 @@ const AUTO_SYNC_ALARM = 'tbv:auto-sync';
 const AUTO_SYNC_INTERVAL_MINUTES = 5;
 
 // ── Keepalive (prevents 30 s MV3 worker suspension during long operations) ──
+// Reference-counted: multiple concurrent fire-and-forget operations can each
+// call startKeepalive/stopKeepalive without stomping on each other.
 const KEEPALIVE_ALARM = 'tbv:keepalive';
+let keepaliveRefCount = 0;
 
 function startKeepalive(): void {
-  try {
-    // Fire every ~24 s (< 30 s Chrome suspension timer).
-    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
-  } catch {
-    // Alarms unavailable — best-effort only.
+  keepaliveRefCount++;
+  if (keepaliveRefCount === 1) {
+    try {
+      // Fire every ~24 s (< 30 s Chrome suspension timer).
+      chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
+    } catch {
+      // Alarms unavailable — best-effort only.
+    }
   }
 }
 
 function stopKeepalive(): void {
-  try {
-    chrome.alarms.clear(KEEPALIVE_ALARM);
-  } catch {
-    // ignore
+  keepaliveRefCount = Math.max(0, keepaliveRefCount - 1);
+  if (keepaliveRefCount === 0) {
+    try {
+      chrome.alarms.clear(KEEPALIVE_ALARM);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -189,7 +198,9 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
 
     // Recovery path: if turn capture missed but copy contains a paired prompt + full response,
     // infer and upsert a turn from copy metadata, then rematch.
+    let backfilledConvId: string | undefined;
     if (!enriched.turnId) {
+      backfilledConvId = enriched.conversationId;
       await tryBackfillTurnFromCopy(enriched);
       enriched = await enrichCopyActivity(enriched);
     }
@@ -235,6 +246,21 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       enriched.textLength >= NUDGE_COPY_MIN_CHARS
     ) {
       void trySendCopyNudge(sender.tab?.id, enriched);
+    }
+
+    // ── Background categorisation for backfilled turns ──
+    // Fired AFTER copy is saved so categorizeLatestPendingTurn can find and
+    if (backfilledConvId) {
+      void (async () => {
+        startKeepalive();
+        try {
+          await categorizeLatestPendingTurn(backfilledConvId!);
+        } catch (err) {
+          console.warn('[TrustButVerify] Background backfill categorization failed (non-fatal):', err);
+        } finally {
+          stopKeepalive();
+        }
+      })();
     }
 
     return { success: true };
@@ -369,8 +395,8 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
     [inferredTurn]
   );
 
-  // Keep categories aligned with the rest of the pipeline.
-  await categorizeLatestPendingTurn(activity.conversationId);
+  // Categorisation is deferred to handleCopyEvent (after copy is saved)
+  // so that categorizeLatestPendingTurn can patch the linked copy activity.
   flowTrace('tryBackfillTurnFromCopy:created', {
     id: activity.id,
     conversationId: activity.conversationId,
@@ -844,6 +870,7 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
   const task = (async () => {
     try {
       const prompt = buildCopyCategoryPrompt(activity);
+      const correlationId = `copy:${activity.id}`;
       const r = await fetch(LLM2_URL, {
         method: 'POST',
         headers: {
@@ -853,7 +880,8 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
         body: JSON.stringify({
           prompt,
           n_predict: 60,
-          temperature: 0.2
+          temperature: 0.2,
+          tbv_correlation_id: correlationId
         })
       });
 
@@ -865,6 +893,16 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
           bodyPreview: text.slice(0, 400)
         });
         return;
+      }
+
+      // Validate echoed correlation ID (safety-net log, not a hard gate).
+      try {
+        const respJson = JSON.parse(text) as Record<string, unknown>;
+        const echoedId = respJson?.tbv_correlation_id;
+        if (echoedId && echoedId !== correlationId) {
+          console.warn('[TrustButVerify] Copy correlation ID mismatch', { expected: correlationId, got: echoedId });
+        }
+      } catch { /* ignore — extractCategoryOnly handles parsing */
       }
 
       let content: string | null = null;
@@ -970,18 +1008,24 @@ async function handleUpsertConversationTurns(payload: {
 
     await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, enrichedTurns);
 
-    // IMPORTANT (MV3): If we fire-and-forget, Chrome may suspend the service worker
-    // before the fetch+storage write completes, leaving categories stuck at 'pending'.
-    // Awaiting here keeps the message event alive until categorization finishes.
-    const t0 = Date.now();
-    await categorizeLatestPendingTurn(payload.threadId);
-    const dt = Date.now() - t0;
-    if (dt > 2500) {
-      console.log('[TrustButVerify] Turn categorization finished (slow):', {
-        threadId: payload.threadId,
-        ms: dt
-      });
-    }
+    // Fire-and-forget: categorise in background with keepalive.
+    // The turn is already saved above; no need to block the message handler.
+    const tid = payload.threadId;
+    void (async () => {
+      startKeepalive();
+      try {
+        const t0 = Date.now();
+        await categorizeLatestPendingTurn(tid);
+        const dt = Date.now() - t0;
+        if (dt > 2500) {
+          console.log('[TrustButVerify] Turn categorization finished (slow):', { threadId: tid, ms: dt });
+        }
+      } catch (err) {
+        console.warn('[TrustButVerify] Background turn categorization failed (non-fatal):', err);
+      } finally {
+        stopKeepalive();
+      }
+    })();
 
     flowTrace('handleUpsertConversationTurns:done', {
       threadId: payload.threadId,
@@ -1036,6 +1080,7 @@ function parseLlmCompletionPayload(text: string): string {
 async function requestTurnCategorization(turn: ConversationTurn, opts?: { temperature?: number; n_predict?: number }): Promise<string | null> {
   try {
     const prompt = buildCategoryPrompt(turn);
+    const correlationId = `turn:${turn.id}`;
     const r = await fetch(LLM2_URL, {
       method: 'POST',
       headers: {
@@ -1045,7 +1090,8 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       body: JSON.stringify({
         prompt,
         n_predict: opts?.n_predict ?? 120,
-        temperature: opts?.temperature ?? 0.0
+        temperature: opts?.temperature ?? 0.0,
+        tbv_correlation_id: correlationId
       })
     });
 
@@ -1058,6 +1104,16 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       });
       return null;
     }
+
+    // Validate echoed correlation ID (safety-net log, not a hard gate).
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const echoedId = parsed?.tbv_correlation_id;
+      if (echoedId && echoedId !== correlationId) {
+        console.warn('[TrustButVerify] Correlation ID mismatch', { expected: correlationId, got: echoedId });
+      }
+    } catch { /* ignore parse errors — parseLlmCompletionPayload handles them */ }
+
     return parseLlmCompletionPayload(text);
   } catch (error) {
     console.warn('[TrustButVerify] LLM-2 categorization request threw network error', {
@@ -1238,14 +1294,38 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           freshConvo.lastUpdatedAt = now;
           anyPatched = true;
 
-          // Keep copy activities in sync when they reference this turn.
+          console.log('[TrustButVerify] Turn category patched:', {
+            turnId: result.turnId,
+            category: result.category
+          });
+
+          // Patch linked copy activities IN THE SAME in-memory data
           if (result.category !== 'Uncategorized') {
-            await StorageManager.updateCopyCategoriesForTurn(result.turnId, result.category);
+            let copyPatchCount = 0;
+            for (const convo of freshConversations) {
+              if (!convo.copyActivities || convo.copyActivities.length === 0) continue;
+              for (let i = 0; i < convo.copyActivities.length; i++) {
+                if (convo.copyActivities[i].turnId === result.turnId) {
+                  convo.copyActivities[i] = {
+                    ...convo.copyActivities[i],
+                    copyCategory: result.category,
+                    copyCategorySource: 'turn'
+                  };
+                  copyPatchCount++;
+                }
+              }
+            }
+            console.log('[TrustButVerify] Copy activities patched for turn:', {
+              turnId: result.turnId,
+              category: result.category,
+              copyPatchCount
+            });
           }
         }
 
         if (anyPatched) {
           await chrome.storage.local.set({ conversationLogs: freshConversations });
+          console.log('[TrustButVerify] Wrote patched conversations to storage');
         }
       }
     } catch (err) {

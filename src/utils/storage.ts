@@ -434,37 +434,7 @@ export class StorageManager {
     }
   }
 
-  static async updateCopyCategoriesForTurn(turnId: string, copyCategory: string): Promise<void> {
-    if (!turnId || !copyCategory) {
-      return;
-    }
 
-    const patch: Partial<CopyActivity> = {
-      copyCategory,
-      copyCategorySource: 'turn'
-    };
-
-    const conversations = await this.getAllConversations();
-    let convoUpdated = false;
-    for (const convo of conversations) {
-      if (!convo.copyActivities || convo.copyActivities.length === 0) continue;
-      let thisConvoUpdated = false;
-      for (let i = 0; i < convo.copyActivities.length; i++) {
-        const a = convo.copyActivities[i];
-        if (a.turnId === turnId && a.copyCategorySource === 'turn') {
-          convo.copyActivities[i] = { ...a, ...patch };
-          convoUpdated = true;
-          thisConvoUpdated = true;
-        }
-      }
-      if (thisConvoUpdated) {
-        convo.lastUpdatedAt = Date.now();
-      }
-    }
-    if (convoUpdated) {
-      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
-    }
-  }
 
   /**
    * Get recent conversations with limit
