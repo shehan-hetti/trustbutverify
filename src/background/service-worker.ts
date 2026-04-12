@@ -31,7 +31,7 @@ function flowTrace(event: string, detail?: Record<string, unknown>): void {
 }
 
 // LLM-2 (CSC cloud) categorization settings (hardcoded per requirement)
-const LLM2_URL = 'http://86.50.252.163/completion';
+const LLM2_URL = 'https://llm.trustbutverify.dev/completion';
 const LLM2_USER = 'llmuser';
 const LLM2_PASS = 'Test@123';
 
