@@ -73,6 +73,38 @@
     };
   };
 
+  /**
+   * Walk up from a button/icon to find the nearest turn container element.
+   * Returns the turn container if found, otherwise the original element.
+   */
+  const resolveFromButton = (el: Element | null): Element | null => {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return el;
+    const tag = (el as HTMLElement).tagName?.toLowerCase() || '';
+    const isButtonLike = tag === 'button' || tag === 'svg' || tag === 'path'
+      || el.closest('button') !== null
+      || el.closest('[role="button"]') !== null;
+    if (!isButtonLike) return el;
+
+    // Try platform-specific turn container selectors.
+    const selectors = [
+      '[data-testid^="conversation-turn-"]',
+      'div[data-message-author-role]',
+      '.font-claude-response',
+      '[data-testid="user-message"]',
+      'model-response',
+      'message-content',
+      'div[id^="response-"]',
+      '.ds-message'
+    ];
+    for (const sel of selectors) {
+      try {
+        const container = el.closest(sel);
+        if (container) return container;
+      } catch { /* ignore */ }
+    }
+    return el;
+  };
+
   const reportCopy = (text: unknown, method: string) => {
     const normalized = safeString(text).trim();
     if (!normalized) {
@@ -81,7 +113,10 @@
 
     let descriptor: ReturnType<typeof describeElement> = null;
     try {
-      descriptor = describeElement(document.activeElement);
+      // Resolve from button/icon to the nearest turn container for better metadata.
+      const rawEl = document.activeElement;
+      const resolved = resolveFromButton(rawEl);
+      descriptor = describeElement(resolved);
     } catch (error) {
       descriptor = null;
     }

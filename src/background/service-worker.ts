@@ -1,6 +1,6 @@
 import { StorageManager } from '../utils/storage';
 import { computeReadability } from '../utils/readability-metrics';
-import { getNextNudgeQuestion } from '../nudges/nudge-selector';
+import { getActiveNudgeQuestions } from '../nudges/nudge-questions';
 import { verifyParticipant as apiVerifyParticipant, syncData as apiSyncData } from '../utils/backend-api';
 import { evaluateSyncNeed } from './sync-policy';
 import type {
@@ -31,7 +31,7 @@ function flowTrace(event: string, detail?: Record<string, unknown>): void {
 }
 
 // LLM-2 (CSC cloud) categorization settings (hardcoded per requirement)
-const LLM2_URL = 'http://86.50.252.163/completion';
+const LLM2_URL = 'https://llm.trustbutverify.dev/completion';
 const LLM2_USER = 'llmuser';
 const LLM2_PASS = 'Test@123';
 
@@ -46,6 +46,38 @@ const COPY_CATEGORIZATION_MAX_ATTEMPTS = 3;
 
 const AUTO_SYNC_ALARM = 'tbv:auto-sync';
 const AUTO_SYNC_INTERVAL_MINUTES = 5;
+
+// ── Keepalive (prevents 30 s MV3 worker suspension during long operations) ──
+// Reference-counted: multiple concurrent fire-and-forget operations can each
+// call startKeepalive/stopKeepalive without stomping on each other.
+const KEEPALIVE_ALARM = 'tbv:keepalive';
+let keepaliveRefCount = 0;
+
+function startKeepalive(): void {
+  keepaliveRefCount++;
+  if (keepaliveRefCount === 1) {
+    try {
+      // Fire every ~24 s (< 30 s Chrome suspension timer).
+      chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
+    } catch {
+      // Alarms unavailable — best-effort only.
+    }
+  }
+}
+
+function stopKeepalive(): void {
+  keepaliveRefCount = Math.max(0, keepaliveRefCount - 1);
+  if (keepaliveRefCount === 0) {
+    try {
+      chrome.alarms.clear(KEEPALIVE_ALARM);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// ── Sync checkpoint (resume interrupted syncs per-conversation) ──
+const SYNC_CHECKPOINT_KEY = 'syncCheckpointConvId';
 
 type PendingCopyCategorizationItem = {
   id: string;
@@ -65,7 +97,7 @@ chrome.runtime.onMessage.addListener(
           error: error.message
         });
       });
-    
+
     // Return true to indicate async response
     return true;
   }
@@ -85,25 +117,23 @@ async function handleMessage(
   switch (message.type) {
     case 'COPY_EVENT':
       return handleCopyEvent(message.data as CopyActivity, sender);
-    
+
     case 'GET_ACTIVITIES':
       return handleGetActivities((message.data as { limit?: number })?.limit);
-    
+
     case 'CLEAR_ACTIVITIES':
       return handleClearActivities();
-    
-    case 'CONVERSATION_EVENT':
-      return handleConversationEvent(message.data as any);
+
     case 'UPSERT_CONVERSATION_TURNS':
       return handleUpsertConversationTurns(message.data as {
         threadId: string;
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
       }, sender);
-    
+
     case 'GET_CONVERSATIONS':
       return handleGetConversations(message.data as GetConversationsParams | undefined);
-    
+
     case 'CLEAR_CONVERSATIONS':
       return handleClearConversations();
 
@@ -112,6 +142,9 @@ async function handleMessage(
 
     case 'SAVE_NUDGE_EVENT':
       return handleSaveNudgeEvent(message.data as import('../types').NudgeEvent);
+
+    case 'SAVE_NUDGE_EVENTS_BATCH':
+      return handleSaveNudgeEventsBatch(message.data as import('../types').NudgeEvent[]);
 
     case 'GET_NUDGE_STATS':
       return handleGetNudgeStats();
@@ -124,7 +157,10 @@ async function handleMessage(
 
     case 'GET_SYNC_STATUS':
       return handleGetSyncStatus();
-    
+
+    case 'NUDGE_SESSION_COMPLETE':
+      return handleNudgeSessionComplete(message.data as { fullSkip: boolean, triggerType: import('../types').NudgeTriggerType });
+
     default:
       return {
         success: false,
@@ -162,7 +198,9 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
 
     // Recovery path: if turn capture missed but copy contains a paired prompt + full response,
     // infer and upsert a turn from copy metadata, then rematch.
+    let backfilledConvId: string | undefined;
     if (!enriched.turnId) {
+      backfilledConvId = enriched.conversationId;
       await tryBackfillTurnFromCopy(enriched);
       enriched = await enrichCopyActivity(enriched);
     }
@@ -192,7 +230,7 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       copyCategory: enriched.copyCategory || null,
       textLength: enriched.textLength
     });
-    console.log('[TrustButVerify] Copy activity saved:', {
+    console.debug('[TrustButVerify] Copy activity saved:', {
       domain: enriched.domain,
       length: enriched.textLength,
       trigger: enriched.trigger?.method || enriched.trigger?.type,
@@ -209,7 +247,22 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
     ) {
       void trySendCopyNudge(sender.tab?.id, enriched);
     }
-    
+
+    // ── Background categorisation for backfilled turns ──
+    // Fired AFTER copy is saved so categorizeLatestPendingTurn can find and
+    if (backfilledConvId) {
+      void (async () => {
+        startKeepalive();
+        try {
+          await categorizeLatestPendingTurn(backfilledConvId!);
+        } catch (err) {
+          console.warn('[TrustButVerify] Background backfill categorization failed (non-fatal):', err);
+        } finally {
+          stopKeepalive();
+        }
+      })();
+    }
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error saving activity:', error);
@@ -342,8 +395,8 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
     [inferredTurn]
   );
 
-  // Keep categories aligned with the rest of the pipeline.
-  await categorizeLatestPendingTurn(activity.conversationId);
+  // Categorisation is deferred to handleCopyEvent (after copy is saved)
+  // so that categorizeLatestPendingTurn can patch the linked copy activity.
   flowTrace('tryBackfillTurnFromCopy:created', {
     id: activity.id,
     conversationId: activity.conversationId,
@@ -399,6 +452,8 @@ try {
         void processCopyCategorizationQueue();
       } else if (alarm.name === AUTO_SYNC_ALARM) {
         void runAutoSync();
+      } else if (alarm.name === KEEPALIVE_ALARM) {
+        // No-op: receiving this alarm prevents the service worker from being suspended.
       }
     });
   } else {
@@ -417,6 +472,7 @@ async function runAutoSync(): Promise<void> {
 }
 
 async function processCopyCategorizationQueue(): Promise<void> {
+  startKeepalive();
   try {
     const current = await chrome.storage.local.get(COPY_CATEGORIZATION_QUEUE_KEY);
     const queue = (current[COPY_CATEGORIZATION_QUEUE_KEY] as PendingCopyCategorizationItem[] | undefined) ?? [];
@@ -498,6 +554,8 @@ async function processCopyCategorizationQueue(): Promise<void> {
     }
   } catch (err) {
     console.warn('[TrustButVerify] Failed processing copy categorization queue (non-fatal):', err);
+  } finally {
+    stopKeepalive();
   }
 }
 
@@ -734,14 +792,21 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     turnSide: activity.turnSide || bestSide,
     bestScore,
     bestPrimaryScore,
-    bestPromptScore
+    bestPromptScore,
+    turnCategory: bestTurn.category || 'pending'
   });
+
+  // Don't inherit "pending" — the turn's LLM-2 categorization hasn't finished.
+  // Leave copyCategory undefined so enqueueCopyCategorizationIfNeeded() picks it
+  // up for deferred re-categorization once the turn has a real category.
+  const hasFinalCategory = bestTurn.category && bestTurn.category !== 'pending';
+
   return {
     ...activity,
     turnId: bestTurn.id,
     turnSide: activity.turnSide || bestSide,
-    copyCategory: bestTurn.category || 'pending',
-    copyCategorySource: 'turn'
+    copyCategory: hasFinalCategory ? bestTurn.category : undefined,
+    copyCategorySource: hasFinalCategory ? 'turn' : undefined
   };
 }
 
@@ -805,6 +870,7 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
   const task = (async () => {
     try {
       const prompt = buildCopyCategoryPrompt(activity);
+      const correlationId = `copy:${activity.id}`;
       const r = await fetch(LLM2_URL, {
         method: 'POST',
         headers: {
@@ -814,7 +880,8 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
         body: JSON.stringify({
           prompt,
           n_predict: 60,
-          temperature: 0.2
+          temperature: 0.2,
+          tbv_correlation_id: correlationId
         })
       });
 
@@ -826,6 +893,16 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
           bodyPreview: text.slice(0, 400)
         });
         return;
+      }
+
+      // Validate echoed correlation ID (safety-net log, not a hard gate).
+      try {
+        const respJson = JSON.parse(text) as Record<string, unknown>;
+        const echoedId = respJson?.tbv_correlation_id;
+        if (echoedId && echoedId !== correlationId) {
+          console.warn('[TrustButVerify] Copy correlation ID mismatch', { expected: correlationId, got: echoedId });
+        }
+      } catch { /* ignore — extractCategoryOnly handles parsing */
       }
 
       let content: string | null = null;
@@ -868,10 +945,10 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
  */
 async function handleGetActivities(limit?: number): Promise<MessageResponse> {
   try {
-    const activities = limit 
+    const activities = limit
       ? await StorageManager.getRecentActivities(limit)
       : await StorageManager.getAllActivities();
-    
+
     return {
       success: true,
       data: activities
@@ -888,8 +965,8 @@ async function handleGetActivities(limit?: number): Promise<MessageResponse> {
 async function handleClearActivities(): Promise<MessageResponse> {
   try {
     await StorageManager.clearAllActivities();
-    console.log('[TrustButVerify] All activities cleared');
-    
+    console.debug('[TrustButVerify] All activities cleared');
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error clearing activities:', error);
@@ -897,61 +974,7 @@ async function handleClearActivities(): Promise<MessageResponse> {
   }
 }
 
-/**
- * Handle conversation event from content script
- */
-async function handleConversationEvent(conversation: any): Promise<MessageResponse> {
-  try {
-    // Backward compatibility: if an old-style conversation arrives, convert to turns
-    if (conversation && conversation.userPrompt && conversation.llmResponse) {
-      const threadId = deriveThreadIdFromUrl(conversation.url, conversation.domain);
-      const promptTs = conversation.timestamp - (conversation.responseTime || 0);
-      const responseTs = conversation.timestamp;
-      const turns: ConversationTurn[] = [
-        {
-          id: `${responseTs}-turn`,
-          ts: responseTs,
-          responseTimeMs: conversation.responseTime || undefined,
-          prompt: {
-            text: conversation.userPrompt,
-            textLength: conversation.userPrompt.length,
-            ts: promptTs
-          },
-          response: {
-            text: conversation.llmResponse,
-            textLength: conversation.llmResponse.length,
-            ts: responseTs
-          }
-        }
-      ];
 
-      await StorageManager.upsertConversationTurns(threadId, {
-        id: threadId,
-        url: conversation.url,
-        domain: conversation.domain,
-        title: conversation.metadata?.conversationTitle,
-        metadata: { messageCount: conversation.metadata?.messageCount }
-      }, turns);
-
-      console.log('[TrustButVerify] Conversation upserted (legacy payload):', {
-        domain: conversation.domain,
-        turns: turns.length
-      });
-      return { success: true };
-    }
-
-    // If new format accidentally sent here, try to upsert
-    if (conversation && conversation.id && Array.isArray(conversation.turns)) {
-      await StorageManager.upsertConversationTurns(conversation.id, conversation, conversation.turns);
-      return { success: true };
-    }
-
-    return { success: true };
-  } catch (error) {
-    console.error('[TrustButVerify] Error saving conversation:', error);
-    throw error;
-  }
-}
 
 async function handleUpsertConversationTurns(payload: {
   threadId: string;
@@ -985,18 +1008,24 @@ async function handleUpsertConversationTurns(payload: {
 
     await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, enrichedTurns);
 
-    // IMPORTANT (MV3): If we fire-and-forget, Chrome may suspend the service worker
-    // before the fetch+storage write completes, leaving categories stuck at 'pending'.
-    // Awaiting here keeps the message event alive until categorization finishes.
-    const t0 = Date.now();
-    await categorizeLatestPendingTurn(payload.threadId);
-    const dt = Date.now() - t0;
-    if (dt > 2500) {
-      console.log('[TrustButVerify] Turn categorization finished (slow):', {
-        threadId: payload.threadId,
-        ms: dt
-      });
-    }
+    // Fire-and-forget: categorise in background with keepalive.
+    // The turn is already saved above; no need to block the message handler.
+    const tid = payload.threadId;
+    void (async () => {
+      startKeepalive();
+      try {
+        const t0 = Date.now();
+        await categorizeLatestPendingTurn(tid);
+        const dt = Date.now() - t0;
+        if (dt > 2500) {
+          console.log('[TrustButVerify] Turn categorization finished (slow):', { threadId: tid, ms: dt });
+        }
+      } catch (err) {
+        console.warn('[TrustButVerify] Background turn categorization failed (non-fatal):', err);
+      } finally {
+        stopKeepalive();
+      }
+    })();
 
     flowTrace('handleUpsertConversationTurns:done', {
       threadId: payload.threadId,
@@ -1051,6 +1080,7 @@ function parseLlmCompletionPayload(text: string): string {
 async function requestTurnCategorization(turn: ConversationTurn, opts?: { temperature?: number; n_predict?: number }): Promise<string | null> {
   try {
     const prompt = buildCategoryPrompt(turn);
+    const correlationId = `turn:${turn.id}`;
     const r = await fetch(LLM2_URL, {
       method: 'POST',
       headers: {
@@ -1060,7 +1090,8 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       body: JSON.stringify({
         prompt,
         n_predict: opts?.n_predict ?? 120,
-        temperature: opts?.temperature ?? 0.0
+        temperature: opts?.temperature ?? 0.0,
+        tbv_correlation_id: correlationId
       })
     });
 
@@ -1073,6 +1104,16 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       });
       return null;
     }
+
+    // Validate echoed correlation ID (safety-net log, not a hard gate).
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const echoedId = parsed?.tbv_correlation_id;
+      if (echoedId && echoedId !== correlationId) {
+        console.warn('[TrustButVerify] Correlation ID mismatch', { expected: correlationId, got: echoedId });
+      }
+    } catch { /* ignore parse errors — parseLlmCompletionPayload handles them */ }
+
     return parseLlmCompletionPayload(text);
   } catch (error) {
     console.warn('[TrustButVerify] LLM-2 categorization request threw network error', {
@@ -1172,9 +1213,16 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
       }
 
       const maxToProcess = 2;
-      const now = Date.now();
 
-      for (const { t: turn, idx } of pending.slice(0, maxToProcess)) {
+      // Collect categorization results first, then batch-write to storage.
+      // This avoids holding a stale snapshot during multi-second LLM calls.
+      const results: Array<{
+        turnId: string;
+        category: string;
+        summary: string;
+      }> = [];
+
+      for (const { t: turn } of pending.slice(0, maxToProcess)) {
         if (!turn || turn.category !== 'pending') {
           continue;
         }
@@ -1194,23 +1242,92 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
             turnId: turn.id,
             contentPreview: (completion ?? '').slice(0, 400)
           });
-
-          // Avoid leaving 'pending' forever. This preserves flow without breaking matching.
-          convo.turns[idx].category = 'Uncategorized';
-          convo.turns[idx].summary = 'LLM-2 returned invalid categorization format.';
-          convo.lastUpdatedAt = now;
+          results.push({
+            turnId: turn.id,
+            category: 'Uncategorized',
+            summary: 'LLM-2 returned invalid categorization format.'
+          });
           continue;
         }
 
-        convo.turns[idx].category = extracted.category;
-        convo.turns[idx].summary = extracted.summary;
-        convo.lastUpdatedAt = now;
-
-        // Keep copy activities in sync when they reference this turn.
-        await StorageManager.updateCopyCategoriesForTurn(convo.turns[idx].id, extracted.category);
+        results.push({
+          turnId: turn.id,
+          category: extracted.category,
+          summary: extracted.summary
+        });
       }
 
-      await chrome.storage.local.set({ conversationLogs: conversations });
+      // ── Atomic re-read → patch → write ──────────────────────────────
+      // Re-read the LATEST state from storage to avoid overwriting any
+      // concurrent writes (new turns, copy activities, etc.) that happened
+      // while the LLM calls were in flight.
+      if (results.length > 0) {
+        const freshConversations = await StorageManager.getAllConversations();
+        const freshConvo = freshConversations.find(c => c.id === threadId);
+        if (!freshConvo || !Array.isArray(freshConvo.turns)) {
+          return;
+        }
+
+        const now = Date.now();
+        let anyPatched = false;
+
+        for (const result of results) {
+          const turnIndex = freshConvo.turns.findIndex(t => t.id === result.turnId);
+          if (turnIndex === -1) {
+            continue;
+          }
+
+          // Only patch if the turn is still pending — another code path
+          // (e.g. copy enrichment) may have already categorized it.
+          const currentCategory = freshConvo.turns[turnIndex].category;
+          if (currentCategory && currentCategory !== 'pending') {
+            flowTrace('categorizeLatestPendingTurn:skipAlreadyCategorized', {
+              threadId,
+              turnId: result.turnId,
+              currentCategory
+            });
+            continue;
+          }
+
+          freshConvo.turns[turnIndex].category = result.category;
+          freshConvo.turns[turnIndex].summary = result.summary;
+          freshConvo.lastUpdatedAt = now;
+          anyPatched = true;
+
+          console.log('[TrustButVerify] Turn category patched:', {
+            turnId: result.turnId,
+            category: result.category
+          });
+
+          // Patch linked copy activities IN THE SAME in-memory data
+          if (result.category !== 'Uncategorized') {
+            let copyPatchCount = 0;
+            for (const convo of freshConversations) {
+              if (!convo.copyActivities || convo.copyActivities.length === 0) continue;
+              for (let i = 0; i < convo.copyActivities.length; i++) {
+                if (convo.copyActivities[i].turnId === result.turnId) {
+                  convo.copyActivities[i] = {
+                    ...convo.copyActivities[i],
+                    copyCategory: result.category,
+                    copyCategorySource: 'turn'
+                  };
+                  copyPatchCount++;
+                }
+              }
+            }
+            console.log('[TrustButVerify] Copy activities patched for turn:', {
+              turnId: result.turnId,
+              category: result.category,
+              copyPatchCount
+            });
+          }
+        }
+
+        if (anyPatched) {
+          await chrome.storage.local.set({ conversationLogs: freshConversations });
+          console.log('[TrustButVerify] Wrote patched conversations to storage');
+        }
+      }
     } catch (err) {
       console.warn('[TrustButVerify] LLM-2 categorization failed (non-fatal):', err);
     }
@@ -1249,7 +1366,7 @@ async function handleGetConversations(params?: GetConversationsParams): Promise<
         .join('\n');
       return matchesDomain && haystack.includes(searchTerm);
     });
-    
+
     return {
       success: true,
       data: filtered
@@ -1283,7 +1400,7 @@ async function handleClearConversations(): Promise<MessageResponse> {
   try {
     await StorageManager.clearAllConversations();
     console.log('[TrustButVerify] All conversations cleared');
-    
+
     return { success: true };
   } catch (error) {
     console.error('[TrustButVerify] Error clearing conversations:', error);
@@ -1312,6 +1429,20 @@ async function handleSaveNudgeEvent(event: import('../types').NudgeEvent): Promi
   }
 }
 
+async function handleSaveNudgeEventsBatch(events: import('../types').NudgeEvent[]): Promise<MessageResponse> {
+  try {
+    await StorageManager.saveNudgeEventsBatch(events);
+    flowTrace('nudge:batch-saved', {
+      count: events.length,
+      ids: events.map((e) => e.id)
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error saving nudge events batch:', error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
 async function handleGetNudgeStats(): Promise<MessageResponse> {
   try {
     const stats = await StorageManager.getNudgeAggregateStats();
@@ -1336,18 +1467,21 @@ const NUDGE_COPY_MIN_CHARS = 40;
 function sendNudgeToTab(
   tabId: number,
   data: {
-    questionId: string;
-    questionText: string;
-    answerMode: string;
     triggerType: string;
     conversationId?: string;
     turnId?: string;
     copyActivityId?: string;
     timeoutMs?: number;
     position?: string;
-    ratingLabels?: { low: string; high: string };
-    yesLabel?: string;
-    questionTags?: string[];
+    textPreview?: string;
+    questions: {
+      questionId: string;
+      questionText: string;
+      answerMode: string;
+      ratingLabels?: { low: string; high: string };
+      yesLabel?: string;
+      questionTags?: string[];
+    }[];
   }
 ): void {
   chrome.tabs.sendMessage(
@@ -1363,40 +1497,109 @@ function sendNudgeToTab(
   );
 }
 
-/**
- * Try to fire a copy-triggered nudge after a qualifying copy event.
- */
+const NUDGE_COOLDOWN_KEY = 'nudgeCooldownState';
+
+interface NudgeCooldownState {
+  continuousSkips: number;
+  pausedUntil: number;
+}
+
+async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType: import('../types').NudgeTriggerType }): Promise<MessageResponse> {
+  if (data.triggerType !== 'copy') {
+    return { success: true };
+  }
+
+  try {
+    const stateObj = await chrome.storage.local.get(NUDGE_COOLDOWN_KEY);
+    const state: NudgeCooldownState = stateObj[NUDGE_COOLDOWN_KEY] || { continuousSkips: 0, pausedUntil: 0 };
+
+    if (data.fullSkip) {
+      state.continuousSkips += 1;
+      console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
+      if (state.continuousSkips >= 3) {
+        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 1 minute
+        console.debug('[TrustButVerify] Nudges paused for 1 minute due to 3 continuous skips');
+      }
+    } else {
+      if (state.continuousSkips > 0) {
+        console.debug('[TrustButVerify] User answered a question, resetting continuous skips count to 0');
+      }
+      state.continuousSkips = 0;
+    }
+
+    await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
+    return { success: true };
+  } catch (error) {
+    console.error('[TrustButVerify] Error handling nudge session complete:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
 async function trySendCopyNudge(
   tabId: number | undefined,
   activity: CopyActivity
 ): Promise<void> {
+  console.debug('[TrustButVerify] trySendCopyNudge entered', { tabId, domain: activity.domain, textLength: activity.textLength });
+
   if (!tabId) {
+    console.debug('[TrustButVerify] trySendCopyNudge returning early - NO TAB ID');
     return;
   }
   try {
-    const question = await getNextNudgeQuestion('copy');
-    if (!question) {
+    const stateObj = await chrome.storage.local.get(NUDGE_COOLDOWN_KEY);
+    const state: NudgeCooldownState = stateObj[NUDGE_COOLDOWN_KEY] || { continuousSkips: 0, pausedUntil: 0 };
+
+    console.debug('[TrustButVerify] Cooldown state:', state);
+
+    if (Date.now() < state.pausedUntil) {
+      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.');
       return;
     }
+
+    // Pause expired → reset the skip counter so the user gets a fresh 3-skip allowance.
+    if (state.continuousSkips >= 3) {
+      state.continuousSkips = 0;
+      state.pausedUntil = 0;
+      await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
+      console.debug('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
+    }
+
+    const questions = getActiveNudgeQuestions('copy');
+    console.debug('[TrustButVerify] Fetched questions array length:', questions?.length);
+
+    if (!questions || questions.length === 0) {
+      console.debug('[TrustButVerify] trySendCopyNudge returning early - NO QUESTIONS');
+      return;
+    }
+
     flowTrace('nudge:copy-trigger', {
       tabId,
-      questionId: question.id,
+      questionCount: questions.length,
       copyActivityId: activity.id,
       textLength: activity.textLength
     });
+
+    const formattedQuestions = questions.map(q => ({
+      questionId: q.id,
+      questionText: q.text,
+      answerMode: q.answerMode,
+      ratingLabels: q.ratingLabels,
+      yesLabel: q.yesLabel,
+      questionTags: q.tags ? Array.from(new Set(q.tags)) : []
+    }));
+
+    const previewWords = activity.copiedText.split(/\s+/).slice(0, 15).join(' ');
+    const textPreview = previewWords.length < activity.copiedText.length ? previewWords + '...' : previewWords;
+
     sendNudgeToTab(tabId, {
-      questionId: question.id,
-      questionText: question.text,
-      answerMode: question.answerMode,
       triggerType: 'copy',
       conversationId: activity.conversationId,
       turnId: activity.turnId,
       copyActivityId: activity.id,
-      timeoutMs: 60_000,
+      timeoutMs: 120_000,
       position: 'bottom-right',
-      ratingLabels: question.ratingLabels,
-      yesLabel: question.yesLabel,
-      questionTags: question.tags ? Array.from(new Set(question.tags)) : []
+      textPreview,
+      questions: formattedQuestions
     });
   } catch (error) {
     console.debug('[TrustButVerify] Copy nudge failed:', error);
@@ -1421,6 +1624,11 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[TrustButVerify] Extension started (browser startup)');
+  reinjectContentScripts();
+});
+
 async function reinjectContentScripts(): Promise<void> {
   const LLM_PATTERNS = [
     'https://chatgpt.com/*',
@@ -1440,7 +1648,7 @@ async function reinjectContentScripts(): Promise<void> {
       if (!tab.id) continue;
       try {
         await chrome.scripting.executeScript({
-          target: { tabId: tab.id, allFrames: true },
+          target: { tabId: tab.id, allFrames: false },
           files: ['content/content-script.js']
         });
         console.log('[TrustButVerify] Re-injected content script into tab:', tab.id, tab.url);
@@ -1454,37 +1662,11 @@ async function reinjectContentScripts(): Promise<void> {
   }
 }
 
-// Also check on service-worker startup (browser restart)
-routePopup();
+// Also check on service-worker startup (browser restart).
+// Delay to ensure storage APIs are ready after rapid reloads.
+setTimeout(() => routePopup(), 500);
 
-function deriveThreadIdFromUrl(url: string, domain: string): string {
-  try {
-    const u = new URL(url);
-    const path = u.pathname;
 
-    // ChatGPT
-    const chatgpt = path.match(/\/c\/([^/?#]+)/);
-    if (chatgpt) return `${domain}::${chatgpt[1]}`;
-
-    // Gemini
-    const gemApp = path.match(/\/app\/([^/?#]+)/);
-    if (gemApp) return `${domain}::${gemApp[1]}`;
-
-    // Grok
-    const grokC = path.match(/\/c\/([^/?#]+)/);
-    if (grokC) return `${domain}::${grokC[1]}`;
-
-    // Fallback: hash origin+path
-    const key = `${u.origin}${u.pathname}`;
-    let hash = 0;
-    for (let i = 0; i < key.length; i++) {
-      hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-    }
-    return `${domain}::h${hash.toString(36)}`;
-  } catch {
-    return `${domain}::unknown`;
-  }
-}
 
 /* ------------------------------------------------------------------ */
 /*  Popup routing: registration vs main                                */
@@ -1549,9 +1731,7 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     const syncDecision = evaluateSyncNeed(conversations, nudgeEvents, lastSyncAt);
     if (!syncDecision.shouldSync) {
       await StorageManager.setSyncStatus('idle');
-      flowTrace(`sync:skipped-${syncDecision.reason}`, {
-        lastSyncAt
-      });
+      flowTrace(`sync:skipped-${syncDecision.reason}`, { lastSyncAt });
       return {
         success: true,
         data: {
@@ -1569,14 +1749,59 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     await StorageManager.setSyncStatus('syncing');
 
     // Build the sync payload — shape it to match backend SyncRequest
-    const payload = buildSyncPayload(conversations, nudgeEvents);
+    const { conversations: syncConversations, nudgeEvents: syncNudgeEvents } =
+      buildSyncPayload(conversations, nudgeEvents);
 
     flowTrace('sync:start', {
-      conversations: payload.conversations.length,
-      nudgeEvents: payload.nudgeEvents.length
+      conversations: syncConversations.length,
+      nudgeEvents: syncNudgeEvents.length
     });
 
-    const result = await apiSyncData(uuid, payload);
+    // ── Checkpoint-based upload: resume from last successfully synced conversation ──
+    // On interruption (worker killed / network error), the next sync run picks up
+    // from the last saved checkpoint instead of restarting from scratch.
+    const cpResult = await chrome.storage.local.get(SYNC_CHECKPOINT_KEY);
+    const checkpointId = cpResult[SYNC_CHECKPOINT_KEY] as string | undefined;
+    const startIdx = checkpointId
+      ? Math.max(0, syncConversations.findIndex((c) => c.id === checkpointId) + 1)
+      : 0;
+
+    if (startIdx > 0) {
+      flowTrace('sync:resuming-from-checkpoint', { checkpointId, startIdx });
+    }
+
+    // Accumulate totals across all partial uploads.
+    let totalNewConversations = 0;
+    let totalUpdatedConversations = 0;
+    let totalNewTurns = 0;
+    let totalNewCopyActivities = 0;
+    let totalNewNudgeEvents = 0;
+
+    startKeepalive();
+    try {
+      // Upload one conversation at a time so we can checkpoint after each.
+      for (let i = startIdx; i < syncConversations.length; i++) {
+        const partial = await apiSyncData(uuid, {
+          conversations: [syncConversations[i]],
+          nudgeEvents: []
+        });
+        totalNewConversations += (partial.newConversations || 0);
+        totalUpdatedConversations += (partial.updatedConversations || 0);
+        totalNewTurns += (partial.newTurns || 0);
+        totalNewCopyActivities += (partial.newCopyActivities || 0);
+        // Save checkpoint after each successful conversation upload.
+        await chrome.storage.local.set({ [SYNC_CHECKPOINT_KEY]: syncConversations[i].id });
+      }
+
+      // All conversations synced — now sync nudge events.
+      const nudgeResult = await apiSyncData(uuid, { conversations: [], nudgeEvents: syncNudgeEvents });
+      totalNewNudgeEvents = (nudgeResult.newNudgeEvents || 0);
+
+      // Success: clear the checkpoint.
+      await chrome.storage.local.remove(SYNC_CHECKPOINT_KEY);
+    } finally {
+      stopKeepalive();
+    }
 
     const syncedAt = Date.now();
     await StorageManager.setLastSyncAt(syncedAt);
@@ -1585,11 +1810,11 @@ async function handleTriggerSync(): Promise<MessageResponse> {
 
     const syncResult: SyncResult = {
       success: true,
-      newConversations: result.newConversations,
-      updatedConversations: result.updatedConversations,
-      newTurns: result.newTurns,
-      newCopyActivities: result.newCopyActivities,
-      newNudgeEvents: result.newNudgeEvents,
+      newConversations: totalNewConversations,
+      updatedConversations: totalUpdatedConversations,
+      newTurns: totalNewTurns,
+      newCopyActivities: totalNewCopyActivities,
+      newNudgeEvents: totalNewNudgeEvents,
       syncedAt
     };
 
@@ -1599,6 +1824,7 @@ async function handleTriggerSync(): Promise<MessageResponse> {
     await StorageManager.setSyncStatus('error');
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[TrustButVerify] Sync failed:', msg);
+    // Note: checkpoint is intentionally NOT cleared on error, so the next run can resume.
     return {
       success: false,
       data: {

@@ -245,6 +245,8 @@ export interface NudgeEvent {
   response: NudgeResponseValue;
   responseTimeMs: number;
   dismissedBy: 'answer' | 'skip' | 'close' | 'timeout' | 'replaced';
+  /** True when the user changed their initial answer before finishing the session. */
+  edited?: boolean;
 }
 
 export interface NudgeAggregateStats {
@@ -296,28 +298,31 @@ export interface MessagePayload {
     | 'COPY_EVENT'
     | 'GET_ACTIVITIES'
     | 'CLEAR_ACTIVITIES'
-    | 'CONVERSATION_EVENT'
     | 'UPSERT_CONVERSATION_TURNS'
     | 'GET_CONVERSATIONS'
     | 'CLEAR_CONVERSATIONS'
     | 'GET_ANALYTICS'
     | 'SAVE_NUDGE_EVENT'
+    | 'SAVE_NUDGE_EVENTS_BATCH'
     | 'GET_NUDGE_STATS'
     | 'VERIFY_PARTICIPANT'
     | 'TRIGGER_SYNC'
-    | 'GET_SYNC_STATUS';
+    | 'GET_SYNC_STATUS'
+    | 'NUDGE_SESSION_COMPLETE';
   data?:
     | CopyActivity
     | ConversationLog
     | { limit?: number }
     | GetConversationsParams
     | NudgeEvent
+    | NudgeEvent[]
     | {
         threadId: string;
         threadInfo?: Partial<ConversationLog>;
         turns: ConversationTurn[];
       }
-    | { uuid: string };
+    | { uuid: string }
+    | { fullSkip: boolean; triggerType: NudgeTriggerType };
 }
 
 export interface MessageResponse {

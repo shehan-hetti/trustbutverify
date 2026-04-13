@@ -21,14 +21,18 @@ class ActivityTracker {
   private nudgeOverlay: NudgeOverlay | null = null;
   private lastInteractedElement: HTMLElement | null = null;
   private extensionContextInvalidated = false;
-  private readonly copySignatureCache = new Map<string, number>();
-  private readonly nudgeEventIdCollisions = new Map<string, number>();
+  private reconnectTimer: number | null = null;
+  private copySignatureCache = new Map<string, number>();
+  private nudgeEventIdCollisions = new Map<string, number>();
+  private flushIntervalTimer: number | null = null;
   private static readonly COPY_SIGNATURE_TTL = 2500;
   private static readonly PROGRAMMATIC_COPY_MESSAGE = 'TBV_PROGRAMMATIC_COPY';
   private static readonly MAX_CONTAINER_TEXT_CHARS = 20000;
   private static readonly MAX_PAIRED_PROMPT_CHARS = 20000;
   private static readonly CHAT_ACTIVITY_EVENT = 'tbv:chat-activity';
-  private static readonly NUDGE_TIMEOUT_MS = 60_000;
+  private static readonly NUDGE_TIMEOUT_MS = 120_000;
+
+  private readonly boundHandleCopy = this.handleCopy.bind(this);
 
   private readonly handleRuntimeMessage = (
     message: unknown,
@@ -38,18 +42,21 @@ class ActivityTracker {
     const payload = (message || {}) as {
       type?: string;
       data?: {
-        questionId?: string;
-        questionText?: string;
-        answerMode?: NudgeAnswerMode;
         triggerType?: NudgeTriggerType;
         conversationId?: string;
         turnId?: string;
         copyActivityId?: string;
         timeoutMs?: number;
         position?: NudgeOverlayPosition;
-        ratingLabels?: { low: string; high: string };
-        yesLabel?: string;
-        questionTags?: string[];
+        textPreview?: string;
+        questions?: {
+          questionId: string;
+          questionText: string;
+          answerMode: NudgeAnswerMode;
+          ratingLabels?: { low: string; high: string };
+          yesLabel?: string;
+          questionTags?: string[];
+        }[];
       };
     };
 
@@ -64,25 +71,21 @@ class ActivityTracker {
       }
 
       const data = payload.data;
-      if (!data || !data.questionId || !data.questionText || !data.answerMode || !data.triggerType) {
+      if (!data || !data.triggerType || !data.questions || data.questions.length === 0) {
         console.warn('[TrustButVerify] Invalid nudge payload:', data);
         sendResponse({ success: false, error: 'Invalid nudge payload' });
         return;
       }
 
       this.showNudgeOverlay({
-        questionId: data.questionId,
-        questionText: data.questionText,
-        answerMode: data.answerMode,
         triggerType: data.triggerType,
         conversationId: data.conversationId,
         turnId: data.turnId,
         copyActivityId: data.copyActivityId,
         timeoutMs: data.timeoutMs,
         position: data.position,
-        ratingLabels: data.ratingLabels,
-        yesLabel: data.yesLabel,
-        questionTags: data.questionTags
+        textPreview: data.textPreview,
+        questions: data.questions
       });
       sendResponse({ success: true });
       return;
@@ -148,7 +151,25 @@ class ActivityTracker {
 
 
 
+  private readonly _instanceId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  private static readonly STAMP_KEY = 'tbv_active_instance';
+
   constructor() {
+    // Takeover: if a previous instance exists in this exact same isolated world, tear it down
+    const prev = (window as any).__tbv_active_tracker as ActivityTracker | undefined;
+    if (prev && typeof prev.teardown === 'function') {
+      try { prev.teardown(); } catch { /* ignore */ }
+    }
+    (window as any).__tbv_active_tracker = this;
+
+    // Stamp sessionStorage so ALL content-script worlds know who's the current owner.
+    // sessionStorage is shared across isolated worlds (like the DOM) but unlike DOM
+    // attributes it cannot be stripped by frameworks (e.g. ChatGPT's Next.js removes
+    // custom data-* attributes from <html> during hydration).
+    try {
+      sessionStorage.setItem(ActivityTracker.STAMP_KEY, this._instanceId);
+    } catch { /* sessionStorage unavailable — isActiveInstance will fall back to true */ }
+
     this.domain = window.location.hostname;
     this.conversationDetector = new ConversationDetector(this.domain);
     this.init();
@@ -163,7 +184,7 @@ class ActivityTracker {
     this.trackInteractionTargets();
 
     // Initialize copy tracking
-    document.addEventListener('copy', this.handleCopy.bind(this));
+    document.addEventListener('copy', this.boundHandleCopy);
     this.setupProgrammaticCopyTracking();
     
     // Initialize conversation tracking
@@ -179,6 +200,12 @@ class ActivityTracker {
       this.nudgeOverlay?.dispose();
       this.nudgeOverlay = null;
     });
+
+    // Flush any events that were buffered during a prior context invalidation.
+    void this.flushPendingEvents();
+
+    // Periodically flush any orphaned pending events (defense-in-depth)
+    this.flushIntervalTimer = window.setInterval(() => void this.flushPendingEvents(), 30_000);
   }
 
   private initNudgeOverlay(): void {
@@ -189,6 +216,8 @@ class ActivityTracker {
     try {
       this.nudgeOverlay = new NudgeOverlay();
       this.nudgeOverlay.setOnResolve((result) => this.handleNudgeResolution(result));
+      this.nudgeOverlay.setOnBatchResolve((results) => this.handleNudgeBatchResolution(results));
+      this.nudgeOverlay.setOnSessionComplete((fullSkip, triggerType) => this.handleNudgeSessionComplete(fullSkip, triggerType));
     } catch (error) {
       console.debug('[TrustButVerify] Nudge overlay init failed:', error);
       this.nudgeOverlay = null;
@@ -202,14 +231,25 @@ class ActivityTracker {
       return;
     }
 
-    console.log('[TrustButVerify] Showing nudge overlay:', data.questionId, data.questionText);
+    console.debug('[TrustButVerify] Showing nudge overlay with multiple questions');
     this.nudgeOverlay.show({
       ...data,
       timeoutMs: data.timeoutMs ?? ActivityTracker.NUDGE_TIMEOUT_MS
     });
   }
 
+  private handleNudgeSessionComplete(fullSkip: boolean, triggerType: NudgeTriggerType): void {
+    console.debug('[TrustButVerify] Nudge session complete, full skip:', fullSkip);
+    void this.safeSendToBackground({
+      type: 'NUDGE_SESSION_COMPLETE',
+      data: { fullSkip, triggerType }
+    });
+  }
+
   private handleNudgeResolution(result: NudgeOverlayResolution): void {
+    // Individual resolution callback — used for debug logging only.
+    // Actual persistence is handled by handleNudgeBatchResolution at session end
+    // to prevent the concurrent read-modify-write race on chrome.storage.local.
     console.debug('[TrustButVerify] Nudge resolved:', {
       questionId: result.questionId,
       response: result.response,
@@ -220,38 +260,46 @@ class ActivityTracker {
       turnId: result.turnId,
       copyActivityId: result.copyActivityId
     });
+  }
 
-    const timestamp = Date.now();
-
-    // Persist the nudge event via service worker
-    const nudgeEvent = {
-      id: this.buildNudgeEventId(result.questionId, timestamp),
-      timestamp,
-      conversationId: result.conversationId || '',
-      turnId: result.turnId,
-      copyActivityId: result.copyActivityId,
-      domain: this.domain,
-      triggerType: result.triggerType,
-      nudgeQuestionId: result.questionId,
-      nudgeQuestionText: result.questionText,
-      questionTags: result.questionTags,
-      response: result.response,
-      responseTimeMs: result.responseTimeMs,
-      dismissedBy: result.dismissedBy
-    };
-
-    try {
-      chrome.runtime.sendMessage(
-        { type: 'SAVE_NUDGE_EVENT', data: nudgeEvent },
-        () => {
-          if (chrome.runtime.lastError) {
-            console.debug('[TrustButVerify] Nudge event save failed:', chrome.runtime.lastError.message);
-          }
-        }
-      );
-    } catch {
-      // Extension context may be invalidated — safe to ignore
+  /**
+   * Handle a batch of nudge resolutions from a completed session.
+   * Sends all events in a single SAVE_NUDGE_EVENTS_BATCH message to the
+   * service worker, which writes them atomically in one storage operation.
+   * This prevents the read-modify-write race that caused lost events when
+   * individual SAVE_NUDGE_EVENT messages fired concurrently.
+   */
+  private handleNudgeBatchResolution(results: NudgeOverlayResolution[]): void {
+    if (!results || results.length === 0) {
+      return;
     }
+
+    console.debug('[TrustButVerify] Nudge batch resolution:', {
+      count: results.length,
+      questionIds: results.map(r => r.questionId)
+    });
+
+    const nudgeEvents = results.map(result => {
+      const timestamp = Date.now();
+      return {
+        id: this.buildNudgeEventId(result.questionId, timestamp),
+        timestamp,
+        conversationId: result.conversationId || '',
+        turnId: result.turnId,
+        copyActivityId: result.copyActivityId,
+        domain: this.domain,
+        triggerType: result.triggerType,
+        nudgeQuestionId: result.questionId,
+        nudgeQuestionText: result.questionText,
+        questionTags: result.questionTags,
+        response: result.response,
+        responseTimeMs: result.responseTimeMs,
+        dismissedBy: result.dismissedBy,
+        edited: result.edited
+      };
+    });
+
+    void this.safeSendToBackground({ type: 'SAVE_NUDGE_EVENTS_BATCH', data: nudgeEvents });
   }
 
   private buildNudgeEventId(questionId: string, timestampMs: number): string {
@@ -272,9 +320,31 @@ class ActivityTracker {
   }
 
   /**
+   * Check whether this instance is the current "owner" via sessionStorage.
+   * Only the most recently created instance will match.
+   */
+  private isActiveInstance(): boolean {
+    try {
+      return sessionStorage.getItem(ActivityTracker.STAMP_KEY) === this._instanceId;
+    } catch {
+      return true; // sessionStorage unavailable — assume active to avoid dropping events
+    }
+  }
+
+  /**
    * Handle copy event
    */
   private async handleCopy(event: ClipboardEvent): Promise<void> {
+    // Bail out if this tracker's context is already invalidated (zombie instance)
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] handleCopy: skipped — extensionContextInvalidated');
+      return;
+    }
+    // Cross-world dedup: only the instance whose ID matches the DOM stamp processes events
+    if (!this.isActiveInstance()) {
+      console.debug('[TrustButVerify] handleCopy: skipped — not active instance');
+      return;
+    }
     try {
       const selection = window.getSelection();
       let copiedText = selection?.toString()?.trim() || '';
@@ -342,7 +412,7 @@ class ActivityTracker {
           : undefined
       });
 
-      console.log('[TrustButVerify] Copy event tracked:', {
+      console.debug('[TrustButVerify] Copy event tracked:', {
         domain: this.domain,
         length: finalText.length,
         method: 'copy',
@@ -448,7 +518,7 @@ class ActivityTracker {
     }
 
     if (domain.includes('chatgpt') || domain.includes('openai')) {
-      const turn = anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      const turn = anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       const nestedTurnMessage = turn
         ? (turn.querySelector('div[data-message-author-role="assistant"], div[data-message-author-role="user"]') as HTMLElement | null)
         : null;
@@ -602,17 +672,17 @@ class ActivityTracker {
     }
   }
 
-  private trackInteractionTargets(): void {
-    const updateTarget = (event: Event) => {
-      const target = event.target as HTMLElement | null;
-      if (target) {
-        this.lastInteractedElement = target;
-      }
-    };
+  private readonly boundUpdateTarget = (event: Event) => {
+    const target = event.target as HTMLElement | null;
+    if (target) {
+      this.lastInteractedElement = target;
+    }
+  };
 
-    document.addEventListener('pointerdown', updateTarget, true);
-    document.addEventListener('focusin', updateTarget, true);
-    document.addEventListener('keydown', updateTarget, true);
+  private trackInteractionTargets(): void {
+    document.addEventListener('pointerdown', this.boundUpdateTarget, true);
+    document.addEventListener('focusin', this.boundUpdateTarget, true);
+    document.addEventListener('keydown', this.boundUpdateTarget, true);
   }
 
   private setupProgrammaticCopyTracking(): void {
@@ -624,11 +694,17 @@ class ActivityTracker {
 
   private patchClipboardWriteText(): void {
     const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.writeText !== 'function' || clipboard.__TBV_WRITE_PATCHED__) {
+    if (!clipboard || typeof clipboard.writeText !== 'function') {
       return;
     }
 
-    const original = clipboard.writeText.bind(clipboard);
+    // Store the TRULY original function only once, on the very first patch.
+    // This prevents patch chaining where each new instance wraps the previous
+    // instance's patched function, causing duplicate events.
+    if (!(window as any).__tbv_original_writeText) {
+      (window as any).__tbv_original_writeText = clipboard.writeText.bind(clipboard);
+    }
+    const original = (window as any).__tbv_original_writeText as typeof clipboard.writeText;
     const tracker = this;
 
     const patched = async function patchedWriteText(...args: Parameters<Clipboard['writeText']>) {
@@ -655,11 +731,15 @@ class ActivityTracker {
 
   private patchClipboardWrite(): void {
     const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean } & { __TBV_WRITE_DATA_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.write !== 'function' || clipboard.__TBV_WRITE_DATA_PATCHED__) {
+    if (!clipboard || typeof clipboard.write !== 'function') {
       return;
     }
 
-    const original = clipboard.write.bind(clipboard);
+    // Store the TRULY original function only once (same pattern as writeText)
+    if (!(window as any).__tbv_original_write) {
+      (window as any).__tbv_original_write = clipboard.write.bind(clipboard);
+    }
+    const original = (window as any).__tbv_original_write as typeof clipboard.write;
     const tracker = this;
 
     const patched = async function patchedWrite(...args: Parameters<Clipboard['write']>) {
@@ -724,22 +804,46 @@ class ActivityTracker {
     method: string,
     metadata?: { context?: string | null; trigger?: Partial<CopyActivityTrigger> | undefined }
   ): void {
+    // Bail out if this tracker's context is already invalidated (zombie instance)
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] handleProgrammaticCopy: skipped — extensionContextInvalidated');
+      return;
+    }
+    // Cross-world dedup: only the instance whose ID matches the DOM stamp processes events
+    if (!this.isActiveInstance()) {
+      console.debug('[TrustButVerify] handleProgrammaticCopy: skipped — not active instance');
+      return;
+    }
     const trimmed = text?.trim();
     if (!trimmed) {
       return;
     }
 
-    const element = this.lastInteractedElement || (document.activeElement as HTMLElement | null);
-    const expanded = this.expandCopyFromElement(element, trimmed);
+    // Resolve the best element for turn identification.
+    // lastInteractedElement is often a copy *button* which sits OUTSIDE the
+    // turn's content hierarchy.  Try to climb from the button to the actual
+    // turn container first.
+    const rawElement = this.lastInteractedElement || (document.activeElement as HTMLElement | null);
+    const resolvedElement = this.resolveElementForCopyButton(rawElement) || rawElement;
+
+    console.debug('[TrustButVerify] handleProgrammaticCopy element resolution:', {
+      rawTag: rawElement?.tagName,
+      rawClasses: rawElement?.className ? String(rawElement.className).substring(0, 80) : null,
+      resolvedTag: resolvedElement?.tagName,
+      resolvedClasses: resolvedElement?.className ? String(resolvedElement.className).substring(0, 80) : null,
+      isResolved: resolvedElement !== rawElement
+    });
+
+    const expanded = this.expandCopyFromElement(resolvedElement, trimmed);
 
     const candidateContext = metadata?.context?.trim() ? metadata.context.trim() : '';
     const context = candidateContext
       && !this.looksLikeScriptNoise(candidateContext)
       && !this.looksLikeUselessContext(candidateContext)
         ? candidateContext.substring(0, 200)
-        : expanded?.context || this.buildContextFromElement(expanded?.element || element, trimmed);
+        : expanded?.context || this.buildContextFromElement(expanded?.element || resolvedElement, trimmed);
 
-    const fallbackMetadata = this.describeElement(expanded?.element || element) || {};
+    const fallbackMetadata = this.describeElement(expanded?.element || resolvedElement) || {};
     const combinedMetadata = this.mergeTriggerMetadata(fallbackMetadata, metadata?.trigger);
 
     const trigger: CopyActivityTrigger = {
@@ -764,13 +868,132 @@ class ActivityTracker {
       console.error('[TrustButVerify] Error tracking programmatic copy:', error);
     });
 
-    console.log('[TrustButVerify] Copy event tracked:', {
+    console.debug('[TrustButVerify] Copy event tracked:', {
       domain: this.domain,
       length: trimmed.length,
       method,
       strategy: expanded?.strategy || 'programmatic:fallback',
       timestamp: new Date().toISOString()
     });
+  }
+
+  /**
+   * Resolve a better element when the clicked element is a copy button or
+   * toolbar icon sitting OUTSIDE the turn's content DOM hierarchy.
+   * 
+   * Copy buttons on all platforms are structurally outside the message content:
+   *   ChatGPT: button inside article but outside div[data-message-author-role]
+   *   Claude:  button in toolbar sibling of .font-claude-response
+   *   Gemini:  button inside model-response but outside message-content
+   *   Grok:    button inside div[id^="response-"] (usually works already)
+   *   DeepSeek: button in toolbar sibling of .ds-markdown
+   *
+   * This method walks UP from the button and then searches DOWN into the
+   * turn container to find the actual message content element.
+   */
+  private resolveElementForCopyButton(element: HTMLElement | null): HTMLElement | null {
+    if (!element) return null;
+
+    const domain = this.domain;
+    const tag = element.tagName?.toLowerCase() || '';
+    const isCopyButtonLike = tag === 'button' || tag === 'svg' || tag === 'path'
+      || element.closest('button') !== null
+      || element.closest('[role="button"]') !== null;
+
+    // Only run this resolution when the element looks like a button/icon.
+    // If the user clicked directly on message content, let the normal flow handle it.
+    if (!isCopyButtonLike) return null;
+
+    // ── ChatGPT ─────────────────────────────────────────────────────────
+    if (domain.includes('chatgpt') || domain.includes('openai')) {
+      // Copy button is inside section/article[data-testid^="conversation-turn-"]
+      // but outside div[data-message-author-role].
+      // NOTE: ChatGPT changed from <article> to <section> in 2026.
+      const turnSection = element.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      if (turnSection) {
+        const msgDiv = (turnSection.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null)
+          || (turnSection.querySelector('div[data-message-author-role="user"]') as HTMLElement | null);
+        if (msgDiv) return msgDiv;
+        return turnSection;
+      }
+    }
+
+    // ── Claude ───────────────────────────────────────────────────────────
+    if (domain.includes('claude')) {
+      // Walk up looking for the response wrapper or user message.
+      let cursor: HTMLElement | null = element;
+      for (let i = 0; i < 12 && cursor; i++) {
+        // Check if this level contains the response or user message.
+        const claude = (cursor.querySelector('.font-claude-response') as HTMLElement | null)
+          || (cursor.querySelector('[data-testid="user-message"]') as HTMLElement | null);
+        if (claude) return claude;
+        // Also check direct matches (in case cursor IS the wrapper).
+        if (cursor.matches('.font-claude-response') || cursor.matches('[data-testid="user-message"]')) {
+          return cursor;
+        }
+        cursor = cursor.parentElement;
+      }
+    }
+
+    // ── Gemini ───────────────────────────────────────────────────────────
+    if (domain.includes('gemini')) {
+      // User prompt copy button: resolve to user-query content.
+      const userQuery = element.closest('user-query') as HTMLElement | null;
+      if (userQuery) {
+        const queryText = userQuery.querySelector('.query-text') as HTMLElement | null;
+        if (queryText) return queryText;
+        return userQuery;
+      }
+      // Response copy button: resolve to model response content.
+      const modelResp = element.closest('model-response') as HTMLElement | null;
+      if (modelResp) {
+        const md = (modelResp.querySelector('.markdown.markdown-main-panel') as HTMLElement | null)
+          || (modelResp.querySelector('message-content') as HTMLElement | null);
+        if (md) return md;
+        return modelResp;
+      }
+      // Also check broader containers.
+      const msgContent = element.closest('message-content') as HTMLElement | null;
+      if (msgContent) return msgContent;
+    }
+
+    // ── Grok ─────────────────────────────────────────────────────────────
+    if (domain.includes('grok') || domain.includes('x.ai')) {
+      const responseDiv = element.closest('div[id^="response-"]') as HTMLElement | null;
+      if (responseDiv) {
+        const md = responseDiv.querySelector('.response-content-markdown') as HTMLElement | null;
+        if (md) return md;
+        return responseDiv;
+      }
+    }
+
+    // ── DeepSeek ─────────────────────────────────────────────────────────
+    if (domain.includes('deepseek')) {
+      const msg = element.closest('.ds-message') as HTMLElement | null;
+      if (msg) {
+        const md = (msg.querySelector('.ds-markdown') as HTMLElement | null)
+          || (msg.querySelector('.fbb737a4') as HTMLElement | null);
+        if (md) return md;
+        return msg;
+      }
+    }
+
+    // ── Generic: walk up a few levels looking for common turn wrappers ──
+    let cursor: HTMLElement | null = element;
+    for (let i = 0; i < 12 && cursor; i++) {
+      // Check common turn wrapper patterns.
+      if (cursor.matches?.('[data-testid^="conversation-turn-"]')) return cursor;
+      if (cursor.matches?.('div[data-message-author-role]')) return cursor;
+      if (cursor.matches?.('.font-claude-response')) return cursor;
+      if (cursor.matches?.('[data-testid="user-message"]')) return cursor;
+      if (cursor.matches?.('message-content')) return cursor;
+      if (cursor.matches?.('.ds-message')) return cursor;
+      const id = cursor.id || '';
+      if (id.startsWith('response-')) return cursor;
+      cursor = cursor.parentElement;
+    }
+
+    return null;
   }
 
   private expandCopyFromElement(
@@ -786,6 +1009,28 @@ class ActivityTracker {
     pairedPromptText?: string;
   } | null {
     if (!element) {
+      // When element is null but we have copiedText, try pure text matching
+      // against the entire page. This handles cases where both lastInteractedElement
+      // and activeElement failed to resolve.
+      if (copiedText) {
+        const broadMatch = this.findBestMatchByText(document.body as HTMLElement, copiedText);
+        if (broadMatch) {
+          const getText = (el: Element | null) => ((el as HTMLElement | null)?.innerText || (el as HTMLElement | null)?.textContent || '').replace(/\s+$/g, '').trim();
+          const text = getText(broadMatch.element);
+          if (text) {
+            console.debug('[TrustButVerify] expandCopyFromElement: resolved via broad text match (null element)', {
+              side: broadMatch.side,
+              textLength: text.length
+            });
+            return this.buildExpandedCopyResult(
+              broadMatch.element,
+              text,
+              'matched-by-text:broad',
+              broadMatch.side
+            );
+          }
+        }
+      }
       return null;
     }
 
@@ -794,22 +1039,33 @@ class ActivityTracker {
     const normalizeText = (value: string | undefined | null) => (value || '').replace(/\s+$/g, '').trim();
     const getText = (el: Element | null) => normalizeText((el as HTMLElement | null)?.innerText || (el as HTMLElement | null)?.textContent || '');
 
-    const codeRoot = (anchor.closest('pre.code-block__code') as HTMLElement | null)
-      || (anchor.closest('pre') as HTMLElement | null)
-      || (anchor.closest('code') as HTMLElement | null);
+    // NOTE: code-block / code-block-nearby checks used to run here FIRST,
+    // but that caused wrong turnSide detection (e.g. Claude user prompts
+    // wrapped in <pre class="code-block__code"> were misidentified).
+    // They are now a generic fallback AFTER all platform-specific checks.
+    // See the "Generic code-block fallback" section at the end of this method.
 
-    if (codeRoot) {
-      const text = getText(codeRoot);
-      if (text) {
-        return this.buildExpandedCopyResult(codeRoot, text, 'code-block');
-      }
-    }
-
-    const nearbyCode = this.findNearbyCodeBlock(anchor);
-    if (nearbyCode) {
-      const text = getText(nearbyCode);
-      if (text) {
-        return this.buildExpandedCopyResult(nearbyCode, text, 'code-block-nearby');
+    // Compute text-matching fallback early so platform branches can use it.
+    // Use a broader search scope to handle copy buttons outside conversation structure.
+    let bestMatchFromText: { element: HTMLElement; side?: 'prompt' | 'response' } | null = null;
+    if (copiedText) {
+      // First try scoped search from the anchor's context.
+      bestMatchFromText = this.findBestMatchByText(anchor, copiedText);
+      // If scoped search failed (anchor is in a toolbar far from message content),
+      // try searching from the main content area.
+      if (!bestMatchFromText) {
+        const mainContainer = (document.querySelector('main') as HTMLElement | null)
+          || (document.querySelector('[role="main"]') as HTMLElement | null)
+          || (document.body as HTMLElement);
+        if (mainContainer !== anchor) {
+          bestMatchFromText = this.findBestMatchByText(mainContainer, copiedText);
+          if (bestMatchFromText) {
+            console.debug('[TrustButVerify] expandCopyFromElement: resolved via broad text match', {
+              side: bestMatchFromText.side,
+              strategy: 'broad-text-search'
+            });
+          }
+        }
       }
     }
 
@@ -822,11 +1078,14 @@ class ActivityTracker {
           const side = root.matches('[data-testid="user-message"]') ? 'prompt' : 'response';
           return this.buildExpandedCopyResult(root, text, side === 'prompt' ? 'claude:user-message' : 'claude:assistant-message', side);
         }
+      } else if (bestMatchFromText && bestMatchFromText.side) {
+        const text = getText(bestMatchFromText.element);
+        if (text) return this.buildExpandedCopyResult(bestMatchFromText.element, text, 'matched-by-text', bestMatchFromText.side);
       }
     }
 
     if (domain.includes('chatgpt') || domain.includes('openai')) {
-      const turn = anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      const turn = anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       const nestedTurnMessage = turn
         ? (turn.querySelector('div[data-message-author-role="assistant"], div[data-message-author-role="user"]') as HTMLElement | null)
         : null;
@@ -838,8 +1097,6 @@ class ActivityTracker {
           ? (root.getAttribute('data-message-author-role') || 'unknown')
           : 'unknown';
 
-        // Fallback: if role is unknown (e.g. copy button outside the role
-        // wrapper but inside the turn article), infer from nested children.
         if (role === 'unknown' && turn) {
           const nestedAssistant = turn.querySelector('div[data-message-author-role="assistant"]');
           const nestedUser = turn.querySelector('div[data-message-author-role="user"]');
@@ -853,14 +1110,28 @@ class ActivityTracker {
         }
 
         const side = role === 'user' ? 'prompt' : role === 'assistant' ? 'response' : undefined;
+        const resolvedSide = side || bestMatchFromText?.side; // OVERRIDE undefined side using text matching
+
         const strategy = root.matches('div[data-message-author-role]') ? `chatgpt:message:${role}` : 'chatgpt:conversation-turn';
-        const text = this.sanitizeCapturedText(getText(root), side, strategy);
+        const text = this.sanitizeCapturedText(getText(root), resolvedSide, strategy);
         if (text) {
           return this.buildExpandedCopyResult(
             root,
             text,
             strategy,
-            side
+            resolvedSide
+          );
+        }
+      } else if (bestMatchFromText) {
+        // ChatGPT: closest() failed entirely — button is outside all turn wrappers.
+        // Use the text-matched element instead.
+        const text = this.sanitizeCapturedText(getText(bestMatchFromText.element), bestMatchFromText.side, 'chatgpt:matched-by-text');
+        if (text) {
+          return this.buildExpandedCopyResult(
+            bestMatchFromText.element,
+            text,
+            'chatgpt:matched-by-text',
+            bestMatchFromText.side
           );
         }
       }
@@ -936,21 +1207,45 @@ class ActivityTracker {
       }
     }
 
-    // Last-resort fallback for programmatic copies when site-specific side
-    // resolution fails. Keep this at the end so stronger platform heuristics
-    // run first.
-    if (copiedText) {
-      const matched = this.findBestMatchByText(anchor, copiedText);
-      if (matched) {
-        const text = getText(matched.element);
+    // ── Generic code-block fallback ────────────────────────────────────
+    // Runs AFTER all platform-specific checks so it doesn't short-circuit
+    // proper turn detection. Uses the ANCHOR's turn context (not the code
+    // block's) to determine turnSide.
+    {
+      const codeRoot = (anchor.closest('pre.code-block__code') as HTMLElement | null)
+        || (anchor.closest('pre') as HTMLElement | null)
+        || (anchor.closest('code') as HTMLElement | null);
+
+      if (codeRoot) {
+        const text = getText(codeRoot);
         if (text) {
-          return this.buildExpandedCopyResult(
-            matched.element,
-            text,
-            'matched-by-text',
-            matched.side
-          );
+          // Determine turnSide from the anchor's turn context, not the code block.
+          const anchorTurn = this.resolveTurnContainer(anchor);
+          return this.buildExpandedCopyResult(codeRoot, text, 'code-block', anchorTurn?.side);
         }
+      }
+
+      const nearbyCode = this.findNearbyCodeBlock(anchor);
+      if (nearbyCode) {
+        const text = getText(nearbyCode);
+        if (text) {
+          // Determine turnSide from the anchor's turn context, not the code block.
+          const anchorTurn = this.resolveTurnContainer(anchor);
+          return this.buildExpandedCopyResult(nearbyCode, text, 'code-block-nearby', anchorTurn?.side);
+        }
+      }
+    }
+
+    // If all else fails and we have the text match from earlier:
+    if (bestMatchFromText) {
+      const text = getText(bestMatchFromText.element);
+      if (text) {
+        return this.buildExpandedCopyResult(
+          bestMatchFromText.element,
+          text,
+          'matched-by-text',
+          bestMatchFromText.side
+        );
       }
     }
 
@@ -1008,8 +1303,8 @@ class ActivityTracker {
       }
 
       // Fallback: copy buttons sit outside div[data-message-author-role] but
-      // inside the turn article. Check for nested role elements.
-      const turn = element.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null;
+      // inside the turn section/article. Check for nested role elements.
+      const turn = element.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null;
       if (turn) {
         const assistantMsg = turn.querySelector('div[data-message-author-role="assistant"]') as HTMLElement | null;
         const userMsg = turn.querySelector('div[data-message-author-role="user"]') as HTMLElement | null;
@@ -1211,7 +1506,7 @@ class ActivityTracker {
     if (!needle) return null;
 
     // Restrict search to a reasonable container to avoid scanning the whole page.
-    const container = (anchor.closest('article[data-testid^="conversation-turn-"]') as HTMLElement | null)
+    const container = (anchor.closest('[data-testid^="conversation-turn-"]') as HTMLElement | null)
       || (anchor.closest('div[data-message-author-role]') as HTMLElement | null)
       || (anchor.closest('main') as HTMLElement | null)
       || (anchor.closest('section') as HTMLElement | null)
@@ -1400,7 +1695,7 @@ class ActivityTracker {
     // when the user clicks "Share". Skip these — they're not user-selected
     // content from a conversation.
     if (this.looksLikeShareLink(trimmed)) {
-      console.log('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
+      console.debug('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
       return;
     }
 
@@ -1408,7 +1703,7 @@ class ActivityTracker {
     // Store copy activity only when it is confidently from the LLM response.
     // Keep pairedPromptText capture for response-side copies unchanged.
     if (extras?.turnSide !== 'response') {
-      console.log('[TrustButVerify] Skipping non-response copy activity', {
+      console.debug('[TrustButVerify] Skipping non-response copy activity', {
         turnSide: extras?.turnSide || null,
         domain: this.domain,
         strategy: trigger.extractionStrategy || null
@@ -1654,42 +1949,190 @@ class ActivityTracker {
    * Send activity to background script
    */
   private async sendToBackground(activity: CopyActivity): Promise<void> {
+    await this.safeSendToBackground({ type: 'COPY_EVENT', data: activity });
+  }
+
+  private teardown(): void {
+    this.extensionContextInvalidated = true;
+
+    // Restore original clipboard methods to prevent patch chaining on next instance
     try {
-      const payload = {
-        type: 'COPY_EVENT',
-        data: activity
-      };
+      const clipboard = navigator.clipboard;
+      if ((window as any).__tbv_original_writeText) {
+        Object.defineProperty(clipboard, 'writeText', {
+          value: (window as any).__tbv_original_writeText,
+          configurable: true
+        });
+      }
+      if ((window as any).__tbv_original_write) {
+        Object.defineProperty(clipboard, 'write', {
+          value: (window as any).__tbv_original_write,
+          configurable: true
+        });
+      }
+    } catch { /* ignore */ }
 
+    document.removeEventListener('copy', this.boundHandleCopy);
+    document.removeEventListener('pointerdown', this.boundUpdateTarget, true);
+    document.removeEventListener('focusin', this.boundUpdateTarget, true);
+    document.removeEventListener('keydown', this.boundUpdateTarget, true);
+
+    window.removeEventListener('message', this.handleBridgeMessage);
+    try {
+      chrome.runtime.onMessage.removeListener(this.handleRuntimeMessage);
+    } catch { /* ignore */ }
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.flushIntervalTimer) {
+      window.clearInterval(this.flushIntervalTimer);
+      this.flushIntervalTimer = null;
+    }
+  }
+
+  /**
+   * Safe send: buffers to window.sessionStorage on context invalidation and
+   * tears down the script to allow a fresh injection to take over.
+   *
+   * IMPORTANT: We distinguish between two very different states:
+   *  1. True context invalidation (extension was uninstalled/updated) → teardown
+   *  2. Transient worker sleep (MV3 30s suspension) → buffer only, do NOT teardown
+   *
+   * Calling teardown() on transient sleep permanently kills the tracker instance,
+   * causing all future copy events to be silently dropped. This was the root cause
+   * of the ChatGPT-only copy tracking failure.
+   */
+  private async safeSendToBackground(payload: object): Promise<void> {
+    // If we already know the context is truly invalidated, just buffer.
+    if (this.extensionContextInvalidated) {
+      console.debug('[TrustButVerify] safeSend: context already invalidated, buffering');
+      await this.enqueueEvent(payload);
+      return;  // Already torn down previously
+    }
+
+    // chrome.runtime.id being absent can mean:
+    //  (a) Extension truly uninstalled/updated → context gone forever
+    //  (b) MV3 service worker is sleeping → transient, will wake on next message
+    // We CANNOT distinguish (a) from (b) here, so we MUST NOT teardown.
+    // Instead, buffer and let the periodic flush (30s interval) retry.
+    if (!chrome?.runtime?.id) {
+      console.debug('[TrustButVerify] safeSend: chrome.runtime.id absent (worker may be sleeping), buffering');
+      await this.enqueueEvent(payload);
+      return;  // Do NOT teardown — worker may wake up
+    }
+
+    try {
       await chrome.runtime.sendMessage(payload);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const lower = message.toLowerCase();
-
-      const isTransientPortIssue =
-        lower.includes('message port closed') ||
-        lower.includes('receiving end does not exist') ||
-        lower.includes('could not establish connection');
-
-      if (isTransientPortIssue && chrome?.runtime?.id) {
+      // Successful send — clear any stale pending events
+      this.clearPendingEventsIfNeeded();
+    } catch (err) {
+      const msg = String(err).toLowerCase();
+      if (msg.includes('extension context invalidated')) {
+        // True invalidation: the extension was updated or uninstalled.
+        this.extensionContextInvalidated = true;
+        console.warn('[TrustButVerify] Context invalidated — buffering event and tearing down');
+        await this.enqueueEvent(payload);
+        this.teardown();
+      } else if (
+        msg.includes('message port closed') ||
+        msg.includes('message channel closed') ||
+        msg.includes('receiving end does not exist') ||
+        msg.includes('could not establish connection')
+      ) {
+        // Transient port/channel issue (worker sleeping or restarting).
+        // Buffer the event AND retry after a short delay.
+        console.debug('[TrustButVerify] Transient send error, buffering and retrying:', msg.substring(0, 80));
+        await this.enqueueEvent(payload);
+        await new Promise((r) => window.setTimeout(r, 300));
         try {
-          await new Promise((resolve) => window.setTimeout(resolve, 200));
-          await chrome.runtime.sendMessage({
-            type: 'COPY_EVENT',
-            data: activity
-          });
-          return;
-        } catch (retryError) {
-          console.error('[TrustButVerify] Error sending to background (retry failed):', retryError);
-          return;
+          // If the worker woke up, this will succeed and we can flush.
+          if (chrome?.runtime?.id) {
+            await chrome.runtime.sendMessage(payload);
+            // Retry succeeded — flush the buffer too
+            this.clearPendingEventsIfNeeded();
+          }
+        } catch (retryErr) {
+          // Retry failed — that's OK, the event is buffered.
+          // The 30s periodic flush will pick it up.
+          console.debug('[TrustButVerify] Retry also failed (event is buffered):', String(retryErr).substring(0, 80));
+        }
+      } else {
+        console.error('[TrustButVerify] Error sending to background:', err);
+      }
+    }
+  }
+
+  /** Append one event payload to the persistent pending-events queue in sessionStorage. */
+  private async enqueueEvent(payload: object): Promise<void> {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      const queue: object[] = raw ? JSON.parse(raw) : [];
+
+      // Deduplicate: check if an identical payload already exists in the queue.
+      const payloadStr = JSON.stringify(payload);
+      const isDuplicate = queue.some(item => JSON.stringify(item) === payloadStr);
+      if (isDuplicate) {
+        console.debug('[TrustButVerify] Skipping duplicate enqueue');
+        return;
+      }
+
+      queue.push(payload);
+      window.sessionStorage.setItem('tbv_pending_events', JSON.stringify(queue));
+    } catch (e) {
+      console.debug('[TrustButVerify] enqueueEvent failed:', e);
+    }
+  }
+
+  /** Drain the pending-events queue and send each item to the background. */
+  private async flushPendingEvents(): Promise<void> {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      if (!raw) return;
+      const queue: object[] = JSON.parse(raw);
+      if (!Array.isArray(queue) || queue.length === 0) {
+        return;
+      }
+      // Clear the queue before sending to avoid re-queueing on failure.
+      window.sessionStorage.removeItem('tbv_pending_events');
+
+      // Deduplicate queue entries and discard stale events from previous sessions
+      const MAX_EVENT_AGE_MS = 60_000; // 60 seconds
+      const now = Date.now();
+      const seen = new Set<string>();
+      const uniqueQueue = queue.filter(item => {
+        const key = JSON.stringify(item);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        // Discard events older than MAX_EVENT_AGE_MS
+        const data = (item as any)?.data;
+        if (data?.timestamp && now - data.timestamp > MAX_EVENT_AGE_MS) {
+          console.debug('[TrustButVerify] Discarding stale event:', data.id);
+          return false;
+        }
+        return true;
+      });
+
+      console.log(`[TrustButVerify] Context restored — flushing ${uniqueQueue.length} buffered event(s)`);
+      for (const payload of uniqueQueue) {
+        await this.safeSendToBackground(payload);
+      }
+    } catch (e) {
+      console.debug('[TrustButVerify] flushPendingEvents failed:', e);
+    }
+  }
+
+  /** Clear the pending-events queue if it exists and is empty (stale). */
+  private clearPendingEventsIfNeeded(): void {
+    try {
+      const raw = window.sessionStorage.getItem('tbv_pending_events');
+      if (raw) {
+        const queue = JSON.parse(raw);
+        if (!Array.isArray(queue) || queue.length === 0) {
+          window.sessionStorage.removeItem('tbv_pending_events');
         }
       }
-
-      if (lower.includes('extension context invalidated')) {
-        this.extensionContextInvalidated = true;
-      }
-
-      console.error('[TrustButVerify] Error sending to background:', error);
-    }
+    } catch { /* ignore */ }
   }
 
   /**
@@ -1700,9 +2143,11 @@ class ActivityTracker {
   }
 }
 
-// Initialize tracker when DOM is ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => new ActivityTracker());
-} else {
-  new ActivityTracker();
+// Only run in the top frame — copies bubble up from iframes anyway.
+if (window.top === window.self) {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => new ActivityTracker());
+  } else {
+    new ActivityTracker();
+  }
 }

@@ -21,10 +21,21 @@ export class StorageManager {
   private static readonly MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC = 20;
   private static readonly MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC = 20;
 
+  /** Collapse whitespace for turn text comparison. */
   private static normalizeTurnText(text: string): string {
     return (text || '').replace(/\s+/g, ' ').trim();
   }
 
+  /**
+   * Simple substring-based containment similarity for turn deduplication.
+   * Returns ratio of shorter text length to longer when one contains the other.
+   *
+   * NOTE: This is intentionally simpler than service-worker's `containmentScore()`
+   * which uses a 3-pass strategy (soft/hard normalization + token overlap) for
+   * copy→turn pairing. The two serve different purposes:
+   * - containmentSimilarity: fast dedup during storage upsert (exact/substring match)
+   * - containmentScore: fuzzy matching for copy activity enrichment
+   */
   private static containmentSimilarity(a: string, b: string): number {
     const x = this.normalizeTurnText(a).toLowerCase();
     const y = this.normalizeTurnText(b).toLowerCase();
@@ -423,37 +434,7 @@ export class StorageManager {
     }
   }
 
-  static async updateCopyCategoriesForTurn(turnId: string, copyCategory: string): Promise<void> {
-    if (!turnId || !copyCategory) {
-      return;
-    }
 
-    const patch: Partial<CopyActivity> = {
-      copyCategory,
-      copyCategorySource: 'turn'
-    };
-
-    const conversations = await this.getAllConversations();
-    let convoUpdated = false;
-    for (const convo of conversations) {
-      if (!convo.copyActivities || convo.copyActivities.length === 0) continue;
-      let thisConvoUpdated = false;
-      for (let i = 0; i < convo.copyActivities.length; i++) {
-        const a = convo.copyActivities[i];
-        if (a.turnId === turnId && a.copyCategorySource === 'turn') {
-          convo.copyActivities[i] = { ...a, ...patch };
-          convoUpdated = true;
-          thisConvoUpdated = true;
-        }
-      }
-      if (thisConvoUpdated) {
-        convo.lastUpdatedAt = Date.now();
-      }
-    }
-    if (convoUpdated) {
-      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
-    }
-  }
 
   /**
    * Get recent conversations with limit
@@ -494,6 +475,42 @@ export class StorageManager {
       await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
     } catch (error) {
       console.error('Error saving nudge event:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Save multiple nudge events atomically in a single read-push-write.
+   * This prevents the race condition where concurrent saveNudgeEvent calls
+   * each read a stale array and overwrite each other's writes.
+   */
+  static async saveNudgeEventsBatch(newEvents: NudgeEvent[]): Promise<void> {
+    if (!newEvents || newEvents.length === 0) {
+      return;
+    }
+    try {
+      const events = await this.getAllNudgeEvents();
+      const existingIds = new Set(events.map((e) => e.id));
+
+      let added = 0;
+      for (const event of newEvents) {
+        if (!existingIds.has(event.id)) {
+          events.push(event);
+          existingIds.add(event.id);
+          added++;
+        }
+      }
+
+      if (added === 0) {
+        return; // All duplicates — nothing to write
+      }
+
+      events.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      this.trimNudgeEvents(events);
+
+      await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
+    } catch (error) {
+      console.error('Error saving nudge events batch:', error);
       throw error;
     }
   }
