@@ -1317,7 +1317,7 @@ export class ConversationDetector {
           retryCount,
           platformSignalFired
         });
-        this.extractAndSaveMessage(element);
+        this.extractWhenVisible(element);
         waitRetryCount = 0;
       }
     };
@@ -1482,7 +1482,7 @@ export class ConversationDetector {
       this.markProcessed(element, messageKey);
       const absText = element.textContent?.trim() || '';
       if (absText.length >= 2 && !this.isPlaceholderText(this.normalizeText(absText))) {
-        this.extractAndSaveMessage(element);
+        this.extractWhenVisible(element);
       }
     }, ABSOLUTE_MAX_WAIT_MS);
   }
@@ -1547,6 +1547,60 @@ export class ConversationDetector {
       '[data-role*="assistant"]',
       '[data-author*="assistant"]'
     ];
+  }
+
+  /**
+   * Wrapper around extractAndSaveMessage that defers extraction when the tab
+   * is hidden (background). Chrome throttles DOM rendering in background tabs,
+   * so reading element.textContent while hidden yields truncated text.
+   * When visibility restores, we wait a short settle period for the browser
+   * to paint the full response before extracting.
+   */
+  private extractWhenVisible(element: Element): void {
+    const VISIBILITY_SETTLE_MS = 1500;
+
+    // Refresh the migration grace window so threadGate doesn't reject
+    // elements stamped with the pre-redirect thread ID. The 15 s grace
+    // normally starts from the URL redirect, but by the time extraction
+    // runs (either immediately or after a visibility-deferred wait) it
+    // may have already expired.
+    if (this.migratedFromThreadId !== null) {
+      this.migratedFromThreadAt = Date.now();
+    }
+
+    if (document.visibilityState === 'visible') {
+      // Tab is active — extract immediately
+      this.extractAndSaveMessage(element);
+      return;
+    }
+
+    // Tab is hidden — defer until user returns
+    this.traceFlow('extractWhenVisible:deferred', {
+      threadId: this.getConversationId(),
+      key: this.getElementKey(element),
+      currentTextLength: element.textContent?.trim().length || 0
+    });
+
+    const onVisible = () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      // Let the browser paint the full DOM after becoming visible
+      setTimeout(() => {
+        // Refresh again — the user may have been away for a long time
+        if (this.migratedFromThreadId !== null) {
+          this.migratedFromThreadAt = Date.now();
+        }
+
+        this.traceFlow('extractWhenVisible:resumed', {
+          threadId: this.getConversationId(),
+          key: this.getElementKey(element),
+          textLengthAfterResume: element.textContent?.trim().length || 0,
+          migrationGraceRefreshed: this.migratedFromThreadId !== null
+        });
+        this.extractAndSaveMessage(element);
+      }, VISIBILITY_SETTLE_MS);
+    };
+
+    document.addEventListener('visibilitychange', onVisible);
   }
 
   /**

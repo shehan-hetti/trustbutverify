@@ -22,6 +22,20 @@ export class StorageManager {
   private static readonly MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC = 20;
   private static readonly ACCUMULATED_STATS_KEY = 'accumulatedStats';
 
+  /**
+   * Promise-chain mutex for serializing all read-modify-write operations
+   * on the conversationLogs storage key. Prevents concurrent writes from
+   * different tabs overwriting each other's data.
+   */
+  private static _convWriteLock: Promise<void> = Promise.resolve();
+
+  private static withConversationLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this._convWriteLock;
+    let release!: () => void;
+    this._convWriteLock = new Promise<void>(r => { release = r; });
+    return prev.then(fn).finally(() => release());
+  }
+
   /** Collapse whitespace for turn text comparison. */
   private static normalizeTurnText(text: string): string {
     return (text || '').replace(/\s+/g, ' ').trim();
@@ -166,18 +180,20 @@ export class StorageManager {
    * Clear all activities
    */
   static async clearAllActivities(): Promise<void> {
-    try {
-      const conversations = await this.getAllConversations();
-      for (const convo of conversations) {
-        if (convo.copyActivities?.length) {
-          convo.copyActivities = [];
+    return this.withConversationLock(async () => {
+      try {
+        const conversations = await this.getAllConversations();
+        for (const convo of conversations) {
+          if (convo.copyActivities?.length) {
+            convo.copyActivities = [];
+          }
         }
+        await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
+      } catch (error) {
+        console.error('Error clearing activities:', error);
+        throw error;
       }
-      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
-    } catch (error) {
-      console.error('Error clearing activities:', error);
-      throw error;
-    }
+    });
   }
 
   /**
@@ -188,6 +204,7 @@ export class StorageManager {
     threadInfo: Partial<ConversationLog> | undefined,
     turns: ConversationTurn[]
   ): Promise<void> {
+    return this.withConversationLock(async () => {
     try {
       const data = await this.getAllConversations();
       let existing = data.find(c => c.id === threadId);
@@ -385,6 +402,7 @@ export class StorageManager {
       console.error('Error upserting conversation turns:', error);
       throw error;
     }
+    }); // end withConversationLock
   }
 
   /**
@@ -401,6 +419,7 @@ export class StorageManager {
   }
 
   static async attachCopyToConversation(conversationId: string | undefined, activity: CopyActivity): Promise<void> {
+    return this.withConversationLock(async () => {
     try {
       const data = await this.getAllConversations();
       const resolvedConversationId = conversationId || this.deriveThreadIdFromUrl(activity.url, activity.domain);
@@ -443,6 +462,7 @@ export class StorageManager {
     } catch (error) {
       console.error('Error attaching copy to conversation:', error);
     }
+    }); // end withConversationLock
   }
 
   static async getConversationById(conversationId: string): Promise<ConversationLog | undefined> {
@@ -455,23 +475,25 @@ export class StorageManager {
       return;
     }
 
-    const conversations = await this.getAllConversations();
-    let updated = false;
-    for (const convo of conversations) {
-      if (!convo.copyActivities || convo.copyActivities.length === 0) {
-        continue;
+    return this.withConversationLock(async () => {
+      const conversations = await this.getAllConversations();
+      let updated = false;
+      for (const convo of conversations) {
+        if (!convo.copyActivities || convo.copyActivities.length === 0) {
+          continue;
+        }
+        const cidx = convo.copyActivities.findIndex(a => a.id === activityId);
+        if (cidx !== -1) {
+          convo.copyActivities[cidx] = { ...convo.copyActivities[cidx], ...patch };
+          convo.lastUpdatedAt = Date.now();
+          updated = true;
+        }
       }
-      const cidx = convo.copyActivities.findIndex(a => a.id === activityId);
-      if (cidx !== -1) {
-        convo.copyActivities[cidx] = { ...convo.copyActivities[cidx], ...patch };
-        convo.lastUpdatedAt = Date.now();
-        updated = true;
-      }
-    }
 
-    if (updated) {
-      await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
-    }
+      if (updated) {
+        await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: conversations });
+      }
+    });
   }
 
 
@@ -490,12 +512,14 @@ export class StorageManager {
    * Clear all conversation logs
    */
   static async clearAllConversations(): Promise<void> {
-    try {
-      await chrome.storage.local.remove(this.CONVERSATION_STORAGE_KEY);
-    } catch (error) {
-      console.error('Error clearing conversations:', error);
-      throw error;
-    }
+    return this.withConversationLock(async () => {
+      try {
+        await chrome.storage.local.remove(this.CONVERSATION_STORAGE_KEY);
+      } catch (error) {
+        console.error('Error clearing conversations:', error);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -598,44 +622,46 @@ export class StorageManager {
    * This limits chrome.storage growth while preserving recent context.
    */
   static async compactAfterSuccessfulSync(): Promise<void> {
-    try {
-      const conversations = await this.getAllConversations();
-      const events = await this.getAllNudgeEvents();
+    return this.withConversationLock(async () => {
+      try {
+        const conversations = await this.getAllConversations();
+        const events = await this.getAllNudgeEvents();
 
-      const keepConversationIds = new Set(
-        [...conversations]
-          .sort((a, b) => (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0))
-          .slice(0, this.MAX_LOCAL_CONVERSATIONS_AFTER_SYNC)
-          .map((c) => c.id)
-      );
+        const keepConversationIds = new Set(
+          [...conversations]
+            .sort((a, b) => (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0))
+            .slice(0, this.MAX_LOCAL_CONVERSATIONS_AFTER_SYNC)
+            .map((c) => c.id)
+        );
 
-      const compactedConversations = conversations
-        .filter((c) => keepConversationIds.has(c.id))
-        .map((c) => {
-          const copyActivities = [...(c.copyActivities || [])]
-            .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-            .slice(0, this.MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC)
-            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        const compactedConversations = conversations
+          .filter((c) => keepConversationIds.has(c.id))
+          .map((c) => {
+            const copyActivities = [...(c.copyActivities || [])]
+              .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+              .slice(0, this.MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC)
+              .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
-          return {
-            ...c,
-            copyActivities
-          };
+            return {
+              ...c,
+              copyActivities
+            };
+          });
+
+        const compactedEvents = [...events]
+          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+          .slice(0, this.MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC)
+          .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+        await chrome.storage.local.set({
+          [this.CONVERSATION_STORAGE_KEY]: compactedConversations,
+          [this.NUDGE_EVENTS_STORAGE_KEY]: compactedEvents
         });
-
-      const compactedEvents = [...events]
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-        .slice(0, this.MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC)
-        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-
-      await chrome.storage.local.set({
-        [this.CONVERSATION_STORAGE_KEY]: compactedConversations,
-        [this.NUDGE_EVENTS_STORAGE_KEY]: compactedEvents
-      });
-    } catch (error) {
-      console.error('Error compacting post-sync data:', error);
-      throw error;
-    }
+      } catch (error) {
+        console.error('Error compacting post-sync data:', error);
+        throw error;
+      }
+    });
   }
 
   /**

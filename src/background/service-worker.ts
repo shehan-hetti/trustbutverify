@@ -234,6 +234,12 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       console.log('[TBV CAT][3] BACKFILL-PATH:SKIP — turnId already found', { copyId: enriched.id, turnId: enriched.turnId });
     }
 
+    // If enriched matched a turn, check if copy has richer response text than the stored turn.
+    // This self-heals truncated responses caused by background tab DOM throttling.
+    if (enriched.turnId && enriched.containerText) {
+      await tryHealTruncatedTurn(enriched);
+    }
+
     // Compute readability metrics for response-side copies.
     if (enriched.turnSide === 'response' && !enriched.readability) {
       const textForMetrics = enriched.copiedText || enriched.containerText || '';
@@ -455,6 +461,60 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
     promptLength: inferredTurn.prompt.textLength,
     responseLength: inferredTurn.response.textLength
   });
+}
+
+/**
+ * If a copy's containerText is significantly longer than the stored turn's
+ * response text, update the turn with the richer data. This heals responses
+ * that were truncated due to background tab DOM throttling.
+ */
+async function tryHealTruncatedTurn(activity: CopyActivity): Promise<void> {
+  if (!activity.turnId || !activity.containerText || !activity.conversationId) return;
+
+  const MIN_RATIO = 1.5;       // copy must be ≥1.5× longer
+  const MIN_DELTA_CHARS = 200;  // and ≥200 chars more
+
+  const convo = await StorageManager.getConversationById(activity.conversationId);
+  if (!convo) return;
+
+  const turn = convo.turns.find(t => t.id === activity.turnId);
+  if (!turn?.response?.text) return;
+
+  const storedLen = turn.response.text.length;
+  const copyLen = activity.containerText.length;
+  const delta = copyLen - storedLen;
+
+  if (delta < MIN_DELTA_CHARS || copyLen < storedLen * MIN_RATIO) return;
+
+  // Heal the turn with richer text from copy
+  const healedTurn: ConversationTurn = {
+    ...turn,
+    response: {
+      ...turn.response,
+      text: activity.containerText,
+      textLength: activity.containerText.length
+    }
+  };
+
+  // Recompute readability for the healed response
+  const result = computeReadability(activity.containerText);
+  if (result) {
+    healedTurn.response.readability = result.metrics;
+    healedTurn.response.complexity = result.complexity;
+  }
+
+  console.log('[TBV CAT][HEAL] Turn response healed from copy containerText', {
+    turnId: activity.turnId,
+    oldLength: storedLen,
+    newLength: copyLen,
+    delta
+  });
+
+  await StorageManager.upsertConversationTurns(
+    activity.conversationId,
+    undefined,
+    [healedTurn]
+  );
 }
 
 async function enqueueCopyCategorizationIfNeeded(activity: CopyActivity): Promise<void> {
