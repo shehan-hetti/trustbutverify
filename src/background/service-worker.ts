@@ -870,22 +870,70 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
   const sidePrefs: Array<'prompt' | 'response'> = activity.turnSide ? [activity.turnSide] : ['prompt', 'response'];
   const turns = convo.turns.slice(-20).reverse();
 
+  // ── Prompt-first gate ────────────────────────────────────────────
+  // When we have a paired prompt, use it as the primary signal to
+  // identify which turn this copy belongs to. If no stored turn's
+  // prompt matches confidently, this copy is from an unlogged turn —
+  // skip response matching entirely and let it go to backfill/LLM-2.
+  const PROMPT_GATE_MIN_LENGTH = 8;
+  const PROMPT_GATE_THRESHOLD = 0.60;
+
+  let turnsToScore: ConversationTurn[] = turns; // default: all turns
+
+  if (candidatePrompt.length >= PROMPT_GATE_MIN_LENGTH) {
+    let bestPromptMatchScore = 0;
+    const promptMatchedTurns: ConversationTurn[] = [];
+
+    for (const turn of turns) {
+      const turnPromptText = turn.prompt?.text || '';
+      if (turnPromptText.length < 4) continue;
+      const pScore = containmentScore(candidatePrompt, turnPromptText);
+      if (pScore >= PROMPT_GATE_THRESHOLD) {
+        promptMatchedTurns.push(turn);
+      }
+      if (pScore > bestPromptMatchScore) bestPromptMatchScore = pScore;
+    }
+
+    if (promptMatchedTurns.length > 0) {
+      // Restrict response matching to only prompt-matched turn(s)
+      turnsToScore = promptMatchedTurns;
+      console.log('[TBV CAT][E] enrich:PROMPT-GATE-PASS', {
+        copyId: activity.id,
+        bestPromptScore: bestPromptMatchScore.toFixed(3),
+        matchedTurnCount: promptMatchedTurns.length,
+        turnsChecked: turns.length
+      });
+    } else {
+      // No prompt match → unlogged turn → skip response matching → LLM-2
+      console.log('[TBV CAT][E] enrich:PROMPT-GATE-REJECT', {
+        copyId: activity.id,
+        bestPromptScore: bestPromptMatchScore.toFixed(3),
+        threshold: PROMPT_GATE_THRESHOLD,
+        turnsChecked: turns.length
+      });
+      flowTrace('enrichCopyActivity:prompt-gate-reject', {
+        id: activity.id,
+        conversationId: activity.conversationId,
+        bestPromptScore: bestPromptMatchScore,
+        threshold: PROMPT_GATE_THRESHOLD
+      });
+      if (!activity.copyCategory) {
+        return { ...activity, copyCategory: 'pending' };
+      }
+      return activity;
+    }
+  }
+
   let bestTurn: ConversationTurn | null = null;
   let bestSide: 'prompt' | 'response' | null = null;
   let bestScore = 0;
-  let bestPrimaryScore = 0;
-  let bestPromptScore = 0;
 
-  for (const turn of turns) {
+  for (const turn of turnsToScore) {
     for (const side of sidePrefs) {
       const text = side === 'prompt' ? turn.prompt.text : turn.response.text;
       if (!text || text.length < 4) continue;
 
       // ── Length ratio guard ─────────────────────────────────────────
-      // The candidate (containerText) should be similar in length to the
-      // turn's text. If the turn is much shorter, it can't be the source.
-      // If the turn is much longer, the container extraction likely missed
-      // content — still allow but require strong containment.
       const ratio = Math.min(text.length, candidate.length)
                   / Math.max(text.length, candidate.length);
       if (ratio < 0.08) {
@@ -893,42 +941,15 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
       }
 
       // ── Directional containment ────────────────────────────────────
-      // Primary check: is candidate contained IN the turn's text?
-      // (copy is a subset of turn — the normal case)
       const forwardScore = directionalContainment(candidate, text);
-
-      // Secondary: is turn's text contained in candidate?
-      // Only meaningful when lengths are similar (ratio ≥ 0.3),
-      // otherwise this just means a short turn shares some words
-      // with a long container — which is a false positive.
       const reverseScore = ratio >= 0.3
         ? directionalContainment(text, candidate)
         : 0;
 
-      let primaryScore = Math.max(forwardScore, reverseScore);
-      let promptScore = 0;
-
-      // ── Prompt alignment ───────────────────────────────────────────
-      // Use paired prompt as a qualifying gate, not just a bonus.
-      // If we have a prompt to compare and it doesn't match at all,
-      // penalize heavily — unless response match is near-perfect.
-      if (side === 'response' && candidatePrompt.length >= 4) {
-        promptScore = containmentScore(candidatePrompt, turn.prompt.text || '');
-
-        if (promptScore < 0.10 && primaryScore < 0.80) {
-          primaryScore *= 0.4; // Heavy penalty: unrelated prompt + weak response
-        }
-      }
-
-      // Composite score — prompt is tiebreaker, not inflator
-      const score = candidatePrompt.length >= 4
-        ? (primaryScore * 0.85) + (promptScore * 0.15)
-        : primaryScore;
+      const score = Math.max(forwardScore, reverseScore);
 
       if (score > bestScore) {
         bestScore = score;
-        bestPrimaryScore = primaryScore;
-        bestPromptScore = promptScore;
         bestTurn = turn;
         bestSide = side;
       }
@@ -985,8 +1006,6 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     turnId: bestTurn.id,
     turnSide: activity.turnSide || bestSide,
     bestScore,
-    bestPrimaryScore,
-    bestPromptScore,
     turnCategory: bestTurn.category || 'pending'
   });
 
@@ -1000,8 +1019,6 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     matchedTurnId: bestTurn.id,
     matchedSide: bestSide,
     bestScore: bestScore.toFixed(3),
-    primaryScore: bestPrimaryScore.toFixed(3),
-    promptScore: bestPromptScore.toFixed(3),
     turnCategory: bestTurn.category || null,
     hasFinalCategory,
     resultCopyCategory: hasFinalCategory ? bestTurn.category : '(undefined — pending turn)',
@@ -2165,7 +2182,7 @@ interface SyncTurnPayload {
   };
   responseTimeMs: number | null;
   category: string | null;
-  summary: string | null;
+  isInferred: boolean;
   ts: number;
 }
 
@@ -2181,6 +2198,7 @@ interface SyncCopyPayload {
   containerTextLength: number | null;
   copyCategory: string | null;
   copyCategorySource: string | null;
+  copyMethod: string | null;
   readability?: Record<string, unknown>;
   complexity?: Record<string, unknown>;
 }
@@ -2240,7 +2258,7 @@ function buildSyncPayload(
       },
       responseTimeMs: t.responseTimeMs ?? null,
       category: (t.category && t.category !== 'pending') ? t.category : null,
-      summary: (t.summary && t.summary !== 'pending') ? t.summary : null,
+      isInferred: t.prompt?.meta?.inferredFromCopy === true,
       ts: t.ts
     })),
     copyActivities: (c.copyActivities || []).map((a): SyncCopyPayload => ({
@@ -2255,6 +2273,9 @@ function buildSyncPayload(
       containerTextLength: a.containerTextLength ?? null,
       copyCategory: a.copyCategory ?? null,
       copyCategorySource: a.copyCategorySource ?? null,
+      copyMethod: a.trigger?.type === 'programmatic' ? 'button'
+                : a.trigger?.type === 'selection' ? 'keyboard'
+                : null,
       ...(a.readability ? { readability: a.readability as unknown as Record<string, unknown> } : {}),
       ...(a.complexity ? { complexity: a.complexity as unknown as Record<string, unknown> } : {})
     }))

@@ -249,11 +249,33 @@ export interface NudgeEvent {
   edited?: boolean;
 }
 
+/**
+ * Persistent lifetime stats that survive post-sync compaction.
+ * Stored under key 'accumulatedStats' in chrome.storage.local.
+ */
+export interface AccumulatedStats {
+  // Maps conversationId → domain for deduplication and domain breakdown
+  knownConversations: Record<string, string>;
+
+  // Lifetime counters (increment-only)
+  lifetimeCopies: number;
+  lifetimeTurns: number; // only real turns, NOT inferred from copy
+
+  // Running sum + count for avg response time
+  lifetimeResponseTimeSum: number;
+  lifetimeResponseTimeCount: number;
+
+  // Nudge counters (copy-triggered only)
+  lifetimeNudgeShown: number;
+  lifetimeNudgeAnswered: number;
+  lifetimeNudgeSkipped: number;
+}
+
 export interface NudgeAggregateStats {
   totalShown: number;
   answered: number;
   skipped: number;
-  dismissRateByQuestionType: Record<NudgeTriggerType, number>;
+  dismissRate: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,8 +303,7 @@ export interface VerifyParticipantResult {
 export interface AnalyticsSummary {
   totalCopies: number;
   totalConversations: number;
-  totalPromptLength: number;
-  totalResponseLength: number;
+  totalTurns: number;
   averageResponseTime: number;
   domainBreakdown: Record<string, number>;
 }

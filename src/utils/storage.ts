@@ -2,9 +2,9 @@ import type {
   CopyActivity,
   ConversationLog,
   ConversationTurn,
+  AccumulatedStats,
   NudgeAggregateStats,
   NudgeEvent,
-  NudgeTriggerType,
   SyncStatus
 } from '../types';
 
@@ -20,6 +20,7 @@ export class StorageManager {
   private static readonly MAX_LOCAL_CONVERSATIONS_AFTER_SYNC = 10;
   private static readonly MAX_LOCAL_COPY_ACTIVITIES_PER_CONVERSATION_AFTER_SYNC = 20;
   private static readonly MAX_LOCAL_NUDGE_EVENTS_AFTER_SYNC = 20;
+  private static readonly ACCUMULATED_STATS_KEY = 'accumulatedStats';
 
   /** Collapse whitespace for turn text comparison. */
   private static normalizeTurnText(text: string): string {
@@ -190,8 +191,10 @@ export class StorageManager {
     try {
       const data = await this.getAllConversations();
       let existing = data.find(c => c.id === threadId);
+      let isNewConversation = false;
 
       if (!existing) {
+        isNewConversation = true;
         existing = {
           id: threadId,
           url: threadInfo?.url || '',
@@ -274,6 +277,9 @@ export class StorageManager {
         return -1;
       };
 
+      // Track genuinely new (non-inferred) turns for accumulated stats
+      const newRealTurns: ConversationTurn[] = [];
+
       for (const turn of turns) {
         const mergeIdx = findMergeableTurnIndex(turn);
         if (mergeIdx !== -1) {
@@ -332,6 +338,12 @@ export class StorageManager {
         previousTurnId = turn.id;
 
         existing.turns.push(turn);
+
+        // Only count real turns (not inferred from copy button backfill)
+        const isInferred = turn.prompt?.meta?.inferredFromCopy === true;
+        if (!isInferred) {
+          newRealTurns.push(turn);
+        }
       }
       existing.lastUpdatedAt = Date.now();
       if (threadInfo?.url) existing.url = threadInfo.url;
@@ -347,6 +359,28 @@ export class StorageManager {
       await chrome.storage.local.set({
         [this.CONVERSATION_STORAGE_KEY]: data
       });
+
+      // Update accumulated stats: new conversation + new real turns
+      const convDomain = existing.domain;
+      if (isNewConversation || newRealTurns.length > 0) {
+        await this.updateAccumulatedStats((stats) => {
+          // Register conversation in dedup map (idempotent for returning conversations)
+          if (!stats.knownConversations[threadId]) {
+            stats.knownConversations[threadId] = convDomain;
+          }
+
+          // Increment turn counter and response time for each real new turn
+          for (const t of newRealTurns) {
+            stats.lifetimeTurns++;
+            if (t.responseTimeMs !== undefined && t.responseTimeMs > 0) {
+              stats.lifetimeResponseTimeSum += t.responseTimeMs;
+              stats.lifetimeResponseTimeCount++;
+            }
+          }
+
+          return stats;
+        });
+      }
     } catch (error) {
       console.error('Error upserting conversation turns:', error);
       throw error;
@@ -400,6 +434,12 @@ export class StorageManager {
       this.trimConversations(data);
 
       await chrome.storage.local.set({ [this.CONVERSATION_STORAGE_KEY]: data });
+
+      // Increment lifetime copy counter (non-duplicate copy was appended)
+      await this.updateAccumulatedStats((stats) => {
+        stats.lifetimeCopies++;
+        return stats;
+      });
     } catch (error) {
       console.error('Error attaching copy to conversation:', error);
     }
@@ -473,6 +513,17 @@ export class StorageManager {
       this.trimNudgeEvents(events);
 
       await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
+
+      // Increment lifetime nudge counters
+      await this.updateAccumulatedStats((stats) => {
+        stats.lifetimeNudgeShown++;
+        if (event.response === 'skip') {
+          stats.lifetimeNudgeSkipped++;
+        } else {
+          stats.lifetimeNudgeAnswered++;
+        }
+        return stats;
+      });
     } catch (error) {
       console.error('Error saving nudge event:', error);
       throw error;
@@ -492,16 +543,16 @@ export class StorageManager {
       const events = await this.getAllNudgeEvents();
       const existingIds = new Set(events.map((e) => e.id));
 
-      let added = 0;
+      const addedEventsList: NudgeEvent[] = [];
       for (const event of newEvents) {
         if (!existingIds.has(event.id)) {
           events.push(event);
           existingIds.add(event.id);
-          added++;
+          addedEventsList.push(event);
         }
       }
 
-      if (added === 0) {
+      if (addedEventsList.length === 0) {
         return; // All duplicates — nothing to write
       }
 
@@ -509,6 +560,19 @@ export class StorageManager {
       this.trimNudgeEvents(events);
 
       await chrome.storage.local.set({ [this.NUDGE_EVENTS_STORAGE_KEY]: events });
+
+      // Increment lifetime nudge counters for all newly added events
+      await this.updateAccumulatedStats((stats) => {
+        for (const event of addedEventsList) {
+          stats.lifetimeNudgeShown++;
+          if (event.response === 'skip') {
+            stats.lifetimeNudgeSkipped++;
+          } else {
+            stats.lifetimeNudgeAnswered++;
+          }
+        }
+        return stats;
+      });
     } catch (error) {
       console.error('Error saving nudge events batch:', error);
       throw error;
@@ -575,80 +639,96 @@ export class StorageManager {
   }
 
   /**
-   * Aggregate stats computed directly from nudge events.
+   * Aggregate stats from persistent accumulated counters.
+   * These survive post-sync compaction unlike raw nudge event counts.
    */
   static async getNudgeAggregateStats(): Promise<NudgeAggregateStats> {
-    const events = await this.getAllNudgeEvents();
-    const totalShown = events.length;
-    const skipped = events.filter((e) => e.response === 'skip').length;
-    const answered = totalShown - skipped;
-
-    const triggerTypes: NudgeTriggerType[] = ['copy', 'response'];
-    const dismissRateByQuestionType = triggerTypes.reduce<Record<NudgeTriggerType, number>>((acc, type) => {
-      const shownForType = events.filter((e) => e.triggerType === type).length;
-      const skippedForType = events.filter((e) => e.triggerType === type && e.response === 'skip').length;
-      acc[type] = shownForType > 0 ? skippedForType / shownForType : 0;
-      return acc;
-    }, {
-      copy: 0,
-      response: 0
-    });
+    const stats = await this.getAccumulatedStats();
+    const { lifetimeNudgeShown, lifetimeNudgeAnswered, lifetimeNudgeSkipped } = stats;
+    const dismissRate = lifetimeNudgeShown > 0
+      ? Math.round((lifetimeNudgeSkipped / lifetimeNudgeShown) * 100)
+      : 0;
 
     return {
-      totalShown,
-      answered,
-      skipped,
-      dismissRateByQuestionType
+      totalShown: lifetimeNudgeShown,
+      answered: lifetimeNudgeAnswered,
+      skipped: lifetimeNudgeSkipped,
+      dismissRate
     };
   }
 
   /**
-   * Get storage statistics for analysis
+   * Get storage statistics from persistent accumulated counters.
+   * These survive post-sync compaction unlike raw conversation data counts.
    */
   static async getStorageStats(): Promise<{
     totalCopies: number;
     totalConversations: number;
-    totalPromptLength: number;
-    totalResponseLength: number;
+    totalTurns: number;
     averageResponseTime: number;
     domainBreakdown: Record<string, number>;
   }> {
-    const conversations = await this.getAllConversations();
-    const copies = await this.getAllActivities();
+    const stats = await this.getAccumulatedStats();
 
-    let totalPromptLength = 0;
-    let totalResponseLength = 0;
-    let totalResponseTime = 0;
-    let responseCount = 0;
+    const totalConversations = Object.keys(stats.knownConversations).length;
 
-    conversations.forEach((c) => {
-      c.turns.forEach((t) => {
-        totalPromptLength += t.prompt.textLength;
-        totalResponseLength += t.response.textLength;
-        if (t.responseTimeMs !== undefined && t.responseTimeMs > 0) {
-          totalResponseTime += t.responseTimeMs;
-          responseCount++;
-        }
-      });
-    });
-
-    const averageResponseTime = responseCount > 0 
-      ? Math.round(totalResponseTime / responseCount) 
+    const averageResponseTime = stats.lifetimeResponseTimeCount > 0
+      ? Math.round(stats.lifetimeResponseTimeSum / stats.lifetimeResponseTimeCount)
       : 0;
 
+    // Derive domain breakdown from the knownConversations dedup map
     const domainBreakdown: Record<string, number> = {};
-    conversations.forEach(c => {
-      domainBreakdown[c.domain] = (domainBreakdown[c.domain] || 0) + 1;
-    });
+    for (const domain of Object.values(stats.knownConversations)) {
+      domainBreakdown[domain] = (domainBreakdown[domain] || 0) + 1;
+    }
 
     return {
-      totalCopies: copies.length,
-      totalConversations: conversations.length,
-      totalPromptLength,
-      totalResponseLength,
+      totalCopies: stats.lifetimeCopies,
+      totalConversations,
+      totalTurns: stats.lifetimeTurns,
       averageResponseTime,
       domainBreakdown
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Accumulated stats helpers                                          */
+  /* ------------------------------------------------------------------ */
+
+  private static defaultAccumulatedStats(): AccumulatedStats {
+    return {
+      knownConversations: {},
+      lifetimeCopies: 0,
+      lifetimeTurns: 0,
+      lifetimeResponseTimeSum: 0,
+      lifetimeResponseTimeCount: 0,
+      lifetimeNudgeShown: 0,
+      lifetimeNudgeAnswered: 0,
+      lifetimeNudgeSkipped: 0
+    };
+  }
+
+  static async getAccumulatedStats(): Promise<AccumulatedStats> {
+    try {
+      const result = await chrome.storage.local.get(this.ACCUMULATED_STATS_KEY);
+      const stored = result[this.ACCUMULATED_STATS_KEY] as AccumulatedStats | undefined;
+      return stored || this.defaultAccumulatedStats();
+    } catch (error) {
+      console.error('Error getting accumulated stats:', error);
+      return this.defaultAccumulatedStats();
+    }
+  }
+
+  static async updateAccumulatedStats(
+    updater: (current: AccumulatedStats) => AccumulatedStats
+  ): Promise<void> {
+    try {
+      const current = await this.getAccumulatedStats();
+      const updated = updater(current);
+      await chrome.storage.local.set({ [this.ACCUMULATED_STATS_KEY]: updated });
+    } catch (error) {
+      console.error('Error updating accumulated stats:', error);
+    }
   }
 
   /* ------------------------------------------------------------------ */

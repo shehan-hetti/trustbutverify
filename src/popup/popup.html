@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TrustButVerify</title>
   <link rel="stylesheet" href="./popup.css">
 </head>
+
 <body>
   <div class="container">
     <header>
@@ -29,12 +31,12 @@
           <span class="analytics-value" id="statTotalCopies">0</span>
         </div>
         <div class="analytics-card">
-          <span class="analytics-label">Avg Response Time</span>
-          <span class="analytics-value" id="statAverageResponse">0s</span>
+          <span class="analytics-label">Total Turns</span>
+          <span class="analytics-value" id="statTotalTurns">0</span>
         </div>
         <div class="analytics-card">
-          <span class="analytics-label">Total Prompt → Response</span>
-          <span class="analytics-value" id="statTextTotals">0 → 0</span>
+          <span class="analytics-label">Avg Response Time</span>
+          <span class="analytics-value" id="statAverageResponse">0s</span>
         </div>
       </div>
 
@@ -63,10 +65,7 @@
             <span class="nudge-stat-label">Dismiss Rate</span>
           </div>
         </div>
-        <div class="nudge-dismiss-breakdown">
-          <span class="nudge-dismiss-chip" id="nudgeCopyRate">Copy: 0%</span>
-          <span class="nudge-dismiss-chip" id="nudgeResponseRate">Response: 0%</span>
-        </div>
+
       </div>
     </section>
 
@@ -122,4 +121,5 @@
 
   <script type="module" src="./popup.ts"></script>
 </body>
+
 </html>

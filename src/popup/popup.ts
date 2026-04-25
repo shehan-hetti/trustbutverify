@@ -27,15 +27,13 @@ class PopupController {
   private statTotalConversations: HTMLElement;
   private statTotalCopies: HTMLElement;
   private statAverageResponse: HTMLElement;
-  private statTextTotals: HTMLElement;
+  private statTotalTurns: HTMLElement;
   private domainBreakdownList: HTMLElement;
   private analyticsSection: HTMLElement;
   private nudgeShown: HTMLElement;
   private nudgeAnswered: HTMLElement;
   private nudgeSkipped: HTMLElement;
   private nudgeDismissRate: HTMLElement;
-  private nudgeCopyRate: HTMLElement;
-  private nudgeResponseRate: HTMLElement;
   private syncStatusBadge: HTMLElement;
   private syncParticipantId: HTMLElement;
   private syncLastTime: HTMLElement;
@@ -66,15 +64,13 @@ class PopupController {
     this.statTotalConversations = document.getElementById('statTotalConversations')!;
     this.statTotalCopies = document.getElementById('statTotalCopies')!;
     this.statAverageResponse = document.getElementById('statAverageResponse')!;
-    this.statTextTotals = document.getElementById('statTextTotals')!;
+    this.statTotalTurns = document.getElementById('statTotalTurns')!;
     this.domainBreakdownList = document.getElementById('domainBreakdown')!;
     this.analyticsSection = document.getElementById('analyticsSection')!;
     this.nudgeShown = document.getElementById('nudgeShown')!;
     this.nudgeAnswered = document.getElementById('nudgeAnswered')!;
     this.nudgeSkipped = document.getElementById('nudgeSkipped')!;
     this.nudgeDismissRate = document.getElementById('nudgeDismissRate')!;
-    this.nudgeCopyRate = document.getElementById('nudgeCopyRate')!;
-    this.nudgeResponseRate = document.getElementById('nudgeResponseRate')!;
     this.syncStatusBadge = document.getElementById('syncStatusBadge')!;
     this.syncParticipantId = document.getElementById('syncParticipantId')!;
     this.syncLastTime = document.getElementById('syncLastTime')!;
@@ -224,17 +220,17 @@ class PopupController {
       this.statTotalConversations.textContent = '0';
       this.statTotalCopies.textContent = '0';
       this.statAverageResponse.textContent = '0s';
-      this.statTextTotals.textContent = '0 → 0';
+      this.statTotalTurns.textContent = '0';
       this.domainBreakdownList.innerHTML = '<li class="domain-chip">No data yet</li>';
       return;
     }
 
-    const { totalConversations, totalCopies, averageResponseTime, totalPromptLength, totalResponseLength, domainBreakdown } = this.stats;
+    const { totalConversations, totalCopies, averageResponseTime, totalTurns, domainBreakdown } = this.stats;
 
     this.statTotalConversations.textContent = totalConversations.toString();
     this.statTotalCopies.textContent = totalCopies.toString();
     this.statAverageResponse.textContent = this.formatDuration(averageResponseTime);
-    this.statTextTotals.textContent = `${totalPromptLength} → ${totalResponseLength}`;
+    this.statTotalTurns.textContent = totalTurns.toString();
 
     const domains = Object.entries(domainBreakdown);
     if (domains.length === 0) {
@@ -265,20 +261,15 @@ class PopupController {
       this.nudgeAnswered.textContent = '0';
       this.nudgeSkipped.textContent = '0';
       this.nudgeDismissRate.textContent = '0%';
-      this.nudgeCopyRate.textContent = 'Copy: 0%';
-      this.nudgeResponseRate.textContent = 'Response: 0%';
       return;
     }
 
-    const { totalShown, answered, skipped, dismissRateByQuestionType } = this.nudgeStats;
-    const overallDismissRate = totalShown > 0 ? Math.round((skipped / totalShown) * 100) : 0;
+    const { totalShown, answered, skipped, dismissRate } = this.nudgeStats;
 
     this.nudgeShown.textContent = totalShown.toString();
     this.nudgeAnswered.textContent = answered.toString();
     this.nudgeSkipped.textContent = skipped.toString();
-    this.nudgeDismissRate.textContent = `${overallDismissRate}%`;
-    this.nudgeCopyRate.textContent = `Copy: ${Math.round((dismissRateByQuestionType.copy || 0) * 100)}%`;
-    this.nudgeResponseRate.textContent = `Response: ${Math.round((dismissRateByQuestionType.response || 0) * 100)}%`;
+    this.nudgeDismissRate.textContent = `${dismissRate}%`;
   }
 
   /** Populate the domain dropdown from the current analytics breakdown. */
