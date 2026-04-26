@@ -2256,6 +2256,7 @@ interface SyncCopyPayload {
   turnSide: string | null;
   textLength: number;
   containerTextLength: number | null;
+  isFullText: boolean;
   copyCategory: string | null;
   copyCategorySource: string | null;
   copyMethod: string | null;
@@ -2331,6 +2332,7 @@ function buildSyncPayload(
       turnSide: a.turnSide ?? null,
       textLength: a.textLength,
       containerTextLength: a.containerTextLength ?? null,
+      isFullText: a.isFullText ?? false,
       copyCategory: a.copyCategory ?? null,
       copyCategorySource: a.copyCategorySource ?? null,
       copyMethod: a.trigger?.type === 'programmatic' ? 'button'

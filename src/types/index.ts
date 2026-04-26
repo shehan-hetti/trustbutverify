@@ -107,6 +107,11 @@ export interface CopyActivity {
    */
   containerTextLength?: number;
   /**
+   * True when the copied text covers the full container text (≥95% coverage).
+   * Works for all copy methods: keyboard selection, right-click, and copy button.
+   */
+  isFullText?: boolean;
+  /**
    * When turnSide is 'response', the paired prompt text captured at copy time.
    */
   pairedPromptText?: string;

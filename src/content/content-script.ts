@@ -1637,6 +1637,15 @@ class ActivityTracker {
       ? this.sanitizeCapturedText(context, extras?.turnSide, trigger.extractionStrategy).substring(0, 200)
       : undefined;
 
+    // Determine if the copied text covers the full container (full response copy).
+    // Compare lengths: ≥95% coverage = full text. Handles all copy methods uniformly:
+    //   - Copy button on full response → ratio ~1.0 → true
+    //   - Copy button on code block → ratio low → false
+    //   - Ctrl+C full select → ratio ~1.0 → true
+    //   - Ctrl+C partial select → ratio low → false
+    const containerLen = cleanedContainerText?.length ?? extras?.containerTextLength ?? 0;
+    const isFullText = containerLen > 0 && (trimmed.length / containerLen) >= 0.95;
+
     const activity: CopyActivity = {
       id: this.generateId(),
       timestamp: Date.now(),
@@ -1648,6 +1657,7 @@ class ActivityTracker {
       turnSide: extras?.turnSide,
       containerText: cleanedContainerText,
       containerTextLength: cleanedContainerText?.length ?? extras?.containerTextLength,
+      isFullText,
       pairedPromptText: extras?.pairedPromptText,
       selectionContext: cleanedContext,
       trigger: this.cleanTriggerMetadata(trigger)

@@ -57,10 +57,15 @@ export class NudgeOverlay {
   private readonly scrollIndicator: HTMLDivElement;
   private readonly skipButton: HTMLButtonElement;
   private readonly closeButton: HTMLButtonElement;
+  private readonly themeToggle: HTMLButtonElement;
+  private readonly progressBar: HTMLDivElement;
   private active: ActiveNudgeState | null = null;
+  private isDarkMode = true;
   private onResolve?: (result: NudgeOverlayResolution) => void;
   private onBatchResolve?: (results: NudgeOverlayResolution[]) => void;
   private onSessionComplete?: (fullSkip: boolean, triggerType: NudgeTriggerType) => void;
+
+  private static readonly THEME_KEY = 'tbv_nudge_theme';
 
   constructor() {
     // ── Build the overlay DOM tree ────────────────────────────────────
@@ -71,6 +76,12 @@ export class NudgeOverlay {
     this.host.style.zIndex = '2147483646';
     this.host.style.pointerEvents = 'none';
     this.host.style.display = 'none';
+
+    // Load saved theme preference
+    try {
+      const saved = sessionStorage.getItem(NudgeOverlay.THEME_KEY);
+      if (saved === 'light') this.isDarkMode = false;
+    } catch { /* ignore */ }
 
     // Inject custom scrollbar styles scoped to this overlay
     const style = document.createElement('style');
@@ -95,6 +106,16 @@ export class NudgeOverlay {
       #__tbv_nudge_overlay_questions::-webkit-scrollbar-thumb:hover {
         background: rgba(255, 255, 255, 0.25);
       }
+      /* Light mode scrollbar overrides */
+      #__tbv_nudge_overlay.tbv-light #__tbv_nudge_overlay_questions:hover::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.03);
+      }
+      #__tbv_nudge_overlay.tbv-light #__tbv_nudge_overlay_questions:hover::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.15);
+      }
+      #__tbv_nudge_overlay.tbv-light #__tbv_nudge_overlay_questions::-webkit-scrollbar-thumb:hover {
+        background: rgba(0, 0, 0, 0.25);
+      }
     `;
     this.host.appendChild(style);
 
@@ -105,7 +126,7 @@ export class NudgeOverlay {
     this.card.style.flexDirection = 'column';
     this.card.style.background = '#10131a';
     this.card.style.color = '#f4f7ff';
-    this.card.style.border = '1px solid rgba(255,255,255,0.12)';
+    this.card.style.border = '1px solid rgba(255,255,255,0.20)';
     this.card.style.borderRadius = '16px';
     this.card.style.padding = '20px';
     this.card.style.boxShadow = '0 10px 40px rgba(0,0,0,0.4)';
@@ -126,6 +147,24 @@ export class NudgeOverlay {
     this.titleEl.style.fontWeight = '700';
     this.titleEl.style.opacity = '0.95';
 
+    const headerRight = document.createElement('div');
+    headerRight.style.display = 'flex';
+    headerRight.style.alignItems = 'center';
+    headerRight.style.gap = '8px';
+
+    // ── Dark/Light mode toggle ────────────────────────────────────────
+    this.themeToggle = document.createElement('button');
+    this.themeToggle.type = 'button';
+    this.themeToggle.setAttribute('aria-label', 'Toggle dark/light mode');
+    this.themeToggle.style.border = 'none';
+    this.themeToggle.style.background = 'transparent';
+    this.themeToggle.style.cursor = 'pointer';
+    this.themeToggle.style.fontSize = '16px';
+    this.themeToggle.style.padding = '2px 4px';
+    this.themeToggle.style.lineHeight = '1';
+    this.themeToggle.style.transition = 'transform 0.2s ease';
+    this.themeToggle.addEventListener('click', () => this.toggleTheme());
+
     this.closeButton = document.createElement('button');
     this.closeButton.type = 'button';
     this.closeButton.textContent = '✕';
@@ -137,8 +176,10 @@ export class NudgeOverlay {
     this.closeButton.style.fontSize = '15px';
     this.closeButton.style.padding = '2px 4px';
 
+    headerRight.appendChild(this.themeToggle);
+    headerRight.appendChild(this.closeButton);
     header.appendChild(this.titleEl);
-    header.appendChild(this.closeButton);
+    header.appendChild(headerRight);
 
     this.previewContainer = document.createElement('div');
     this.previewContainer.style.fontSize = '15px';
@@ -169,6 +210,15 @@ export class NudgeOverlay {
     this.questionsContainer.addEventListener('mouseleave', () => {
       this.questionsContainer.style.scrollbarColor = 'transparent transparent';
     });
+
+    // ── Progress bar (question dots) ───────────────────────────────────
+    this.progressBar = document.createElement('div');
+    this.progressBar.style.flexShrink = '0';
+    this.progressBar.style.display = 'none'; // shown when >1 question
+    this.progressBar.style.alignItems = 'center';
+    this.progressBar.style.justifyContent = 'center';
+    this.progressBar.style.gap = '6px';
+    this.progressBar.style.paddingBottom = '12px';
 
     const footer = document.createElement('div');
     footer.style.flexShrink = '0';
@@ -204,6 +254,7 @@ export class NudgeOverlay {
 
     this.card.appendChild(header);
     this.card.appendChild(this.previewContainer);
+    this.card.appendChild(this.progressBar);
     this.card.appendChild(this.questionsContainer);
     this.card.appendChild(footer);
     this.host.appendChild(this.card);
@@ -237,6 +288,7 @@ export class NudgeOverlay {
       document.addEventListener('DOMContentLoaded', attach, { once: true });
     }
     this.applyPosition('bottom-right');
+    this.applyTheme();
   }
 
   setOnResolve(handler: (result: NudgeOverlayResolution) => void): void {
@@ -280,12 +332,21 @@ export class NudgeOverlay {
       this.renderQuestion(q);
     });
 
+    // Build progress dots
+    this.renderProgressDots(payload.questions);
+
     // Re-attach if somehow removed from DOM
     if (!this.host.isConnected) {
       (document.body || document.documentElement).appendChild(this.host);
     }
 
     this.host.style.display = 'block';
+
+    // Reset scroll to top on every new nudge appearance
+    this.questionsContainer.scrollTop = 0;
+
+    // Apply current theme
+    this.applyTheme();
 
     // Check initial scroll state after rendering
     setTimeout(() => this.updateScrollIndicator(), 50);
@@ -347,16 +408,22 @@ export class NudgeOverlay {
       // and clear the auto-close timeout so the popup stays open until the
       // user explicitly clicks "Done".
       this.skipButton.textContent = 'Done';
-      this.skipButton.style.border = '1px solid rgb(74 140 255)';
-      this.skipButton.style.background = 'rgb(17 62 167)';
+      this.skipButton.style.border = this.isDarkMode ? '1px solid rgb(74 140 255)' : '1px solid rgb(56 89 178)';
+      this.skipButton.style.background = this.isDarkMode ? 'rgb(17 62 167)' : 'rgb(56 103 178)';
+      this.skipButton.style.color = '#ffffff';
       this.skipButton.style.fontWeight = '600';
       this.closeButton.style.display = 'none';
       window.clearTimeout(this.active.timeoutId);
     } else if (answered > 0) {
       // Some answered — show "Skip Rest", ensure close button visible
       this.skipButton.textContent = 'Skip Rest';
-      this.skipButton.style.border = '1px solid rgba(255,255,255,0.22)';
-      this.skipButton.style.background = 'transparent';
+      this.skipButton.style.border = this.isDarkMode
+        ? '1px solid rgba(255,255,255,0.22)'
+        : '1px solid rgba(0,0,0,0.55)';
+      this.skipButton.style.background = this.isDarkMode
+        ? 'transparent'
+        : 'rgba(0,0,0,0.18)';
+      this.skipButton.style.color = this.isDarkMode ? '#f4f7ff' : '#1a1d27';
       this.skipButton.style.fontWeight = '';
       this.closeButton.style.display = '';
     } else {
@@ -397,9 +464,13 @@ export class NudgeOverlay {
       button.type = 'button';
       button.textContent = label;
       button.setAttribute('data-tbv-answer-value', String(value));
-      button.style.border = '1px solid rgba(255,255,255,0.18)';
-      button.style.background = 'rgba(255,255,255,0.06)';
-      button.style.color = '#f4f7ff';
+      button.style.border = this.isDarkMode
+        ? '1px solid rgba(255,255,255,0.18)'
+        : '1px solid rgba(0,0,0,0.15)';
+      button.style.background = this.isDarkMode
+        ? 'rgba(255,255,255,0.06)'
+        : 'rgba(0,0,0,0.04)';
+      button.style.color = this.isDarkMode ? '#f4f7ff' : '#1a1d27';
       button.style.borderRadius = '10px';
       button.style.padding = '8px 12px';
       button.style.cursor = 'pointer';
@@ -504,13 +575,20 @@ export class NudgeOverlay {
         if (b.getAttribute('data-tbv-answer-value') === String(response)) {
           // Highlight the selected answer
           b.style.border = '1px solid rgb(74 140 255)';
-          b.style.background = 'rgb(19 77 211 / 40%)';
+          // b.style.background = 'rgb(19 77 211 / 40%)';
+          b.style.background = this.isDarkMode ? 'rgb(19 77 211 / 40%)' : 'rgb(201 232 255 / 55%)';
+          b.style.color = this.isDarkMode ? '#f4f7ff' : 'rgb(19 45 121)';
           b.style.fontWeight = '600';
           b.style.opacity = '1';
         } else {
           // Dim unselected but keep clickable for potential edits
-          b.style.border = '1px solid rgba(255,255,255,0.18)';
-          b.style.background = 'rgba(255,255,255,0.06)';
+          b.style.border = this.isDarkMode
+            ? '1px solid rgba(255,255,255,0.18)'
+            : '1px solid rgba(0,0,0,0.65)';
+          b.style.background = this.isDarkMode
+            ? 'rgba(255,255,255,0.06)'
+            : 'rgba(0,0,0,0.12)';
+          b.style.color = this.isDarkMode ? '#f4f7ff' : '#1a1d27';
           b.style.fontWeight = '';
           b.style.opacity = '0.45';
         }
@@ -527,14 +605,15 @@ export class NudgeOverlay {
         confirmEl.id = confirmId;
         confirmEl.style.fontSize = '12px';
         confirmEl.style.marginTop = '4px';
-        confirmEl.style.color = '#8db7ff';
+        confirmEl.style.color = this.isDarkMode ? '#8db7ff' : 'rgb(50, 100, 220)';
         qWrapper.appendChild(confirmEl);
       }
       confirmEl.textContent = isEdit ? '✓ Answer edited' : '✓ Answer recorded';
     }
 
-    // Update the footer button text based on progress
+    // Update the footer button text and progress dots based on progress
     this.updateSkipButtonState();
+    this.updateProgressDots();
   }
 
   // ── Resolve remaining questions ─────────────────────────────────────
@@ -595,6 +674,159 @@ export class NudgeOverlay {
 
     if (this.onSessionComplete) {
       this.onSessionComplete(fullSkip, triggerType);
+    }
+  }
+
+  // ── Progress dots ───────────────────────────────────────────────────
+  private renderProgressDots(questions: NudgeOverlayQuestionPayload[]): void {
+    this.progressBar.innerHTML = '';
+    if (questions.length <= 1) {
+      this.progressBar.style.display = 'none';
+      return;
+    }
+
+    this.progressBar.style.display = 'flex';
+
+    questions.forEach((q, idx) => {
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.setAttribute('data-tbv-dot-qid', q.questionId);
+      dot.setAttribute('aria-label', `Question ${idx + 1}`);
+      dot.style.width = '15px';
+      dot.style.height = '5px';
+      dot.style.borderRadius = '30%';
+      dot.style.border = 'none';
+      dot.style.padding = '0';
+      dot.style.cursor = 'pointer';
+      dot.style.transition = 'all 0.2s ease';
+      dot.style.background = this.isDarkMode
+        ? 'rgba(255,255,255,0.25)'
+        : 'rgba(0,0,0,0.2)';
+
+      dot.addEventListener('click', () => {
+        const target = this.questionsContainer.querySelector(`#__tbv_q_${q.questionId}`) as HTMLElement | null;
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+
+      this.progressBar.appendChild(dot);
+    });
+  }
+
+  private updateProgressDots(): void {
+    if (!this.active) return;
+    const dots = this.progressBar.querySelectorAll('button[data-tbv-dot-qid]');
+    dots.forEach(dotEl => {
+      const dot = dotEl as HTMLButtonElement;
+      const qid = dot.getAttribute('data-tbv-dot-qid') || '';
+      const isAnswered = !this.active!.unansweredQuestions.has(qid);
+      if (isAnswered) {
+        dot.style.background = 'rgb(39 112 239)';
+        dot.style.transform = 'scale(1.1)';
+      } else {
+        dot.style.background = this.isDarkMode
+          ? 'rgba(255,255,255,0.25)'
+          : 'rgba(0,0,0,0.2)';
+        dot.style.boxShadow = 'none';
+        dot.style.transform = 'scale(1)';
+      }
+    });
+  }
+
+  // ── Dark/Light theme toggle ─────────────────────────────────────────
+  private toggleTheme(): void {
+    this.isDarkMode = !this.isDarkMode;
+    try {
+      sessionStorage.setItem(NudgeOverlay.THEME_KEY, this.isDarkMode ? 'dark' : 'light');
+    } catch { /* ignore */ }
+    this.applyTheme();
+  }
+
+  private applyTheme(): void {
+    if (this.isDarkMode) {
+      this.host.classList.remove('tbv-light');
+      // Dark mode
+      this.card.style.background = '#10131a';
+      this.card.style.color = '#f4f7ff';
+      this.card.style.border = '1px solid rgba(255,255,255,0.20)';
+      this.card.style.boxShadow = '0 10px 40px rgba(0,0,0,0.4)';
+      this.closeButton.style.color = '#d7deef';
+      this.themeToggle.textContent = '☀️';
+      this.themeToggle.title = 'Switch to light mode';
+      this.previewContainer.style.color = 'rgba(255,255,255,0.6)';
+      this.previewContainer.style.background = 'rgba(255,255,255,0.04)';
+      this.previewContainer.style.borderLeft = '3px solid rgb(95 154 255)';
+      this.skipButton.style.color = '#f4f7ff';
+      this.scrollIndicator.style.color = 'rgb(141, 171, 255)';
+    } else {
+      this.host.classList.add('tbv-light');
+      // Light mode
+      this.card.style.background = '#ffffff';
+      this.card.style.color = '#1a1d27';
+      this.card.style.border = '1px solid rgba(0,0,0,0.20)';
+      this.card.style.boxShadow = '0 10px 40px rgba(0,0,0,0.40)';
+      this.closeButton.style.color = '#4a4f5e';
+      this.themeToggle.textContent = '🌙';
+      this.themeToggle.title = 'Switch to dark mode';
+      this.previewContainer.style.color = 'rgba(0,0,0,0.55)';
+      this.previewContainer.style.background = 'rgba(0,0,0,0.12)';
+      this.previewContainer.style.borderLeft = '3px solid rgb(50 100 220)';
+      this.skipButton.style.color = '#1a1d27';
+      this.scrollIndicator.style.color = 'rgb(50, 100, 220)';
+    }
+
+    // Re-apply themed borders on header/footer
+    const borderColor = this.isDarkMode ? 'rgba(255,255,255,0.70)' : 'rgba(0,0,0,0.40)';
+    const headerEl = this.card.children[0] as HTMLElement;
+    if (headerEl) headerEl.style.borderBottom = `1px solid ${borderColor}`;
+    const footerEl = this.card.lastElementChild as HTMLElement;
+    if (footerEl) footerEl.style.borderTop = `1px solid ${borderColor}`;
+
+    // Re-theme answer buttons
+    this.applyThemeToButtons();
+
+    // Re-theme progress dots
+    this.updateProgressDots();
+
+    // Re-theme scrollbar behavior
+    this.questionsContainer.style.scrollbarColor = 'transparent transparent';
+  }
+
+  private applyThemeToButtons(): void {
+    const allButtons = this.questionsContainer.querySelectorAll('button[data-tbv-answer-value]');
+    allButtons.forEach(b => {
+      const btn = b as HTMLButtonElement;
+      const isSelected = btn.style.fontWeight === '600';
+      if (isSelected) {
+        // Selected state stays blue regardless of theme
+        btn.style.border = '1px solid rgb(74 140 255)';
+        btn.style.background = this.isDarkMode ? 'rgb(19 77 211 / 40%)' : 'rgb(201 232 255 / 55%)';
+        btn.style.color = this.isDarkMode ? '#f4f7ff' : 'rgb(19 45 121)';
+      } else {
+        btn.style.border = this.isDarkMode
+          ? '1px solid rgba(255,255,255,0.18)'
+          : '1px solid rgba(0,0,0,0.65)';
+        btn.style.background = this.isDarkMode
+          ? 'rgba(255,255,255,0.06)'
+          : 'rgba(0,0,0,0.12)';
+        btn.style.color = this.isDarkMode ? '#f4f7ff' : '#1a1d27';
+      }
+    });
+
+    // Re-theme skip button
+    if (this.skipButton.textContent === 'Done') {
+      this.skipButton.style.border = this.isDarkMode ? '1px solid rgb(74 140 255)' : '1px solid rgb(56 89 178)';
+      this.skipButton.style.background = this.isDarkMode ? 'rgb(17 62 167)' : 'rgb(56 103 178)';
+      this.skipButton.style.color = '#ffffff';
+    } else {
+      this.skipButton.style.border = this.isDarkMode
+        ? '1px solid rgba(255,255,255,0.22)'
+        : '1px solid rgba(0,0,0,0.55)';
+      this.skipButton.style.background = this.isDarkMode
+        ? 'transparent'
+        : 'rgba(0,0,0,0.18)';
+      this.skipButton.style.color = this.isDarkMode ? '#f4f7ff' : '#1a1d27';
     }
   }
 
