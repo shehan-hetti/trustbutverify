@@ -30,10 +30,10 @@ function flowTrace(event: string, detail?: Record<string, unknown>): void {
   console.log('[TBV FLOW][Worker]', event);
 }
 
-// LLM-2 (CSC cloud) categorization settings (hardcoded per requirement)
-const LLM2_URL = 'https://llm.trustbutverify.dev/completion';
-const LLM2_USER = 'llmuser';
-const LLM2_PASS = 'Test@123';
+// LLM-2 (CSC cloud) categorization settings
+const LLM2_URL = import.meta.env.VITE_LLM2_URL || '';
+const LLM2_USER = import.meta.env.VITE_LLM2_USER || '';
+const LLM2_PASS = import.meta.env.VITE_LLM2_PASS || '';
 
 const categorizationInFlightByThreadId = new Map<string, Promise<void>>();
 const copyCategorizationInFlightByActivityId = new Map<string, Promise<void>>();
@@ -183,7 +183,8 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       strategy: activity.trigger?.extractionStrategy || null,
       method: activity.trigger?.method || activity.trigger?.type || null,
       hasPairedPrompt: Boolean(activity.pairedPromptText),
-      copiedTextPreview: (activity.copiedText || '').slice(0, 80)
+      containerTextLen: activity.containerTextLength ?? null,
+      pairedPromptLen: activity.pairedPromptText?.length ?? null
     });
     flowTrace('handleCopyEvent:start', {
       id: activity.id,
@@ -923,8 +924,7 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     convId: activity.conversationId,
     turnsInConvo: convo.turns.length,
     candidateLen: candidate.length,
-    candidatePromptLen: candidatePrompt.length,
-    candidatePreview: candidate.slice(0, 60)
+    candidatePromptLen: candidatePrompt.length
   });
 
   const sidePrefs: Array<'prompt' | 'response'> = activity.turnSide ? [activity.turnSide] : ['prompt', 'response'];
@@ -1189,7 +1189,7 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
           copyId: activity.id,
           status: r.status,
           statusText: r.statusText,
-          bodyPreview: text.slice(0, 400)
+          bodyLen: text.length
         });
         return;
       }
@@ -1218,7 +1218,7 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
       if (!category) {
         console.warn('[TBV CAT][LLM-COPY] NO-CATEGORY — LLM-2 returned no parseable category; leaving pending', {
           copyId: activity.id,
-          contentPreview: (content ?? text).slice(0, 400)
+          contentLen: (content ?? text).length
         });
         return;
       }
@@ -1291,7 +1291,8 @@ async function handleUpsertConversationTurns(payload: {
       threadId: payload.threadId,
       turnCount: payload.turns.length,
       turnIds: payload.turns.map(t => t.id || '(new)'),
-      firstPromptPreview: (payload.turns[0]?.prompt?.text || '').slice(0, 60)
+      firstPromptLen: payload.turns[0]?.prompt?.textLength ?? 0,
+      firstResponseLen: payload.turns[0]?.response?.textLength ?? 0
     });
     flowTrace('handleUpsertConversationTurns:start', {
       threadId: payload.threadId,
@@ -1410,7 +1411,7 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       console.warn('[TrustButVerify] LLM-2 categorization request failed', {
         status: r.status,
         statusText: r.statusText,
-        bodyPreview: text.slice(0, 400)
+        bodyLen: text.length
       });
       return null;
     }
@@ -1550,7 +1551,8 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
         console.log('[TBV CAT][LLM-TURN] REQUESTING LLM-2 categorization (attempt 1)', {
           threadId,
           turnId: turn.id,
-          promptPreview: (turn.prompt.text || '').slice(0, 60)
+          promptLen: turn.prompt.textLength,
+          responseLen: turn.response.textLength
         });
 
         let completion = await requestTurnCategorization(turn, { temperature: 0.0, n_predict: 120 });
@@ -1567,7 +1569,7 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           console.warn('[TBV CAT][LLM-TURN] UNCATEGORIZED — both LLM-2 attempts failed', {
             threadId,
             turnId: turn.id,
-            contentPreview: (completion ?? '').slice(0, 400)
+            contentLen: (completion ?? '').length
           });
           results.push({
             turnId: turn.id,
@@ -1581,7 +1583,7 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           threadId,
           turnId: turn.id,
           category: extracted.category,
-          summaryPreview: extracted.summary.slice(0, 80)
+          summaryLen: extracted.summary.length
         });
 
         results.push({

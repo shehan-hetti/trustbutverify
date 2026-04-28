@@ -1608,7 +1608,7 @@ class ActivityTracker {
     // when the user clicks "Share". Skip these — they're not user-selected
     // content from a conversation.
     if (this.looksLikeShareLink(trimmed)) {
-      console.debug('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
+      console.debug('[TrustButVerify] Skipping share-link copy (filtered)');
       return;
     }
 

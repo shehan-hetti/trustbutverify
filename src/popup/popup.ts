@@ -22,8 +22,6 @@ class PopupController {
   private clearBtn: HTMLButtonElement;
   private searchInput: HTMLInputElement;
   private domainFilter: HTMLSelectElement;
-  private exportJsonBtn: HTMLButtonElement;
-  private exportCsvBtn: HTMLButtonElement;
   private statTotalConversations: HTMLElement;
   private statTotalCopies: HTMLElement;
   private statAverageResponse: HTMLElement;
@@ -59,8 +57,6 @@ class PopupController {
     this.clearBtn = document.getElementById('clearBtn') as HTMLButtonElement;
     this.searchInput = document.getElementById('searchInput') as HTMLInputElement;
     this.domainFilter = document.getElementById('domainFilter') as HTMLSelectElement;
-    this.exportJsonBtn = document.getElementById('exportJsonBtn') as HTMLButtonElement;
-    this.exportCsvBtn = document.getElementById('exportCsvBtn') as HTMLButtonElement;
     this.statTotalConversations = document.getElementById('statTotalConversations')!;
     this.statTotalCopies = document.getElementById('statTotalCopies')!;
     this.statAverageResponse = document.getElementById('statAverageResponse')!;
@@ -147,8 +143,7 @@ class PopupController {
       }, 250);
     });
 
-    this.exportJsonBtn.addEventListener('click', () => this.handleExport('json'));
-    this.exportCsvBtn.addEventListener('click', () => this.handleExport('csv'));
+
   }
 
   private async loadAnalytics(): Promise<void> {
@@ -408,72 +403,7 @@ class PopupController {
     }
   }
 
-  /** Export conversations as JSON or CSV download. */
-  private handleExport(format: 'json' | 'csv'): void {
-    if (this.conversations.length === 0) {
-      alert('No conversations available to export yet.');
-      return;
-    }
 
-    const timestamp = new Date().toISOString().slice(0, 10);
-    if (format === 'json') {
-      const blob = new Blob([JSON.stringify(this.conversations, null, 2)], { type: 'application/json' });
-      this.downloadBlob(blob, `tbv-conversations-${timestamp}.json`);
-    } else {
-      const csv = this.createCsv(this.conversations);
-      const blob = new Blob([csv], { type: 'text/csv' });
-      this.downloadBlob(blob, `tbv-conversations-${timestamp}.csv`);
-    }
-  }
-
-  private downloadBlob(blob: Blob, filename: string): void {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  /**
-   * Build a CSV string from conversations — one row per turn for easier
-   * analysis in spreadsheet tools.
-   */
-  private createCsv(conversations: ConversationLog[]): string {
-    // One row per turn for easier analysis
-    const headers = ['conversationId', 'domain', 'createdAt', 'lastUpdatedAt', 'promptTs', 'responseTs', 'responseTimeMs', 'promptLength', 'responseLength', 'promptText', 'responseText', 'url'];
-    const rows: string[] = [];
-    conversations.forEach((c) => {
-      c.turns.forEach((t) => {
-        const cells: Array<string | number | undefined> = [
-          c.id,
-          c.domain,
-          new Date(c.createdAt).toISOString(),
-          new Date(c.lastUpdatedAt).toISOString(),
-          new Date(t.prompt.ts).toISOString(),
-          new Date(t.response.ts).toISOString(),
-          t.responseTimeMs,
-          t.prompt.textLength,
-          t.response.textLength,
-          t.prompt.text,
-          t.response.text,
-          c.url
-        ];
-        rows.push(cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(','));
-      });
-    });
-    return [headers.join(','), ...rows].join('\n');
-  }
-
-  /** Quote and escape a CSV cell value (RFC 4180). */
-  private escapeCsv(value: string): string {
-    if (value.includes('"') || value.includes(',') || value.includes('\n')) {
-      return `"${value.replace(/"/g, '""')}"`;
-    }
-    return value;
-  }
 
   private switchTab(tab: 'conversations' | 'copies'): void {
     if (this.currentTab === tab) {
