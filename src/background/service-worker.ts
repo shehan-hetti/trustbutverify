@@ -1882,8 +1882,12 @@ async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType
       state.continuousSkips += 1;
       console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
       if (state.continuousSkips >= 3) {
-        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 1 minute
-        console.debug('[TrustButVerify] Nudges paused for 1 minute due to 3 continuous skips');
+        state.pausedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
+        state.continuousSkips = 0;
+        console.debug('[TrustButVerify] Nudges paused for 15 minutes due to 3 consecutive skips — counter reset');
+      } else {
+        state.pausedUntil = Date.now() + 5 * 60 * 1000; // 5 minutes
+        console.debug(`[TrustButVerify] Nudges paused for 5 minutes (skip ${state.continuousSkips}/3)`);
       }
     } else {
       if (state.continuousSkips > 0) {
@@ -1917,16 +1921,18 @@ async function trySendCopyNudge(
     console.debug('[TrustButVerify] Cooldown state:', state);
 
     if (Date.now() < state.pausedUntil) {
-      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.');
+      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.', {
+        remainingMs: state.pausedUntil - Date.now(),
+        continuousSkips: state.continuousSkips
+      });
       return;
     }
 
-    // Pause expired → reset the skip counter so the user gets a fresh 3-skip allowance.
-    if (state.continuousSkips >= 3) {
-      state.continuousSkips = 0;
+    // Pause expired → clear pausedUntil so we don't keep logging stale state.
+    if (state.pausedUntil > 0) {
       state.pausedUntil = 0;
       await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
-      console.debug('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
+      console.debug('[TrustButVerify] Cooldown expired — cleared pausedUntil');
     }
 
     const questions = getActiveNudgeQuestions('copy');
