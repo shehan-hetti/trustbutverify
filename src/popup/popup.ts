@@ -22,20 +22,16 @@ class PopupController {
   private clearBtn: HTMLButtonElement;
   private searchInput: HTMLInputElement;
   private domainFilter: HTMLSelectElement;
-  private exportJsonBtn: HTMLButtonElement;
-  private exportCsvBtn: HTMLButtonElement;
   private statTotalConversations: HTMLElement;
   private statTotalCopies: HTMLElement;
   private statAverageResponse: HTMLElement;
-  private statTextTotals: HTMLElement;
+  private statTotalTurns: HTMLElement;
   private domainBreakdownList: HTMLElement;
   private analyticsSection: HTMLElement;
   private nudgeShown: HTMLElement;
   private nudgeAnswered: HTMLElement;
   private nudgeSkipped: HTMLElement;
   private nudgeDismissRate: HTMLElement;
-  private nudgeCopyRate: HTMLElement;
-  private nudgeResponseRate: HTMLElement;
   private syncStatusBadge: HTMLElement;
   private syncParticipantId: HTMLElement;
   private syncLastTime: HTMLElement;
@@ -61,20 +57,16 @@ class PopupController {
     this.clearBtn = document.getElementById('clearBtn') as HTMLButtonElement;
     this.searchInput = document.getElementById('searchInput') as HTMLInputElement;
     this.domainFilter = document.getElementById('domainFilter') as HTMLSelectElement;
-    this.exportJsonBtn = document.getElementById('exportJsonBtn') as HTMLButtonElement;
-    this.exportCsvBtn = document.getElementById('exportCsvBtn') as HTMLButtonElement;
     this.statTotalConversations = document.getElementById('statTotalConversations')!;
     this.statTotalCopies = document.getElementById('statTotalCopies')!;
     this.statAverageResponse = document.getElementById('statAverageResponse')!;
-    this.statTextTotals = document.getElementById('statTextTotals')!;
+    this.statTotalTurns = document.getElementById('statTotalTurns')!;
     this.domainBreakdownList = document.getElementById('domainBreakdown')!;
     this.analyticsSection = document.getElementById('analyticsSection')!;
     this.nudgeShown = document.getElementById('nudgeShown')!;
     this.nudgeAnswered = document.getElementById('nudgeAnswered')!;
     this.nudgeSkipped = document.getElementById('nudgeSkipped')!;
     this.nudgeDismissRate = document.getElementById('nudgeDismissRate')!;
-    this.nudgeCopyRate = document.getElementById('nudgeCopyRate')!;
-    this.nudgeResponseRate = document.getElementById('nudgeResponseRate')!;
     this.syncStatusBadge = document.getElementById('syncStatusBadge')!;
     this.syncParticipantId = document.getElementById('syncParticipantId')!;
     this.syncLastTime = document.getElementById('syncLastTime')!;
@@ -151,8 +143,7 @@ class PopupController {
       }, 250);
     });
 
-    this.exportJsonBtn.addEventListener('click', () => this.handleExport('json'));
-    this.exportCsvBtn.addEventListener('click', () => this.handleExport('csv'));
+
   }
 
   private async loadAnalytics(): Promise<void> {
@@ -224,17 +215,17 @@ class PopupController {
       this.statTotalConversations.textContent = '0';
       this.statTotalCopies.textContent = '0';
       this.statAverageResponse.textContent = '0s';
-      this.statTextTotals.textContent = '0 → 0';
+      this.statTotalTurns.textContent = '0';
       this.domainBreakdownList.innerHTML = '<li class="domain-chip">No data yet</li>';
       return;
     }
 
-    const { totalConversations, totalCopies, averageResponseTime, totalPromptLength, totalResponseLength, domainBreakdown } = this.stats;
+    const { totalConversations, totalCopies, averageResponseTime, totalTurns, domainBreakdown } = this.stats;
 
     this.statTotalConversations.textContent = totalConversations.toString();
     this.statTotalCopies.textContent = totalCopies.toString();
     this.statAverageResponse.textContent = this.formatDuration(averageResponseTime);
-    this.statTextTotals.textContent = `${totalPromptLength} → ${totalResponseLength}`;
+    this.statTotalTurns.textContent = totalTurns.toString();
 
     const domains = Object.entries(domainBreakdown);
     if (domains.length === 0) {
@@ -265,20 +256,15 @@ class PopupController {
       this.nudgeAnswered.textContent = '0';
       this.nudgeSkipped.textContent = '0';
       this.nudgeDismissRate.textContent = '0%';
-      this.nudgeCopyRate.textContent = 'Copy: 0%';
-      this.nudgeResponseRate.textContent = 'Response: 0%';
       return;
     }
 
-    const { totalShown, answered, skipped, dismissRateByQuestionType } = this.nudgeStats;
-    const overallDismissRate = totalShown > 0 ? Math.round((skipped / totalShown) * 100) : 0;
+    const { totalShown, answered, skipped, dismissRate } = this.nudgeStats;
 
     this.nudgeShown.textContent = totalShown.toString();
     this.nudgeAnswered.textContent = answered.toString();
     this.nudgeSkipped.textContent = skipped.toString();
-    this.nudgeDismissRate.textContent = `${overallDismissRate}%`;
-    this.nudgeCopyRate.textContent = `Copy: ${Math.round((dismissRateByQuestionType.copy || 0) * 100)}%`;
-    this.nudgeResponseRate.textContent = `Response: ${Math.round((dismissRateByQuestionType.response || 0) * 100)}%`;
+    this.nudgeDismissRate.textContent = `${dismissRate}%`;
   }
 
   /** Populate the domain dropdown from the current analytics breakdown. */
@@ -417,72 +403,7 @@ class PopupController {
     }
   }
 
-  /** Export conversations as JSON or CSV download. */
-  private handleExport(format: 'json' | 'csv'): void {
-    if (this.conversations.length === 0) {
-      alert('No conversations available to export yet.');
-      return;
-    }
 
-    const timestamp = new Date().toISOString().slice(0, 10);
-    if (format === 'json') {
-      const blob = new Blob([JSON.stringify(this.conversations, null, 2)], { type: 'application/json' });
-      this.downloadBlob(blob, `tbv-conversations-${timestamp}.json`);
-    } else {
-      const csv = this.createCsv(this.conversations);
-      const blob = new Blob([csv], { type: 'text/csv' });
-      this.downloadBlob(blob, `tbv-conversations-${timestamp}.csv`);
-    }
-  }
-
-  private downloadBlob(blob: Blob, filename: string): void {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  /**
-   * Build a CSV string from conversations — one row per turn for easier
-   * analysis in spreadsheet tools.
-   */
-  private createCsv(conversations: ConversationLog[]): string {
-    // One row per turn for easier analysis
-    const headers = ['conversationId', 'domain', 'createdAt', 'lastUpdatedAt', 'promptTs', 'responseTs', 'responseTimeMs', 'promptLength', 'responseLength', 'promptText', 'responseText', 'url'];
-    const rows: string[] = [];
-    conversations.forEach((c) => {
-      c.turns.forEach((t) => {
-        const cells: Array<string | number | undefined> = [
-          c.id,
-          c.domain,
-          new Date(c.createdAt).toISOString(),
-          new Date(c.lastUpdatedAt).toISOString(),
-          new Date(t.prompt.ts).toISOString(),
-          new Date(t.response.ts).toISOString(),
-          t.responseTimeMs,
-          t.prompt.textLength,
-          t.response.textLength,
-          t.prompt.text,
-          t.response.text,
-          c.url
-        ];
-        rows.push(cells.map((cell) => this.escapeCsv(String(cell ?? ''))).join(','));
-      });
-    });
-    return [headers.join(','), ...rows].join('\n');
-  }
-
-  /** Quote and escape a CSV cell value (RFC 4180). */
-  private escapeCsv(value: string): string {
-    if (value.includes('"') || value.includes(',') || value.includes('\n')) {
-      return `"${value.replace(/"/g, '""')}"`;
-    }
-    return value;
-  }
 
   private switchTab(tab: 'conversations' | 'copies'): void {
     if (this.currentTab === tab) {

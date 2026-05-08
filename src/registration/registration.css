@@ -4,13 +4,31 @@
   box-sizing: border-box;
 }
 
+:root {
+  --reg-bg: #f5f5f5;
+  --reg-text: #333;
+  --reg-text-secondary: #555;
+  --reg-text-muted: #888;
+  --reg-surface: #ffffff;
+  --reg-border: #e8e8e8;
+  --reg-header-from: #0286f7;
+  --reg-header-to: #002387;
+  --reg-input-border: #d0d0d0;
+  --reg-input-bg: #ffffff;
+  --reg-input-text: #333;
+  --reg-label: #444;
+  --reg-btn-from: #0286f7;
+  --reg-btn-to: #0070d4;
+  --reg-logo-filter: none;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   font-size: 14px;
   width: 380px;
   min-height: 340px;
-  background: #f5f5f5;
-  color: #333;
+  background: var(--reg-bg);
+  color: var(--reg-text);
 }
 
 .reg-container {
@@ -20,16 +38,31 @@ body {
 }
 
 .reg-header {
-  background: linear-gradient(135deg, #0286f7 0%, #002387 100%);
+  background: linear-gradient(135deg, var(--reg-header-from) 0%, var(--reg-header-to) 100%);
   color: white;
   padding: 24px 20px 18px;
   text-align: center;
 }
 
+.reg-header-brand {
+  /* display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px; */
+  margin-bottom: 2px;
+}
+
+.reg-header-logo {
+  border-radius: 6px;
+  filter: var(--reg-logo-filter);
+  position: absolute;
+  left: 20px;
+}
+
 .reg-header h1 {
   font-size: 1.3em;
   font-weight: 600;
-  margin-bottom: 4px;
+  margin-bottom: 0;
 }
 
 .reg-subtitle {
@@ -44,7 +77,7 @@ body {
 
 .reg-instructions {
   font-size: 0.92em;
-  color: #555;
+  color: var(--reg-text-secondary);
   line-height: 1.5;
   margin-bottom: 20px;
 }
@@ -58,7 +91,7 @@ body {
 .reg-label {
   font-size: 0.85em;
   font-weight: 600;
-  color: #444;
+  color: var(--reg-label);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -67,10 +100,12 @@ body {
   padding: 10px 12px;
   font-size: 0.95em;
   font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-  border: 1.5px solid #d0d0d0;
+  border: 1.5px solid var(--reg-input-border);
   border-radius: 6px;
   outline: none;
   transition: border-color 0.2s;
+  background: var(--reg-input-bg);
+  color: var(--reg-input-text);
 }
 
 .reg-input:focus {
@@ -91,7 +126,7 @@ body {
   font-size: 1em;
   font-weight: 600;
   color: white;
-  background: linear-gradient(135deg, #0286f7 0%, #0070d4 100%);
+  background: linear-gradient(135deg, var(--reg-btn-from) 0%, var(--reg-btn-to) 100%);
   border: none;
   border-radius: 6px;
   cursor: pointer;
@@ -142,6 +177,52 @@ body {
   padding: 14px 20px;
   text-align: center;
   font-size: 0.82em;
-  color: #888;
-  border-top: 1px solid #e8e8e8;
+  color: var(--reg-text-muted);
+  border-top: 1px solid var(--reg-border);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   DARK MODE
+   ═══════════════════════════════════════════════════════════════════ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --reg-bg: #1a1d27;
+    --reg-text: #e8ecf4;
+    --reg-text-secondary: #9ca3b4;
+    --reg-text-muted: #7b839a;
+    --reg-surface: #22262f;
+    --reg-border: rgba(255, 255, 255, 0.12);
+    --reg-header-from: #0a4da8;
+    --reg-header-to: #001550;
+    --reg-input-border: rgba(255, 255, 255, 0.18);
+    --reg-input-bg: #2a2e38;
+    --reg-input-text: #e8ecf4;
+    --reg-label: #9ca3b4;
+    --reg-btn-from: #0a5dc0;
+    --reg-btn-to: #0050a0;
+    --reg-logo-filter: none;
+  }
+
+  .reg-input:focus {
+    border-color: #5b8def;
+    box-shadow: 0 0 0 3px rgba(91, 141, 239, 0.15);
+  }
+
+  .reg-status.status-success {
+    background: #1a3a2a;
+    color: #4ec97a;
+    border-color: #2a5a3a;
+  }
+
+  .reg-status.status-error {
+    background: #3a1a1a;
+    color: #f07060;
+    border-color: #5a2a2a;
+  }
+
+  .reg-status.status-loading {
+    background: #1a2a4a;
+    color: #5b9cf7;
+    border-color: #2a3a5a;
+  }
 }

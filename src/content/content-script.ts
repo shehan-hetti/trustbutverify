@@ -686,95 +686,8 @@ class ActivityTracker {
   }
 
   private setupProgrammaticCopyTracking(): void {
-    this.patchClipboardWriteText();
-    this.patchClipboardWrite();
     window.addEventListener('message', this.handleBridgeMessage);
     this.injectClipboardBridgeScript();
-  }
-
-  private patchClipboardWriteText(): void {
-    const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.writeText !== 'function') {
-      return;
-    }
-
-    // Store the TRULY original function only once, on the very first patch.
-    // This prevents patch chaining where each new instance wraps the previous
-    // instance's patched function, causing duplicate events.
-    if (!(window as any).__tbv_original_writeText) {
-      (window as any).__tbv_original_writeText = clipboard.writeText.bind(clipboard);
-    }
-    const original = (window as any).__tbv_original_writeText as typeof clipboard.writeText;
-    const tracker = this;
-
-    const patched = async function patchedWriteText(...args: Parameters<Clipboard['writeText']>) {
-      const [text] = args;
-      try {
-        tracker.handleProgrammaticCopy(typeof text === 'string' ? text : String(text), 'navigator.clipboard.writeText');
-      } catch (error) {
-        console.debug('[TrustButVerify] clipboard writeText hook error:', error);
-      }
-      return original(...args);
-    };
-
-    try {
-      Object.defineProperty(clipboard, 'writeText', {
-        value: patched,
-        configurable: true
-      });
-    } catch {
-      (clipboard as Clipboard & { writeText: typeof patched }).writeText = patched;
-    }
-
-    clipboard.__TBV_WRITE_PATCHED__ = true;
-  }
-
-  private patchClipboardWrite(): void {
-    const clipboard = navigator.clipboard as Clipboard & { __TBV_WRITE_PATCHED__?: boolean } & { __TBV_WRITE_DATA_PATCHED__?: boolean };
-    if (!clipboard || typeof clipboard.write !== 'function') {
-      return;
-    }
-
-    // Store the TRULY original function only once (same pattern as writeText)
-    if (!(window as any).__tbv_original_write) {
-      (window as any).__tbv_original_write = clipboard.write.bind(clipboard);
-    }
-    const original = (window as any).__tbv_original_write as typeof clipboard.write;
-    const tracker = this;
-
-    const patched = async function patchedWrite(...args: Parameters<Clipboard['write']>) {
-      const [items] = args;
-      if (Array.isArray(items)) {
-        items.forEach(item => {
-          if (!item || typeof item !== 'object') {
-            return;
-          }
-          if ('types' in item && Array.isArray(item.types) && item.types.includes('text/plain')) {
-            try {
-              item.getType('text/plain')
-                .then(blob => blob.text())
-                .then(text => tracker.handleProgrammaticCopy(text, 'navigator.clipboard.write'))
-                .catch(() => undefined);
-            } catch (error) {
-              console.debug('[TrustButVerify] clipboard write hook error:', error);
-            }
-          }
-        });
-      }
-
-      return original(...args);
-    };
-
-    try {
-      Object.defineProperty(clipboard, 'write', {
-        value: patched,
-        configurable: true
-      });
-    } catch {
-      (clipboard as Clipboard & { write: typeof patched }).write = patched;
-    }
-
-    clipboard.__TBV_WRITE_DATA_PATCHED__ = true;
   }
 
   private injectClipboardBridgeScript(): void {
@@ -847,11 +760,11 @@ class ActivityTracker {
     const combinedMetadata = this.mergeTriggerMetadata(fallbackMetadata, metadata?.trigger);
 
     const trigger: CopyActivityTrigger = {
+      ...combinedMetadata,
       type: 'programmatic',
       method,
       expanded: false,
       extractionStrategy: expanded?.strategy || 'programmatic:fallback',
-      ...combinedMetadata
     };
 
     const containerText = expanded?.containerText || trimmed;
@@ -1695,7 +1608,7 @@ class ActivityTracker {
     // when the user clicks "Share". Skip these — they're not user-selected
     // content from a conversation.
     if (this.looksLikeShareLink(trimmed)) {
-      console.debug('[TrustButVerify] Skipping share-link copy:', trimmed.substring(0, 80));
+      console.debug('[TrustButVerify] Skipping share-link copy (filtered)');
       return;
     }
 
@@ -1724,6 +1637,15 @@ class ActivityTracker {
       ? this.sanitizeCapturedText(context, extras?.turnSide, trigger.extractionStrategy).substring(0, 200)
       : undefined;
 
+    // Determine if the copied text covers the full container (full response copy).
+    // Compare lengths: ≥95% coverage = full text. Handles all copy methods uniformly:
+    //   - Copy button on full response → ratio ~1.0 → true
+    //   - Copy button on code block → ratio low → false
+    //   - Ctrl+C full select → ratio ~1.0 → true
+    //   - Ctrl+C partial select → ratio low → false
+    const containerLen = cleanedContainerText?.length ?? extras?.containerTextLength ?? 0;
+    const isFullText = containerLen > 0 && (trimmed.length / containerLen) >= 0.95;
+
     const activity: CopyActivity = {
       id: this.generateId(),
       timestamp: Date.now(),
@@ -1735,11 +1657,11 @@ class ActivityTracker {
       turnSide: extras?.turnSide,
       containerText: cleanedContainerText,
       containerTextLength: cleanedContainerText?.length ?? extras?.containerTextLength,
+      isFullText,
       pairedPromptText: extras?.pairedPromptText,
       selectionContext: cleanedContext,
       trigger: this.cleanTriggerMetadata(trigger)
     };
-
     await this.sendToBackground(activity);
   }
 

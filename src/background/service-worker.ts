@@ -30,10 +30,10 @@ function flowTrace(event: string, detail?: Record<string, unknown>): void {
   console.log('[TBV FLOW][Worker]', event);
 }
 
-// LLM-2 (CSC cloud) categorization settings (hardcoded per requirement)
-const LLM2_URL = 'https://llm.trustbutverify.dev/completion';
-const LLM2_USER = 'llmuser';
-const LLM2_PASS = 'Test@123';
+// LLM-2 (CSC cloud) categorization settings
+const LLM2_URL = import.meta.env.VITE_LLM2_URL || '';
+const LLM2_USER = import.meta.env.VITE_LLM2_USER || '';
+const LLM2_PASS = import.meta.env.VITE_LLM2_PASS || '';
 
 const categorizationInFlightByThreadId = new Map<string, Promise<void>>();
 const copyCategorizationInFlightByActivityId = new Map<string, Promise<void>>();
@@ -174,6 +174,18 @@ async function handleMessage(
  */
 async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.MessageSender): Promise<MessageResponse> {
   try {
+    console.log('[TBV CAT][1] handleCopyEvent:ENTRY', {
+      copyId: activity.id,
+      convId: activity.conversationId,
+      domain: activity.domain,
+      turnSide: activity.turnSide,
+      textLen: activity.textLength,
+      strategy: activity.trigger?.extractionStrategy || null,
+      method: activity.trigger?.method || activity.trigger?.type || null,
+      hasPairedPrompt: Boolean(activity.pairedPromptText),
+      containerTextLen: activity.containerTextLength ?? null,
+      pairedPromptLen: activity.pairedPromptText?.length ?? null
+    });
     flowTrace('handleCopyEvent:start', {
       id: activity.id,
       conversationId: activity.conversationId,
@@ -185,6 +197,7 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
 
     // Defense-in-depth: process only response-side copy activity.
     if (activity.turnSide !== 'response') {
+      console.log('[TBV CAT][1] handleCopyEvent:SKIP non-response', { copyId: activity.id, turnSide: activity.turnSide || null });
       flowTrace('handleCopyEvent:skip-non-response', {
         id: activity.id,
         turnSide: activity.turnSide || null,
@@ -194,15 +207,38 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       return { success: true };
     }
 
+    console.log('[TBV CAT][2] enrichCopyActivity:FIRST-ATTEMPT', { copyId: activity.id });
     let enriched = await enrichCopyActivity(activity);
+    console.log('[TBV CAT][2] enrichCopyActivity:FIRST-RESULT', {
+      copyId: enriched.id,
+      turnId: enriched.turnId || null,
+      copyCategory: enriched.copyCategory || null,
+      copyCategorySource: enriched.copyCategorySource || null
+    });
 
     // Recovery path: if turn capture missed but copy contains a paired prompt + full response,
     // infer and upsert a turn from copy metadata, then rematch.
     let backfilledConvId: string | undefined;
     if (!enriched.turnId) {
+      console.log('[TBV CAT][3] BACKFILL-PATH:ENTER — no turnId, trying backfill', { copyId: enriched.id, convId: enriched.conversationId });
       backfilledConvId = enriched.conversationId;
       await tryBackfillTurnFromCopy(enriched);
+      console.log('[TBV CAT][3] enrichCopyActivity:SECOND-ATTEMPT (post-backfill)', { copyId: enriched.id });
       enriched = await enrichCopyActivity(enriched);
+      console.log('[TBV CAT][3] enrichCopyActivity:SECOND-RESULT', {
+        copyId: enriched.id,
+        turnId: enriched.turnId || null,
+        copyCategory: enriched.copyCategory || null,
+        copyCategorySource: enriched.copyCategorySource || null
+      });
+    } else {
+      console.log('[TBV CAT][3] BACKFILL-PATH:SKIP — turnId already found', { copyId: enriched.id, turnId: enriched.turnId });
+    }
+
+    // If enriched matched a turn, check if copy has richer response text than the stored turn.
+    // This self-heals truncated responses caused by background tab DOM throttling.
+    if (enriched.turnId && enriched.containerText) {
+      await tryHealTruncatedTurn(enriched);
     }
 
     // Compute readability metrics for response-side copies.
@@ -214,12 +250,33 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
       }
     }
 
+    console.log('[TBV CAT][4] PRE-SAVE state', {
+      copyId: enriched.id,
+      turnId: enriched.turnId || null,
+      copyCategory: enriched.copyCategory || null,
+      copyCategorySource: enriched.copyCategorySource || null
+    });
     await StorageManager.saveActivity(enriched);
+    console.log('[TBV CAT][4] SAVED to storage', { copyId: enriched.id });
 
     // If we couldn't match to a stored turn, queue LLM-2 fallback (debounced).
     // This avoids firing network calls immediately on every copy.
     if (!enriched.turnId && (!enriched.copyCategory || enriched.copyCategory === 'pending')) {
+      console.log('[TBV CAT][5] QUEUE-PATH:ENTER — no turnId + no final category, enqueueing for LLM-2', { copyId: enriched.id, copyCategory: enriched.copyCategory || null });
       void enqueueCopyCategorizationIfNeeded(enriched);
+    } else if (enriched.turnId && (!enriched.copyCategory || enriched.copyCategory === 'pending')) {
+      console.log('[TBV CAT][5] WAIT-FOR-TURN-CAT — has turnId but category pending, will propagate later', {
+        copyId: enriched.id,
+        turnId: enriched.turnId,
+        copyCategory: enriched.copyCategory || null
+      });
+    } else {
+      console.log('[TBV CAT][5] FINAL-CATEGORY-SET at save time', {
+        copyId: enriched.id,
+        turnId: enriched.turnId || null,
+        copyCategory: enriched.copyCategory,
+        copyCategorySource: enriched.copyCategorySource
+      });
     }
     flowTrace('handleCopyEvent:done', {
       id: enriched.id,
@@ -251,6 +308,7 @@ async function handleCopyEvent(activity: CopyActivity, sender: chrome.runtime.Me
     // ── Background categorisation for backfilled turns ──
     // Fired AFTER copy is saved so categorizeLatestPendingTurn can find and
     if (backfilledConvId) {
+      console.log('[TBV CAT][6] BACKFILL-CATEGORIZE:FIRE — fire-and-forget turn categorization', { copyId: enriched.id, backfilledConvId });
       void (async () => {
         startKeepalive();
         try {
@@ -406,13 +464,73 @@ async function tryBackfillTurnFromCopy(activity: CopyActivity): Promise<void> {
   });
 }
 
+/**
+ * If a copy's containerText is significantly longer than the stored turn's
+ * response text, update the turn with the richer data. This heals responses
+ * that were truncated due to background tab DOM throttling.
+ */
+async function tryHealTruncatedTurn(activity: CopyActivity): Promise<void> {
+  if (!activity.turnId || !activity.containerText || !activity.conversationId) return;
+
+  const MIN_RATIO = 1.5;       // copy must be ≥1.5× longer
+  const MIN_DELTA_CHARS = 200;  // and ≥200 chars more
+
+  const convo = await StorageManager.getConversationById(activity.conversationId);
+  if (!convo) return;
+
+  const turn = convo.turns.find(t => t.id === activity.turnId);
+  if (!turn?.response?.text) return;
+
+  const storedLen = turn.response.text.length;
+  const copyLen = activity.containerText.length;
+  const delta = copyLen - storedLen;
+
+  if (delta < MIN_DELTA_CHARS || copyLen < storedLen * MIN_RATIO) return;
+
+  // Heal the turn with richer text from copy
+  const healedTurn: ConversationTurn = {
+    ...turn,
+    response: {
+      ...turn.response,
+      text: activity.containerText,
+      textLength: activity.containerText.length
+    }
+  };
+
+  // Recompute readability for the healed response
+  const result = computeReadability(activity.containerText);
+  if (result) {
+    healedTurn.response.readability = result.metrics;
+    healedTurn.response.complexity = result.complexity;
+  }
+
+  console.log('[TBV CAT][HEAL] Turn response healed from copy containerText', {
+    turnId: activity.turnId,
+    oldLength: storedLen,
+    newLength: copyLen,
+    delta
+  });
+
+  await StorageManager.upsertConversationTurns(
+    activity.conversationId,
+    undefined,
+    [healedTurn]
+  );
+}
+
 async function enqueueCopyCategorizationIfNeeded(activity: CopyActivity): Promise<void> {
   if (!activity.id) {
+    console.log('[TBV CAT][Q] enqueue:SKIP — no activity id');
     return;
   }
 
   // If already categorized, don't enqueue.
   if (activity.copyCategorySource || (activity.copyCategory && activity.copyCategory !== 'pending')) {
+    console.log('[TBV CAT][Q] enqueue:SKIP — already categorized', {
+      copyId: activity.id,
+      copyCategory: activity.copyCategory,
+      copyCategorySource: activity.copyCategorySource
+    });
     return;
   }
 
@@ -421,9 +539,13 @@ async function enqueueCopyCategorizationIfNeeded(activity: CopyActivity): Promis
   if (!queue.some((q) => q.id === activity.id)) {
     queue.push({ id: activity.id, attempts: 0, enqueuedAt: Date.now() });
     await chrome.storage.local.set({ [COPY_CATEGORIZATION_QUEUE_KEY]: queue });
+    console.log('[TBV CAT][Q] enqueue:ADDED to queue', { copyId: activity.id, queueLen: queue.length });
+  } else {
+    console.log('[TBV CAT][Q] enqueue:ALREADY-IN-QUEUE', { copyId: activity.id });
   }
 
   // Debounce by (re-)scheduling a run a few seconds out.
+  console.log('[TBV CAT][Q] enqueue:SCHEDULING alarm in', COPY_CATEGORIZATION_DELAY_MS, 'ms');
   scheduleCopyCategorizationRun();
 }
 
@@ -477,8 +599,15 @@ async function processCopyCategorizationQueue(): Promise<void> {
     const current = await chrome.storage.local.get(COPY_CATEGORIZATION_QUEUE_KEY);
     const queue = (current[COPY_CATEGORIZATION_QUEUE_KEY] as PendingCopyCategorizationItem[] | undefined) ?? [];
     if (queue.length === 0) {
+      console.log('[TBV CAT][QP] processQueue:EMPTY — nothing to process');
       return;
     }
+
+    console.log('[TBV CAT][QP] processQueue:START', {
+      queueLen: queue.length,
+      ids: queue.map(q => q.id),
+      attempts: queue.map(q => q.attempts)
+    });
 
     // Work oldest-first.
     queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
@@ -487,26 +616,44 @@ async function processCopyCategorizationQueue(): Promise<void> {
     const remaining = queue.slice(COPY_CATEGORIZATION_BATCH_LIMIT);
 
     for (const item of batch) {
-      if (!item?.id) continue;
+      if (!item?.id) {
+        console.log('[TBV CAT][QP] processQueue:SKIP — null item');
+        continue;
+      }
       if (item.attempts >= COPY_CATEGORIZATION_MAX_ATTEMPTS) {
+        console.log('[TBV CAT][QP] processQueue:SKIP — max attempts reached', { copyId: item.id, attempts: item.attempts });
         continue;
       }
 
       const activity = await StorageManager.getCopyActivityById(item.id);
       if (!activity) {
+        console.log('[TBV CAT][QP] processQueue:SKIP — activity not found in storage', { copyId: item.id });
         continue;
       }
 
       // Skip if it got linked/categorized while waiting.
       if (activity.turnId || activity.copyCategorySource || (activity.copyCategory && activity.copyCategory !== 'pending')) {
+        console.log('[TBV CAT][QP] processQueue:SKIP — already categorized while waiting', {
+          copyId: item.id,
+          turnId: activity.turnId || null,
+          copyCategory: activity.copyCategory || null,
+          copyCategorySource: activity.copyCategorySource || null
+        });
         continue;
       }
 
       // Per requirement: don't categorize response copies if we don't have paired prompt.
       // Re-match against turns right before fallback categorization.
       // Turns may arrive after the copy event.
+      console.log('[TBV CAT][QP] processQueue:RE-ENRICH attempt', { copyId: item.id, attempt: item.attempts + 1 });
       const rematched = await enrichCopyActivity(activity);
       if (rematched.turnId && rematched.copyCategorySource === 'turn') {
+        console.log('[TBV CAT][QP] processQueue:LATE-TURN-MATCH — turn arrived after copy, patching from turn', {
+          copyId: item.id,
+          turnId: rematched.turnId,
+          copyCategory: rematched.copyCategory,
+          copyCategorySource: rematched.copyCategorySource
+        });
         await StorageManager.patchCopyActivityById(activity.id, {
           turnId: rematched.turnId,
           turnSide: rematched.turnSide,
@@ -514,6 +661,17 @@ async function processCopyCategorizationQueue(): Promise<void> {
           copyCategorySource: rematched.copyCategorySource
         });
         continue;
+      }
+
+      // Check if re-enrich found turnId but turn category is still pending
+      if (rematched.turnId && !rematched.copyCategorySource) {
+        console.log('[TBV CAT][QP] processQueue:TURN-FOUND-BUT-PENDING — turn matched but category still pending, sending to LLM-2', {
+          copyId: item.id,
+          turnId: rematched.turnId,
+          copyCategory: rematched.copyCategory || null
+        });
+      } else {
+        console.log('[TBV CAT][QP] processQueue:NO-TURN-MATCH — sending to LLM-2 direct copy categorization', { copyId: item.id });
       }
 
       await categorizeCopyActivity(rematched);
@@ -535,7 +693,20 @@ async function processCopyCategorizationQueue(): Promise<void> {
       const a = await StorageManager.getCopyActivityById(q.id);
       const stillPending = a && !a.turnId && !a.copyCategorySource && (!a.copyCategory || a.copyCategory === 'pending');
       if (stillPending && (q.attempts + 1) < COPY_CATEGORIZATION_MAX_ATTEMPTS) {
+        console.log('[TBV CAT][QP] processQueue:RETRY — still pending after processing, re-queuing', {
+          copyId: q.id,
+          nextAttempt: q.attempts + 1
+        });
         updated.push({ ...q, attempts: q.attempts + 1 });
+      } else if (stillPending) {
+        console.log('[TBV CAT][QP] processQueue:GIVE-UP — max attempts exhausted, dropping', { copyId: q.id, attempts: q.attempts + 1 });
+      } else {
+        console.log('[TBV CAT][QP] processQueue:DONE — categorized successfully, removing from queue', {
+          copyId: q.id,
+          copyCategory: a?.copyCategory || null,
+          copyCategorySource: a?.copyCategorySource || null,
+          turnId: a?.turnId || null
+        });
       }
     }
 
@@ -547,6 +718,7 @@ async function processCopyCategorizationQueue(): Promise<void> {
     }
 
     await chrome.storage.local.set({ [COPY_CATEGORIZATION_QUEUE_KEY]: updated });
+    console.log('[TBV CAT][QP] processQueue:END', { remainingInQueue: updated.length });
 
     // If more remain, schedule another run.
     if (updated.length > 0) {
@@ -671,6 +843,47 @@ function containmentScore(a: string, b: string): number {
   return overlap * 0.9;
 }
 
+/**
+ * One-directional containment: does `inner` appear inside `outer`?
+ * Returns a score in [0..1].
+ *
+ * Unlike the symmetric containmentScore(), this only checks one direction:
+ * whether inner is a substring of outer. This prevents false positives where
+ * a very short turn response is trivially "contained" in a long copy container.
+ * Falls back to directional token overlap when substring containment fails.
+ */
+function directionalContainment(inner: string, outer: string): number {
+  const innerSoft = normalizeForMatch(inner, 'soft');
+  const outerSoft = normalizeForMatch(outer, 'soft');
+  if (!innerSoft || !outerSoft) return 0;
+  if (innerSoft === outerSoft) return 1.0;
+
+  // Soft substring check: is inner contained in outer?
+  if (outerSoft.includes(innerSoft)) {
+    return Math.min(1, innerSoft.length / outerSoft.length);
+  }
+
+  // Hard substring check (strip punctuation/whitespace)
+  const innerHard = normalizeForMatch(inner, 'hard');
+  const outerHard = normalizeForMatch(outer, 'hard');
+  if (innerHard && outerHard && outerHard.includes(innerHard)) {
+    return Math.min(1, innerHard.length / outerHard.length);
+  }
+
+  // Token overlap fallback — but only count how much of inner's
+  // tokens appear in outer (directional coverage, not max of both).
+  const innerTokens = tokenizeForOverlap(inner);
+  const outerTokens = new Set(tokenizeForOverlap(outer));
+  if (innerTokens.length === 0) return 0;
+  let common = 0;
+  for (const t of innerTokens) {
+    if (outerTokens.has(t)) common++;
+  }
+  // Scaled down: token overlap is a weaker signal than substring containment.
+  return (common / innerTokens.length) * 0.85;
+}
+
+
 async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity> {
   flowTrace('enrichCopyActivity:start', {
     id: activity.id,
@@ -680,11 +893,17 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     hasPairedPrompt: Boolean(activity.pairedPromptText)
   });
   if (!activity.conversationId) {
+    console.log('[TBV CAT][E] enrich:SKIP — no conversationId', { copyId: activity.id });
     return activity;
   }
 
   const convo = await StorageManager.getConversationById(activity.conversationId);
   if (!convo || !Array.isArray(convo.turns) || convo.turns.length === 0) {
+    console.log('[TBV CAT][E] enrich:NO-TURNS — conversation has no stored turns', {
+      copyId: activity.id,
+      convId: activity.conversationId,
+      convoExists: Boolean(convo)
+    });
     flowTrace('enrichCopyActivity:no-turns', {
       id: activity.id,
       conversationId: activity.conversationId
@@ -696,42 +915,101 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
   const candidate = normalizeText(candidateRaw);
   const candidatePrompt = normalizeText(activity.pairedPromptText || '');
   if (candidate.length < 4) {
+    console.log('[TBV CAT][E] enrich:SKIP — candidate text too short', { copyId: activity.id, candidateLen: candidate.length });
     return activity;
   }
+
+  console.log('[TBV CAT][E] enrich:MATCHING', {
+    copyId: activity.id,
+    convId: activity.conversationId,
+    turnsInConvo: convo.turns.length,
+    candidateLen: candidate.length,
+    candidatePromptLen: candidatePrompt.length
+  });
 
   const sidePrefs: Array<'prompt' | 'response'> = activity.turnSide ? [activity.turnSide] : ['prompt', 'response'];
   const turns = convo.turns.slice(-20).reverse();
 
+  // ── Prompt-first gate ────────────────────────────────────────────
+  // When we have a paired prompt, use it as the primary signal to
+  // identify which turn this copy belongs to. If no stored turn's
+  // prompt matches confidently, this copy is from an unlogged turn —
+  // skip response matching entirely and let it go to backfill/LLM-2.
+  const PROMPT_GATE_MIN_LENGTH = 8;
+  const PROMPT_GATE_THRESHOLD = 0.60;
+
+  let turnsToScore: ConversationTurn[] = turns; // default: all turns
+
+  if (candidatePrompt.length >= PROMPT_GATE_MIN_LENGTH) {
+    let bestPromptMatchScore = 0;
+    const promptMatchedTurns: ConversationTurn[] = [];
+
+    for (const turn of turns) {
+      const turnPromptText = turn.prompt?.text || '';
+      if (turnPromptText.length < 4) continue;
+      const pScore = containmentScore(candidatePrompt, turnPromptText);
+      if (pScore >= PROMPT_GATE_THRESHOLD) {
+        promptMatchedTurns.push(turn);
+      }
+      if (pScore > bestPromptMatchScore) bestPromptMatchScore = pScore;
+    }
+
+    if (promptMatchedTurns.length > 0) {
+      // Restrict response matching to only prompt-matched turn(s)
+      turnsToScore = promptMatchedTurns;
+      console.log('[TBV CAT][E] enrich:PROMPT-GATE-PASS', {
+        copyId: activity.id,
+        bestPromptScore: bestPromptMatchScore.toFixed(3),
+        matchedTurnCount: promptMatchedTurns.length,
+        turnsChecked: turns.length
+      });
+    } else {
+      // No prompt match → unlogged turn → skip response matching → LLM-2
+      console.log('[TBV CAT][E] enrich:PROMPT-GATE-REJECT', {
+        copyId: activity.id,
+        bestPromptScore: bestPromptMatchScore.toFixed(3),
+        threshold: PROMPT_GATE_THRESHOLD,
+        turnsChecked: turns.length
+      });
+      flowTrace('enrichCopyActivity:prompt-gate-reject', {
+        id: activity.id,
+        conversationId: activity.conversationId,
+        bestPromptScore: bestPromptMatchScore,
+        threshold: PROMPT_GATE_THRESHOLD
+      });
+      if (!activity.copyCategory) {
+        return { ...activity, copyCategory: 'pending' };
+      }
+      return activity;
+    }
+  }
+
   let bestTurn: ConversationTurn | null = null;
   let bestSide: 'prompt' | 'response' | null = null;
   let bestScore = 0;
-  let bestPrimaryScore = 0;
-  let bestPromptScore = 0;
 
-  for (const turn of turns) {
+  for (const turn of turnsToScore) {
     for (const side of sidePrefs) {
       const text = side === 'prompt' ? turn.prompt.text : turn.response.text;
-      const primaryScore = containmentScore(candidate, text);
-      let score = primaryScore;
-      let promptScore = 0;
+      if (!text || text.length < 4) continue;
 
-      // If we have an extracted paired prompt, use it to anchor response matching.
-      // This avoids false matches to the newest turn in the thread when copying
-      // older content from the same conversation.
-      if (side === 'response' && candidatePrompt.length >= 4) {
-        promptScore = containmentScore(candidatePrompt, turn.prompt.text || '');
-        score = (primaryScore * 0.8) + (promptScore * 0.2);
-
-        // Penalize near-zero prompt alignment unless response containment is very strong.
-        if (promptScore < 0.12 && primaryScore < 0.75) {
-          score *= 0.7;
-        }
+      // ── Length ratio guard ─────────────────────────────────────────
+      const ratio = Math.min(text.length, candidate.length)
+                  / Math.max(text.length, candidate.length);
+      if (ratio < 0.08) {
+        continue; // Extreme mismatch — skip entirely
       }
+
+      // ── Directional containment ────────────────────────────────────
+      const forwardScore = directionalContainment(candidate, text);
+      const reverseScore = ratio >= 0.3
+        ? directionalContainment(text, candidate)
+        : 0;
+
+      const score = Math.max(forwardScore, reverseScore);
 
       if (score > bestScore) {
         bestScore = score;
-        bestPrimaryScore = primaryScore;
-        bestPromptScore = promptScore;
         bestTurn = turn;
         bestSide = side;
       }
@@ -744,6 +1022,7 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
 
   // Only accept a match if there's clear containment.
   if (!bestTurn || !bestSide) {
+    console.log('[TBV CAT][E] enrich:NO-CANDIDATE — no turn scored above 0', { copyId: activity.id });
     if (!activity.copyCategory) {
       return { ...activity, copyCategory: 'pending' };
     }
@@ -751,14 +1030,23 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
   }
 
   const matchedText = bestSide === 'prompt' ? bestTurn.prompt.text : bestTurn.response.text;
-  const minLen = Math.min(candidateRaw.length, matchedText.length);
+  const maxLen = Math.max(candidateRaw.length, matchedText.length);
 
-  // Acceptance thresholds:
+  // Acceptance thresholds (based on the longer text — harder to match long content):
   // - Allow lower scores when matching long content that may have UI artifacts or truncation.
   // - Be stricter for very short texts to avoid false positives.
-  const acceptThreshold = minLen < 80 ? 0.45 : minLen < 200 ? 0.28 : 0.20;
+  const acceptThreshold = maxLen < 80 ? 0.50 : maxLen < 200 ? 0.35 : maxLen < 500 ? 0.25 : 0.20;
 
   if (bestScore < acceptThreshold) {
+    console.log('[TBV CAT][E] enrich:BELOW-THRESHOLD — best score too low', {
+      copyId: activity.id,
+      bestTurnId: bestTurn.id,
+      bestSide,
+      bestScore: bestScore.toFixed(3),
+      acceptThreshold,
+      maxLen,
+      turnCategory: bestTurn.category || null
+    });
     // Mark pending so UI/export can see this needs categorization.
     if (!activity.copyCategory) {
       return { ...activity, copyCategory: 'pending' };
@@ -772,27 +1060,12 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
     return activity;
   }
 
-  // Extra guard for response-side matching when paired prompt exists:
-  // if prompt alignment is weak, require a strong direct response match.
-  if (bestSide === 'response' && candidatePrompt.length >= 4) {
-    const strongResponseMatch = bestPrimaryScore >= 0.72;
-    const acceptablePromptAlignment = bestPromptScore >= 0.25;
-    if (!strongResponseMatch && !acceptablePromptAlignment) {
-      if (!activity.copyCategory) {
-        return { ...activity, copyCategory: 'pending' };
-      }
-      return activity;
-    }
-  }
-
   flowTrace('enrichCopyActivity:matched', {
     id: activity.id,
     conversationId: activity.conversationId,
     turnId: bestTurn.id,
     turnSide: activity.turnSide || bestSide,
     bestScore,
-    bestPrimaryScore,
-    bestPromptScore,
     turnCategory: bestTurn.category || 'pending'
   });
 
@@ -800,6 +1073,17 @@ async function enrichCopyActivity(activity: CopyActivity): Promise<CopyActivity>
   // Leave copyCategory undefined so enqueueCopyCategorizationIfNeeded() picks it
   // up for deferred re-categorization once the turn has a real category.
   const hasFinalCategory = bestTurn.category && bestTurn.category !== 'pending';
+
+  console.log('[TBV CAT][E] enrich:MATCHED', {
+    copyId: activity.id,
+    matchedTurnId: bestTurn.id,
+    matchedSide: bestSide,
+    bestScore: bestScore.toFixed(3),
+    turnCategory: bestTurn.category || null,
+    hasFinalCategory,
+    resultCopyCategory: hasFinalCategory ? bestTurn.category : '(undefined — pending turn)',
+    resultCopyCategorySource: hasFinalCategory ? 'turn' : '(undefined)'
+  });
 
   return {
     ...activity,
@@ -848,11 +1132,15 @@ function extractCategoryOnly(content: string): string | null {
     const raw = record.category;
     if (typeof raw === 'string') {
       const c = raw.trim();
-      return c.length ? c : null;
+      if (!c.length) return null;
+      // Cap at 5 labels — LLM-2 sometimes ignores the "1-5 labels" instruction.
+      const labels = c.split('|').map(l => l.trim()).filter(Boolean);
+      return labels.slice(0, 5).join('|') || null;
     }
     if (Array.isArray(raw) && raw.every((v) => typeof v === 'string')) {
-      const c = (raw as string[]).map((s) => s.trim()).filter(Boolean).join('|');
-      return c.length ? c : null;
+      // Cap at 5 labels — same guard for array-form categories.
+      const labels = (raw as string[]).map((s) => s.trim()).filter(Boolean);
+      return labels.slice(0, 5).join('|') || null;
     }
   }
   const fallback = extractCategoryFromContent(content);
@@ -861,11 +1149,21 @@ function extractCategoryOnly(content: string): string | null {
 
 async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
   if (!activity.id) {
+    console.log('[TBV CAT][LLM-COPY] SKIP — no activity id');
     return;
   }
   if (copyCategorizationInFlightByActivityId.has(activity.id)) {
+    console.log('[TBV CAT][LLM-COPY] SKIP — already in-flight', { copyId: activity.id });
     return;
   }
+
+  console.log('[TBV CAT][LLM-COPY] START — sending copy to LLM-2 for direct categorization', {
+    copyId: activity.id,
+    turnId: activity.turnId || null,
+    turnSide: activity.turnSide || null,
+    textLen: activity.textLength,
+    hasPairedPrompt: Boolean(activity.pairedPromptText)
+  });
 
   const task = (async () => {
     try {
@@ -887,10 +1185,11 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
 
       const text = await r.text();
       if (!r.ok) {
-        console.warn('[TrustButVerify] LLM-2 copy categorization request failed', {
+        console.warn('[TBV CAT][LLM-COPY] FAIL — LLM-2 HTTP error', {
+          copyId: activity.id,
           status: r.status,
           statusText: r.statusText,
-          bodyPreview: text.slice(0, 400)
+          bodyLen: text.length
         });
         return;
       }
@@ -900,7 +1199,7 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
         const respJson = JSON.parse(text) as Record<string, unknown>;
         const echoedId = respJson?.tbv_correlation_id;
         if (echoedId && echoedId !== correlationId) {
-          console.warn('[TrustButVerify] Copy correlation ID mismatch', { expected: correlationId, got: echoedId });
+          console.warn('[TBV CAT][LLM-COPY] CORRELATION-MISMATCH', { copyId: activity.id, expected: correlationId, got: echoedId });
         }
       } catch { /* ignore — extractCategoryOnly handles parsing */
       }
@@ -917,18 +1216,24 @@ async function categorizeCopyActivity(activity: CopyActivity): Promise<void> {
 
       const category = extractCategoryOnly(content ?? text);
       if (!category) {
-        console.warn('[TrustButVerify] LLM-2 copy categorization missing category; leaving pending', {
-          contentPreview: (content ?? text).slice(0, 400)
+        console.warn('[TBV CAT][LLM-COPY] NO-CATEGORY — LLM-2 returned no parseable category; leaving pending', {
+          copyId: activity.id,
+          contentLen: (content ?? text).length
         });
         return;
       }
 
+      console.log('[TBV CAT][LLM-COPY] SUCCESS — patching copy with LLM-2 category', {
+        copyId: activity.id,
+        category,
+        copyCategorySource: 'llm'
+      });
       await StorageManager.patchCopyActivityById(activity.id, {
         copyCategory: category,
         copyCategorySource: 'llm'
       });
     } catch (err) {
-      console.warn('[TrustButVerify] LLM-2 copy categorization failed (non-fatal):', err);
+      console.warn('[TBV CAT][LLM-COPY] ERROR — LLM-2 copy categorization failed (non-fatal):', { copyId: activity.id, err });
     }
   })();
 
@@ -982,6 +1287,13 @@ async function handleUpsertConversationTurns(payload: {
   turns: ConversationTurn[];
 }, sender: chrome.runtime.MessageSender): Promise<MessageResponse> {
   try {
+    console.log('[TBV CAT][T] upsertTurns:ENTRY', {
+      threadId: payload.threadId,
+      turnCount: payload.turns.length,
+      turnIds: payload.turns.map(t => t.id || '(new)'),
+      firstPromptLen: payload.turns[0]?.prompt?.textLength ?? 0,
+      firstResponseLen: payload.turns[0]?.response?.textLength ?? 0
+    });
     flowTrace('handleUpsertConversationTurns:start', {
       threadId: payload.threadId,
       turnCount: payload.turns.length,
@@ -1007,6 +1319,7 @@ async function handleUpsertConversationTurns(payload: {
     });
 
     await StorageManager.upsertConversationTurns(payload.threadId, payload.threadInfo, enrichedTurns);
+    console.log('[TBV CAT][T] upsertTurns:SAVED — turns persisted, firing background categorization', { threadId: payload.threadId });
 
     // Fire-and-forget: categorise in background with keepalive.
     // The turn is already saved above; no need to block the message handler.
@@ -1017,9 +1330,7 @@ async function handleUpsertConversationTurns(payload: {
         const t0 = Date.now();
         await categorizeLatestPendingTurn(tid);
         const dt = Date.now() - t0;
-        if (dt > 2500) {
-          console.log('[TrustButVerify] Turn categorization finished (slow):', { threadId: tid, ms: dt });
-        }
+        console.log('[TBV CAT][T] upsertTurns:CATEGORIZE-DONE', { threadId: tid, ms: dt });
       } catch (err) {
         console.warn('[TrustButVerify] Background turn categorization failed (non-fatal):', err);
       } finally {
@@ -1100,7 +1411,7 @@ async function requestTurnCategorization(turn: ConversationTurn, opts?: { temper
       console.warn('[TrustButVerify] LLM-2 categorization request failed', {
         status: r.status,
         statusText: r.statusText,
-        bodyPreview: text.slice(0, 400)
+        bodyLen: text.length
       });
       return null;
     }
@@ -1190,6 +1501,7 @@ function extractSummaryFromContent(content: string): string | null {
 
 async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
   if (categorizationInFlightByThreadId.has(threadId)) {
+    console.log('[TBV CAT][LLM-TURN] SKIP — already in-flight for thread', { threadId });
     return;
   }
 
@@ -1198,6 +1510,7 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
       const conversations = await StorageManager.getAllConversations();
       const convo = conversations.find(c => c.id === threadId);
       if (!convo || !Array.isArray(convo.turns) || convo.turns.length === 0) {
+        console.log('[TBV CAT][LLM-TURN] SKIP — no conversation or turns found', { threadId, convoExists: Boolean(convo) });
         return;
       }
 
@@ -1209,8 +1522,16 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
         .slice(-3);
 
       if (pending.length === 0) {
+        console.log('[TBV CAT][LLM-TURN] SKIP — no pending turns', { threadId, totalTurns: convo.turns.length });
         return;
       }
+
+      console.log('[TBV CAT][LLM-TURN] START', {
+        threadId,
+        pendingCount: pending.length,
+        pendingTurnIds: pending.map(p => p.t.id),
+        totalTurns: convo.turns.length
+      });
 
       const maxToProcess = 2;
 
@@ -1227,20 +1548,28 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           continue;
         }
 
+        console.log('[TBV CAT][LLM-TURN] REQUESTING LLM-2 categorization (attempt 1)', {
+          threadId,
+          turnId: turn.id,
+          promptLen: turn.prompt.textLength,
+          responseLen: turn.response.textLength
+        });
+
         let completion = await requestTurnCategorization(turn, { temperature: 0.0, n_predict: 120 });
         let extracted = completion ? extractCategoryAndSummary(completion) : null;
 
         // Retry once with slightly different sampling if the model returned non-JSON output.
         if (!extracted) {
+          console.log('[TBV CAT][LLM-TURN] RETRY — first attempt failed, trying temp=0.1', { threadId, turnId: turn.id });
           completion = await requestTurnCategorization(turn, { temperature: 0.1, n_predict: 140 });
           extracted = completion ? extractCategoryAndSummary(completion) : null;
         }
 
         if (!extracted) {
-          console.warn('[TrustButVerify] LLM-2 response missing category/summary; marking uncategorized', {
+          console.warn('[TBV CAT][LLM-TURN] UNCATEGORIZED — both LLM-2 attempts failed', {
             threadId,
             turnId: turn.id,
-            contentPreview: (completion ?? '').slice(0, 400)
+            contentLen: (completion ?? '').length
           });
           results.push({
             turnId: turn.id,
@@ -1249,6 +1578,13 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           });
           continue;
         }
+
+        console.log('[TBV CAT][LLM-TURN] LLM-2 returned category', {
+          threadId,
+          turnId: turn.id,
+          category: extracted.category,
+          summaryLen: extracted.summary.length
+        });
 
         results.push({
           turnId: turn.id,
@@ -1262,9 +1598,11 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
       // concurrent writes (new turns, copy activities, etc.) that happened
       // while the LLM calls were in flight.
       if (results.length > 0) {
+        console.log('[TBV CAT][LLM-TURN] PATCH-PHASE — re-reading storage for atomic write', { threadId, resultCount: results.length });
         const freshConversations = await StorageManager.getAllConversations();
         const freshConvo = freshConversations.find(c => c.id === threadId);
         if (!freshConvo || !Array.isArray(freshConvo.turns)) {
+          console.log('[TBV CAT][LLM-TURN] PATCH-ABORT — conversation disappeared from storage', { threadId });
           return;
         }
 
@@ -1274,6 +1612,7 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
         for (const result of results) {
           const turnIndex = freshConvo.turns.findIndex(t => t.id === result.turnId);
           if (turnIndex === -1) {
+            console.log('[TBV CAT][LLM-TURN] PATCH-SKIP — turn not found in fresh data', { threadId, turnId: result.turnId });
             continue;
           }
 
@@ -1281,6 +1620,12 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           // (e.g. copy enrichment) may have already categorized it.
           const currentCategory = freshConvo.turns[turnIndex].category;
           if (currentCategory && currentCategory !== 'pending') {
+            console.log('[TBV CAT][LLM-TURN] PATCH-SKIP — turn already categorized by another path', {
+              threadId,
+              turnId: result.turnId,
+              currentCategory,
+              wouldHaveBeen: result.category
+            });
             flowTrace('categorizeLatestPendingTurn:skipAlreadyCategorized', {
               threadId,
               turnId: result.turnId,
@@ -1294,7 +1639,8 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           freshConvo.lastUpdatedAt = now;
           anyPatched = true;
 
-          console.log('[TrustButVerify] Turn category patched:', {
+          console.log('[TBV CAT][LLM-TURN] TURN-PATCHED', {
+            threadId,
             turnId: result.turnId,
             category: result.category
           });
@@ -1302,34 +1648,53 @@ async function categorizeLatestPendingTurn(threadId: string): Promise<void> {
           // Patch linked copy activities IN THE SAME in-memory data
           if (result.category !== 'Uncategorized') {
             let copyPatchCount = 0;
+            const patchedCopyIds: string[] = [];
             for (const convo of freshConversations) {
               if (!convo.copyActivities || convo.copyActivities.length === 0) continue;
               for (let i = 0; i < convo.copyActivities.length; i++) {
                 if (convo.copyActivities[i].turnId === result.turnId) {
+                  const prevCategory = convo.copyActivities[i].copyCategory;
+                  const prevSource = convo.copyActivities[i].copyCategorySource;
                   convo.copyActivities[i] = {
                     ...convo.copyActivities[i],
                     copyCategory: result.category,
                     copyCategorySource: 'turn'
                   };
+                  patchedCopyIds.push(convo.copyActivities[i].id);
                   copyPatchCount++;
+                  console.log('[TBV CAT][LLM-TURN] COPY-PROPAGATED', {
+                    copyId: convo.copyActivities[i].id,
+                    turnId: result.turnId,
+                    prevCategory: prevCategory || null,
+                    prevSource: prevSource || null,
+                    newCategory: result.category,
+                    newSource: 'turn'
+                  });
                 }
               }
             }
-            console.log('[TrustButVerify] Copy activities patched for turn:', {
+            console.log('[TBV CAT][LLM-TURN] COPY-PROPAGATION-SUMMARY', {
               turnId: result.turnId,
               category: result.category,
-              copyPatchCount
+              copyPatchCount,
+              patchedCopyIds
+            });
+          } else {
+            console.log('[TBV CAT][LLM-TURN] COPY-PROPAGATION-SKIPPED — category is Uncategorized', {
+              turnId: result.turnId
             });
           }
         }
 
         if (anyPatched) {
           await chrome.storage.local.set({ conversationLogs: freshConversations });
-          console.log('[TrustButVerify] Wrote patched conversations to storage');
+          console.log('[TBV CAT][LLM-TURN] STORAGE-WRITE — patched conversations written', { threadId });
+        } else {
+          console.log('[TBV CAT][LLM-TURN] STORAGE-WRITE-SKIPPED — nothing to patch', { threadId });
         }
       }
     } catch (err) {
-      console.warn('[TrustButVerify] LLM-2 categorization failed (non-fatal):', err);
+      console.warn('[TBV CAT][LLM-TURN] ERROR — categorization failed (non-fatal):', err);
     }
   })();
 
@@ -1517,8 +1882,12 @@ async function handleNudgeSessionComplete(data: { fullSkip: boolean, triggerType
       state.continuousSkips += 1;
       console.log(`[TrustButVerify] Continuous full skips: ${state.continuousSkips}`);
       if (state.continuousSkips >= 3) {
-        state.pausedUntil = Date.now() + 1 * 60 * 1000; // 1 minute
-        console.debug('[TrustButVerify] Nudges paused for 1 minute due to 3 continuous skips');
+        state.pausedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
+        state.continuousSkips = 0;
+        console.debug('[TrustButVerify] Nudges paused for 15 minutes due to 3 consecutive skips — counter reset');
+      } else {
+        state.pausedUntil = Date.now() + 5 * 60 * 1000; // 5 minutes
+        console.debug(`[TrustButVerify] Nudges paused for 5 minutes (skip ${state.continuousSkips}/3)`);
       }
     } else {
       if (state.continuousSkips > 0) {
@@ -1552,16 +1921,18 @@ async function trySendCopyNudge(
     console.debug('[TrustButVerify] Cooldown state:', state);
 
     if (Date.now() < state.pausedUntil) {
-      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.');
+      console.debug('[TrustButVerify] Nudges are currently paused due to cooldown.', {
+        remainingMs: state.pausedUntil - Date.now(),
+        continuousSkips: state.continuousSkips
+      });
       return;
     }
 
-    // Pause expired → reset the skip counter so the user gets a fresh 3-skip allowance.
-    if (state.continuousSkips >= 3) {
-      state.continuousSkips = 0;
+    // Pause expired → clear pausedUntil so we don't keep logging stale state.
+    if (state.pausedUntil > 0) {
       state.pausedUntil = 0;
       await chrome.storage.local.set({ [NUDGE_COOLDOWN_KEY]: state });
-      console.debug('[TrustButVerify] Cooldown expired — reset continuousSkips to 0');
+      console.debug('[TrustButVerify] Cooldown expired — cleared pausedUntil');
     }
 
     const questions = getActiveNudgeQuestions('copy');
@@ -1879,7 +2250,7 @@ interface SyncTurnPayload {
   };
   responseTimeMs: number | null;
   category: string | null;
-  summary: string | null;
+  isInferred: boolean;
   ts: number;
 }
 
@@ -1893,8 +2264,10 @@ interface SyncCopyPayload {
   turnSide: string | null;
   textLength: number;
   containerTextLength: number | null;
+  isFullText: boolean;
   copyCategory: string | null;
   copyCategorySource: string | null;
+  copyMethod: string | null;
   readability?: Record<string, unknown>;
   complexity?: Record<string, unknown>;
 }
@@ -1954,7 +2327,7 @@ function buildSyncPayload(
       },
       responseTimeMs: t.responseTimeMs ?? null,
       category: (t.category && t.category !== 'pending') ? t.category : null,
-      summary: (t.summary && t.summary !== 'pending') ? t.summary : null,
+      isInferred: t.prompt?.meta?.inferredFromCopy === true,
       ts: t.ts
     })),
     copyActivities: (c.copyActivities || []).map((a): SyncCopyPayload => ({
@@ -1967,8 +2340,12 @@ function buildSyncPayload(
       turnSide: a.turnSide ?? null,
       textLength: a.textLength,
       containerTextLength: a.containerTextLength ?? null,
+      isFullText: a.isFullText ?? false,
       copyCategory: a.copyCategory ?? null,
       copyCategorySource: a.copyCategorySource ?? null,
+      copyMethod: a.trigger?.type === 'programmatic' ? 'button'
+                : a.trigger?.type === 'selection' ? 'keyboard'
+                : null,
       ...(a.readability ? { readability: a.readability as unknown as Record<string, unknown> } : {}),
       ...(a.complexity ? { complexity: a.complexity as unknown as Record<string, unknown> } : {})
     }))

@@ -175,7 +175,7 @@ export class ConversationDetector {
         this.traceFlow('init:restoredPrompt', {
           threadId: this.currentThreadId,
           promptLength: stored.text.length,
-          promptPreview: stored.text.substring(0, 80),
+          promptLen: stored.text.length,
           ageMs: Date.now() - stored.timestamp
         });
         return;
@@ -225,7 +225,7 @@ export class ConversationDetector {
         this.traceFlow('tryRestorePromptThenSettle:restored', {
           threadId: newThreadId,
           promptLength: stored.text.length,
-          promptPreview: stored.text.substring(0, 80),
+          promptLen: stored.text.length,
           ageMs: Date.now() - stored.timestamp
         });
         return;
@@ -593,7 +593,7 @@ export class ConversationDetector {
       if (text && text !== cachedPrompt) {
         cachedPrompt = text;
         cacheTimestamp = Date.now();
-        this.logDebug('Composer updated', cachedPrompt.substring(0, 60));
+        this.logDebug('Composer updated', { length: cachedPrompt.length });
       }
     };
 
@@ -644,12 +644,12 @@ export class ConversationDetector {
             cachedPromptLength: cachedPrompt.length
           });
           if (cachedPrompt) {
-            this.logDebug('Enter captured prompt', cachedPrompt.substring(0, 120));
+            this.logDebug('Enter captured prompt', { length: cachedPrompt.length });
             this.handlePrompt(cachedPrompt);
             this.traceFlow('observePromptSubmissions:enterCapturedPrompt', {
               threadId: this.getConversationId(),
               promptLength: cachedPrompt.length,
-              promptPreview: cachedPrompt.substring(0, 80)
+              promptLen: cachedPrompt.length
             });
             cachedPrompt = '';
           }
@@ -685,13 +685,13 @@ export class ConversationDetector {
         this.logDebug('Submit captured prompt', {
           targetTag: target?.tagName,
           targetClass: target ? (target as HTMLElement).className : undefined,
-          promptPreview: cachedPrompt.substring(0, 120)
+          promptLen: cachedPrompt.length
         });
         this.handlePrompt(cachedPrompt);
         this.traceFlow('observePromptSubmissions:submitCapturedPrompt', {
           threadId: this.getConversationId(),
           promptLength: cachedPrompt.length,
-          promptPreview: cachedPrompt.substring(0, 80)
+          promptLen: cachedPrompt.length
         });
         cachedPrompt = '';
       }
@@ -740,7 +740,7 @@ export class ConversationDetector {
         this.traceFlow('observePromptSubmissions:clickIgnoredNonSend', {
           threadId: this.getConversationId(),
           clickableAria: aria || null,
-          clickableTextPreview: txt.substring(0, 60) || null
+          clickableTextLen: txt.length
         });
         return;
       }
@@ -786,13 +786,13 @@ export class ConversationDetector {
           clickableTag: clickable.tagName,
           clickableAria: clickable.getAttribute('aria-label') || undefined,
           clickableTestId: clickable.getAttribute('data-testid') || clickable.getAttribute('data-test-id') || undefined,
-          promptPreview: cachedPrompt.substring(0, 120)
+          promptLen: cachedPrompt.length
         });
         this.handlePrompt(cachedPrompt);
         this.traceFlow('observePromptSubmissions:clickCapturedPrompt', {
           threadId: this.getConversationId(),
           promptLength: cachedPrompt.length,
-          promptPreview: cachedPrompt.substring(0, 80)
+          promptLen: cachedPrompt.length
         });
         cachedPrompt = '';
       }
@@ -957,7 +957,7 @@ export class ConversationDetector {
             class: (candidate as HTMLElement).className,
             id: (candidate as HTMLElement).id,
             messageKey,
-            textPreview: (candidate.textContent || '').substring(0, 120)
+            textLen: (candidate.textContent || ''  ).length
           });
           this.markProcessed(candidate, messageKey);
           return;
@@ -995,7 +995,7 @@ export class ConversationDetector {
             class: (candidate as HTMLElement).className,
             id: (candidate as HTMLElement).id,
             messageKey,
-            textPreview: (candidate.textContent || '').substring(0, 120)
+            textLen: (candidate.textContent || ''  ).length
           });
           return;
         }
@@ -1035,7 +1035,7 @@ export class ConversationDetector {
           class: (candidate as HTMLElement).className,
           id: (candidate as HTMLElement).id,
           messageKey,
-          textPreview: (candidate.textContent || '').substring(0, 120)
+          textLen: (candidate.textContent || ''  ).length
         });
 
         // Skip if a waitForContent chain is already active for this element
@@ -1224,7 +1224,7 @@ export class ConversationDetector {
         if (this.isPlaceholderText(normalizedText)) {
         if (waitRetryCount <= 1 || waitRetryCount % 5 === 0) {
           this.traceFlow('waitForContent:placeholderBlocked', {
-            text: normalizedText.substring(0, 80),
+            textLen: normalizedText.length,
             waitRetryCount,
             platformSignalFired,
             key: this.getElementKey(element)
@@ -1247,7 +1247,7 @@ export class ConversationDetector {
             if (waitRetryCount <= 1 || waitRetryCount % 5 === 0) {
               this.traceFlow('waitForContent:claudeNoStreamAncestor', {
                 key: this.getElementKey(element),
-                textPreview: normalizedText.substring(0, 60),
+                textLen: normalizedText.length,
                 waitRetryCount
               });
             }
@@ -1288,7 +1288,7 @@ export class ConversationDetector {
           retryCount += 1;
           this.logDebug('No pending prompt, retrying', {
             retryCount,
-            textPreview: text.substring(0, 120)
+            textLen: text.length
           });
           window.setTimeout(finalizeIfReady, PROMPT_WAIT_RETRY_MS);
           return;
@@ -1317,7 +1317,7 @@ export class ConversationDetector {
           retryCount,
           platformSignalFired
         });
-        this.extractAndSaveMessage(element);
+        this.extractWhenVisible(element);
         waitRetryCount = 0;
       }
     };
@@ -1362,7 +1362,7 @@ export class ConversationDetector {
 
     const immediateText = element.textContent?.trim() || '';
     if (immediateText.length >= 2) {
-      this.logDebug('Immediate text found', immediateText.substring(0, 120));
+      this.logDebug('Immediate text found', { length: immediateText.length });
       scheduleStabilityCheck(immediateText);
     }
 
@@ -1374,7 +1374,7 @@ export class ConversationDetector {
       }
 
       if (text !== lastStableText) {
-        this.logDebug('Mutation observed', text.substring(0, 120));
+        this.logDebug('Mutation observed', { length: text.length });
         scheduleStabilityCheck(text);
 
         // Reset the activity watchdog — LLM is still generating.
@@ -1396,7 +1396,7 @@ export class ConversationDetector {
           const fbText = (element.textContent || '').trim();
           const fbNormalized = this.normalizeText(fbText);
           this.logDebug('Fallback timeout hit (reset)', {
-            textPreview: fbText.substring(0, 120),
+            textLen: fbText.length,
             normalized: fbNormalized
           });
           if (!fbNormalized) {
@@ -1422,7 +1422,7 @@ export class ConversationDetector {
       const fallbackText = (element.textContent || '').trim();
       const normalizedText = this.normalizeText(fallbackText);
       this.logDebug('Fallback timeout hit', {
-        textPreview: fallbackText.substring(0, 120),
+        textLen: fallbackText.length,
         normalized: normalizedText
       });
 
@@ -1475,14 +1475,14 @@ export class ConversationDetector {
     absoluteMaxTimeout = window.setTimeout(() => {
       if (this.processedElements.has(element)) return;
       this.logDebug('Absolute max wait reached, forcing finalization', {
-        textPreview: (element.textContent || '').substring(0, 120)
+        textLen: (element.textContent || ''  ).length
       });
       cleanup();
       const messageKey = this.getElementKey(element);
       this.markProcessed(element, messageKey);
       const absText = element.textContent?.trim() || '';
       if (absText.length >= 2 && !this.isPlaceholderText(this.normalizeText(absText))) {
-        this.extractAndSaveMessage(element);
+        this.extractWhenVisible(element);
       }
     }, ABSOLUTE_MAX_WAIT_MS);
   }
@@ -1550,6 +1550,60 @@ export class ConversationDetector {
   }
 
   /**
+   * Wrapper around extractAndSaveMessage that defers extraction when the tab
+   * is hidden (background). Chrome throttles DOM rendering in background tabs,
+   * so reading element.textContent while hidden yields truncated text.
+   * When visibility restores, we wait a short settle period for the browser
+   * to paint the full response before extracting.
+   */
+  private extractWhenVisible(element: Element): void {
+    const VISIBILITY_SETTLE_MS = 1500;
+
+    // Refresh the migration grace window so threadGate doesn't reject
+    // elements stamped with the pre-redirect thread ID. The 15 s grace
+    // normally starts from the URL redirect, but by the time extraction
+    // runs (either immediately or after a visibility-deferred wait) it
+    // may have already expired.
+    if (this.migratedFromThreadId !== null) {
+      this.migratedFromThreadAt = Date.now();
+    }
+
+    if (document.visibilityState === 'visible') {
+      // Tab is active — extract immediately
+      this.extractAndSaveMessage(element);
+      return;
+    }
+
+    // Tab is hidden — defer until user returns
+    this.traceFlow('extractWhenVisible:deferred', {
+      threadId: this.getConversationId(),
+      key: this.getElementKey(element),
+      currentTextLength: element.textContent?.trim().length || 0
+    });
+
+    const onVisible = () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      // Let the browser paint the full DOM after becoming visible
+      setTimeout(() => {
+        // Refresh again — the user may have been away for a long time
+        if (this.migratedFromThreadId !== null) {
+          this.migratedFromThreadAt = Date.now();
+        }
+
+        this.traceFlow('extractWhenVisible:resumed', {
+          threadId: this.getConversationId(),
+          key: this.getElementKey(element),
+          textLengthAfterResume: element.textContent?.trim().length || 0,
+          migrationGraceRefreshed: this.migratedFromThreadId !== null
+        });
+        this.extractAndSaveMessage(element);
+      }, VISIBILITY_SETTLE_MS);
+    };
+
+    document.addEventListener('visibilitychange', onVisible);
+  }
+
+  /**
    * Extract and save message content
    */
   private extractAndSaveMessage(element: Element): void {
@@ -1562,7 +1616,7 @@ export class ConversationDetector {
     if (this.isDomSettling) {
       this.traceFlow('extractAndSaveMessage:domSettling', {
         threadId: currentThreadId,
-        textPreview: (text || '').substring(0, 80)
+        textLen: (text || ''  ).length
       });
       this.logDebug('Skipping capture while DOM is still settling');
       return;
@@ -1585,7 +1639,7 @@ export class ConversationDetector {
           this.traceFlow('extractAndSaveMessage:threadGate', {
             detectedThread: element.dataset.tbvDetectedThread,
             currentThread: currentThreadId,
-            textPreview: (text || '').substring(0, 80)
+            textLen: (text || ''  ).length
           });
           this.logDebug('Discarding stale capture from different thread', {
             detectedThread: element.dataset.tbvDetectedThread,
@@ -1622,7 +1676,7 @@ export class ConversationDetector {
       if (recentPromptIndex !== -1) {
         this.logDebug('Skipping element matching recent prompt history', {
           matchIndex: recentPromptIndex,
-          textPreview: normalizedResponse.substring(0, 120)
+          textLen: normalizedResponse.length
         });
         this.recentPrompts.splice(recentPromptIndex, 1);
         return;
@@ -1633,7 +1687,7 @@ export class ConversationDetector {
       const normalizedPrompt = this.normalizeText(this.pendingPrompt.text);
       if (normalizedPrompt && normalizedResponse && normalizedPrompt === normalizedResponse) {
         this.logDebug('Skipping element identical to prompt', {
-          promptPreview: normalizedPrompt.substring(0, 120),
+          promptLen: normalizedPrompt.length,
           elementTag: element.tagName
         });
         const index = this.recentPrompts.findIndex((entry) => entry.text === normalizedPrompt);
@@ -1684,8 +1738,8 @@ export class ConversationDetector {
         responseTimeMs: responseTime
       });
       this.logDebug('Turn constructed', {
-        promptPreview: turn.prompt.text.substring(0, 120),
-        responsePreview: turn.response.text.substring(0, 120),
+        promptLen: turn.prompt.textLength,
+        responseLen: turn.response.textLength,
         responseTime
       });
       const normalizedPrompt = this.normalizeText(this.pendingPrompt.text);
@@ -1724,7 +1778,7 @@ export class ConversationDetector {
       if (!hasRecentPromptIntent || !hasRecentUserInteraction || !isPromptThreadCompatible) {
         this.logDebug('Skipping inferred turn on cold load (no recent prompt intent)', {
           elementTag: element.tagName,
-          textPreview: (text || '').substring(0, 120),
+          textLen: (text || ''  ).length,
           hasRecentPromptIntent,
           hasRecentUserInteraction,
           isPromptThreadCompatible,
@@ -1755,7 +1809,7 @@ export class ConversationDetector {
         ) {
           this.traceFlow('extractAndSaveMessage:skippedDuplicateInferred', {
             threadId: currentThreadId,
-            promptPreview: inferredPromptText.substring(0, 80)
+            promptLen: inferredPromptText.length
           });
           return;
         }
@@ -1789,8 +1843,8 @@ export class ConversationDetector {
             responseLength: turn.response.textLength
           });
           this.logDebug('Turn constructed (inferred prompt)', {
-            promptPreview: turn.prompt.text.substring(0, 120),
-            responsePreview: turn.response.text.substring(0, 120)
+            promptLen: turn.prompt.textLength,
+            responseLen: turn.response.textLength
           });
           return;
         }
@@ -1804,7 +1858,7 @@ export class ConversationDetector {
    * Handle user prompt submission
    */
   private handlePrompt(promptText: string): void {
-    this.logDebug('Prompt stored', promptText.substring(0, 120));
+    this.logDebug('Prompt stored', { length: promptText.length });
     const timestamp = Date.now();
     const threadId = this.getConversationId();
     this.lastPromptCapturedAt = timestamp;
@@ -1825,7 +1879,7 @@ export class ConversationDetector {
     this.traceFlow('handlePrompt:stored', {
       threadId,
       promptLength: promptText.length,
-      promptPreview: promptText.substring(0, 80)
+      promptLen: promptText.length
     });
 
     // Persist prompt to chrome.storage.session so it survives full-page
@@ -1902,7 +1956,7 @@ export class ConversationDetector {
     this.traceFlow('capturePromptFromUserElement:stored', {
       threadId,
       promptLength: text.length,
-      promptPreview: normalized.substring(0, 80)
+      promptLen: normalized.length
     });
 
     this.recentPrompts.push({ text: normalized, timestamp: now });
@@ -1913,7 +1967,7 @@ export class ConversationDetector {
 
     this.logDebug('Prompt captured from user DOM message', {
       threadId,
-      promptPreview: normalized.substring(0, 120)
+      promptLen: normalized.length
     });
   }
 
